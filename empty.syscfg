@@ -1,20 +1,83 @@
 /**
  * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
  * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
+ * @cliArgs --device "MSPM0G350X" --part "Default" --package "LQFP-64(PM)" --product "mspm0_sdk@2.09.00.01"
+ * @v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)" --product "mspm0_sdk@2.09.00.01"
+ * @versions {"tool":"1.25.0+4268"}
  */
-//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"
-//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"
-// @cliArgs --board /ti/boards/LP_MSPM0G3507 --rtos nortos
 
 /**
  * Import the modules used in this configuration.
  */
+const Board  = scripting.addModule("/ti/driverlib/Board");
+const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const GPIO1  = GPIO.addInstance();
 const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
 
 /**
  * Write custom configuration values to the imported modules.
  */
+Board.configureUnused = true;
 
-const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+GPIO1.$name                                  = "GPIO_GRP_0";
+GPIO1.associatedPins.create(11);
+GPIO1.associatedPins[0].$name                = "BATTERY_ENABLE";
+GPIO1.associatedPins[0].assignedPort         = "PORTB";
+GPIO1.associatedPins[0].assignedPin          = "21";
+GPIO1.associatedPins[1].$name                = "BUCK_DIS";
+GPIO1.associatedPins[1].assignedPort         = "PORTA";
+GPIO1.associatedPins[1].assignedPin          = "13";
+GPIO1.associatedPins[1].pin.$assign          = "PA13";
+GPIO1.associatedPins[2].$name                = "CHARGER_ENABLE";
+GPIO1.associatedPins[2].assignedPort         = "PORTB";
+GPIO1.associatedPins[2].assignedPortSegment  = "Upper";
+GPIO1.associatedPins[2].assignedPin          = "27";
+GPIO1.associatedPins[3].$name                = "OUTPUT_ENABLE";
+GPIO1.associatedPins[3].assignedPort         = "PORTB";
+GPIO1.associatedPins[3].assignedPortSegment  = "Upper";
+GPIO1.associatedPins[3].assignedPin          = "26";
+GPIO1.associatedPins[4].$name                = "VBATM_EN";
+GPIO1.associatedPins[4].assignedPort         = "PORTB";
+GPIO1.associatedPins[4].assignedPin          = "22";
+GPIO1.associatedPins[5].$name                = "USB_EN";
+GPIO1.associatedPins[5].assignedPort         = "PORTA";
+GPIO1.associatedPins[5].assignedPortSegment  = "Lower";
+GPIO1.associatedPins[5].assignedPin          = "5";
+GPIO1.associatedPins[6].$name                = "LED_EN";
+GPIO1.associatedPins[6].assignedPort         = "PORTB";
+GPIO1.associatedPins[6].assignedPin          = "13";
+GPIO1.associatedPins[7].$name                = "LED_DIS";
+GPIO1.associatedPins[7].assignedPort         = "PORTB";
+GPIO1.associatedPins[7].assignedPin          = "5";
+GPIO1.associatedPins[8].$name                = "USB_LD1_EN";
+GPIO1.associatedPins[8].assignedPort         = "PORTB";
+GPIO1.associatedPins[8].assignedPin          = "1";
+GPIO1.associatedPins[9].$name                = "USB_LD2_EN";
+GPIO1.associatedPins[9].assignedPort         = "PORTB";
+GPIO1.associatedPins[9].assignedPin          = "2";
+GPIO1.associatedPins[10].$name               = "CRT_SNS_EN";
+GPIO1.associatedPins[10].assignedPort        = "PORTB";
+GPIO1.associatedPins[10].assignedPortSegment = "Upper";
+GPIO1.associatedPins[10].assignedPin         = "16";
 
 SYSCTL.forceDefaultClkConfig = true;
+
+/**
+ * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
+ * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
+ * re-solve from scratch.
+ */
+Board.peripheral.$suggestSolution             = "DEBUGSS";
+Board.peripheral.swclkPin.$suggestSolution    = "PA20";
+Board.peripheral.swdioPin.$suggestSolution    = "PA19";
+GPIO1.associatedPins[0].pin.$suggestSolution  = "PB21";
+GPIO1.associatedPins[2].pin.$suggestSolution  = "PB27";
+GPIO1.associatedPins[3].pin.$suggestSolution  = "PB26";
+GPIO1.associatedPins[4].pin.$suggestSolution  = "PB22";
+GPIO1.associatedPins[5].pin.$suggestSolution  = "PA5";
+GPIO1.associatedPins[6].pin.$suggestSolution  = "PB13";
+GPIO1.associatedPins[7].pin.$suggestSolution  = "PB5";
+GPIO1.associatedPins[8].pin.$suggestSolution  = "PB1";
+GPIO1.associatedPins[9].pin.$suggestSolution  = "PB2";
+GPIO1.associatedPins[10].pin.$suggestSolution = "PB16";
+SYSCTL.peripheral.$suggestSolution            = "SYSCTL";
