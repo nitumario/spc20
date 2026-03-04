@@ -105,7 +105,7 @@ This is used by the ENERGY_MGMT state machine to detect that the battery is drai
 
 
 ## State Machine Hierarchy
-
+```
 System(ROOT HSM):
 INIT:
   entry /  init GPIO, ADC, PWM, timers, UART, disable all outputs
@@ -134,7 +134,7 @@ when hardware ready -> RUN:
     FAULT_MGR(Child HSM):
 
     UI_MGR(Child HSM):
-
+```
 
 ## Orthogonal regions:
 
