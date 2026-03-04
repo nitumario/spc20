@@ -1,0 +1,52 @@
+index, Signal name    , Pin no., Pin name           , Functionality                                                                                , Pin function  , Initial state
+    1, NRST           ,      38, NRST               , Resets module when pulled low                                                                , RESET PIN     , NA
+    2, SWDIO          ,      12, PA19/SWDIO         , Serial Wire Debug                                                                            , SWDIO         , NA
+    3, SWCLK          ,      13, PA20/SWCLK         , Serial Wire Debug                                                                            , SWCLK         , NA
+    4, I_CHARGE       ,      18, PA22/CLK_OUT/A0_7  , "Analog input for charging current measurement from current sense amplifier.
+                                                      I =0 -> V = VCS/2 (Vcs + VMCU when Q9 is ON) "                                               , ANALOG INPUT  , 
+    5, VBAT_M         ,      23, PB24/A0_5          , "Analog input for battery voltage measurement.
+                                                      V-BATM = VBAT/2 when Q6 is ON"                                                               , ANALOG INPUT  , 
+    6, V_PANEL        ,       8, PA15/A1_0          , "Input voltage from solar panel or Power supply.
+                                                      V_PANEL = VIn/11
+                                                      MAX VIn + 30V. MIN VIN - to be specified and tested at bring up."                            , ANALOG INPUT  , 
+    7, USB_EN         ,      45, PA5                , "ENABLE 5V power for the USB Output.
+                                                      HI - Power enable
+                                                      LOW - Power Disable"                                                                         , DIGITAL OUTPUT, LOW
+    8, CHARGER_ENABLE ,      29, PB27               , Enables/Disables charger input to battery                                                    , DIGITAL OUTPUT, LOW
+    9, OUTPUT_ENABLE  ,      28, PB26               , Enables the output switch to turn on output                                                  , DIGITAL OUTPUT, LOW
+   10, PWM_VCHG       ,       5, PA12/FCC_IN        , Feedback voltage to FB pin of buck converter. Used in MPPT algorithm to control the converter, ANALOG OUTPUT , 
+   11, LEDCTRL1       ,      55, PA9/RTC_OUT/CLK_OUT, Controls current reference voltage for LED1                                                  , DIGITAL OUTPUT, 
+   12, LEDCTRL2       ,      52, PB4                , Controls current reference voltage for LED2                                                  , DIGITAL OUTPUT, 
+   13, VBATM_EN       ,      21, PB22               , Enables/Disables PMOS transistor when taking battery voltage reading.                        , DIGITAL OUTPUT, LOW
+   14, BUCK_DIS       ,       6, PA13               , Disables the buck converter                                                                  , DIGITAL OUTPUT, LOW
+   15, I_PANEL        ,       7, PA14/CLK_OUT/A0_12 , Analog input for panel current measurement from current sense amplifier                      , ANALOG INPUT  , 
+   16, I_DISCHARGE    ,      31, PA27/A0_0          , Analog input for discharge current measurement from current sense amplifier                  , ANALOG INPUT  , 
+   17, TEMP1          ,      14, PB17/A1_4          , Analog input for Temperature sensor 1                                                        , ANALOG INPUT  , 
+   18, TEMP3          ,      19, PB20/A0_6          , Analog input for Temperature sensor 3                                                        , ANALOG INPUT  , 
+   19, BTN1           ,      58, PB6                , Input pin for push button 1                                                                  , DIGITAL INPUT , 
+   20, BTN2           ,      59, Pb7                , Input pin for push button 2                                                                  , DIGITAL INPUT , 
+   21, USB_FLT        ,      46, PA6/HFLCK_IN/HFXOUT, USB Fault Pin                                                                                , DIGITAL INPUT , HIGH
+   22, BSLRX/UART0_RX ,      57, PA11               , Bootstrap Loader Receiver Pin. Used during programming                                       , PROGRAMMING   , 
+   23, BSLTX/UART0_TX ,      56, PA10/CLK_OUT       , Bootstrap Loader Transmit Pin. Used during programming.                                      , PROGRAMMING   , 
+   24, V_LED2         ,      10, PA17/A1_2          , Analog input for voltge measurement for LED output 2                                         , ANALOG INPUT  , 
+   25, V_LED1         ,       9, PA16/A1_1/FCC_IN   , Analog input for voltge measurement for LED output 1                                         , ANALOG INPUT  , 
+   26, 3VOUT_M        ,      26, PA25/A0_2          , Analog input for voltage measurement at output transistor                                    , ANALOG INPUT  , 
+   27, BATTERY_ENABLE ,      20, PB21               , Enable/disable battery cutput/input                                                          , DIGITAL OUTPUT, LOW
+   28, LED_DIS        ,      53, PB5                , LED Output current output disable                                                            , DIGITAL OUTPUT, 
+   29, PWM_FB_TPS61088,       3, PB15               , PWM output to Feedback pin of TPS61088                                                       , DIGITAL OUTPUT, 
+   30, LED_EN         ,       1, PB13               , Enable/disable for LED output                                                                , DIGITAL OUTPUT, LOW
+   31, VCHG_M         ,      11, PA18/A1_3          , Analog input for Buck output voltage measurement                                             , ANALOG INPUT  , 
+   32, USB_LD1_EN     ,      48, PB1                , Enable/Disable USB Load Switch 1                                                             , DIGITAL OUTPUT, LOW
+   33, USB_LD2_EN     ,      50, PB2                , Enable/Disable USB Load Switch 2                                                             , DIGITAL OUTPUT, LOW
+   34, 2.5V_VREF      ,      24, PA23/VREF+         , Internal VREF                                                                                , ANALOG OUTPUT , 
+   35, VREF-          ,      17, PA21/A1_7/VREF-    , GND                                                                                          ,               , 
+   36, B_INT          ,      63, PB11/CLK_OUT       , Interrupt input from LED Outputs                                                             , DIGITAL INPUT , 
+   37, DISP_LED1      ,      43, PA3/LFXIN          , Enable / Disable LED Bar LED 1                                                               , DIGITAL OUTPUT, HIGH
+   38, DISP_LED2      ,      39, PA31/CLK_OUT       , Enable / Disable LED Bar LED 2                                                               , DIGITAL OUTPUT, HIGH
+   39, DISP_LED3      ,      37, PA30               , Enable / Disable LED Bar LED 3                                                               , DIGITAL OUTPUT, HIGH
+   40, DISP_LED4      ,      36, PA29               , Enable / Disable LED Bar LED 4                                                               , DIGITAL OUTPUT, HIGH
+   41, DISP_LED5      ,      35, PA28               , Enable / Disable LED Bar LED 5                                                               , DIGITAL OUTPUT, HIGH
+   42, DIG1           ,      49, PA7/CLK_OUT        , Enable / Disable LED Bar 1 Supply                                                            , DIGITAL OUTPUT, HIGH
+   43, DIG2           ,      47, PB0                , Enable / Disable LED Bar 2 Supply                                                            , DIGITAL OUTPUT, HIGH
+   44, V_USB_1        ,      25, PA24/A0_3          , Analog input for voltage measurement at USB 1 output                                         , ANALOG INPUT  , 
+   45, V_USB_2        ,      27, PB25/A0_4          , Analog input for voltage measurement at USB 2 output                                         , ANALOG INPUT  , 
