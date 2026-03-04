@@ -1,0 +1,19 @@
+FROM           , GUARD                                    , TO
+IDLE           , has_sun AND !has_load AND !bat_full      , CHARGE_ONLY
+IDLE           , !has_sun AND has_load AND !bat_low       , DISCHARGE_ONLY
+IDLE           , has_sun AND has_load AND !bat_full       , CHARGE_AND_LOAD
+CHARGE_ONLY    , has_load                                 , CHARGE_AND_LOAD
+CHARGE_ONLY    , !has_sun OR bat_full                     , IDLE
+CHARGE_AND_LOAD, !has_load                                , CHARGE_ONLY
+CHARGE_AND_LOAD, !has_sun AND !bat_low                    , DISCHARGE_ONLY
+CHARGE_AND_LOAD, !has_sun AND bat_low                     , SAFE_MODE
+CHARGE_AND_LOAD, bat_full AND !has_load                   , IDLE
+CHARGE_AND_LOAD, bat_full AND has_load                    , DISCHARGE_ONLY
+DISCHARGE_ONLY , !has_load                                , IDLE
+DISCHARGE_ONLY , has_sun AND has_load                     , CHARGE_AND_LOAD
+DISCHARGE_ONLY , has_sun AND !has_load                    , CHARGE_ONLY
+DISCHARGE_ONLY , bat_low AND !has_load AND !has_sun       , SAFE_MODE
+SAFE_MODE      , V_bat > 3200mV AND has_sun               , CHARGE_ONLY
+SAFE_MODE      , V_bat > 3200mV AND has_load AND !bat_full, CHARGE_AND_LOAD
+SAFE_MODE      , !has_load                                , IDLE
+SAFE_MODE      , V_bat > 3200mV AND !has_sun              , IDLE

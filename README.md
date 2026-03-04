@@ -94,5 +94,59 @@ Negative = battery losing energy
 
 This is used by the ENERGY_MGMT state machine to detect that the battery is draining even during charging mode, and to trigger safe mode, and shed loads if needed.
 
-###
+### flags used
+
+`has_sun` | V_panel > 9v
+`has_load` | I_load > 50mA
+`bat_low` | V_bat < 2800mV
+`bat_full` | V_bat >= 3650mV AND I_charge < 200mA 
+`can_charge` | has_sun AND allowed_chg > 0
+`panel_limited` | I_charge < allowed_chg − 100mA AND has_sun -> used by MPPT
+
+
+## State Machine Hierarchy
+
+System(ROOT HSM):
+INIT:
+  entry /  init GPIO, ADC, PWM, timers, UART, disable all outputs
+
+when hardware ready -> RUN:
+
+    ENERGY_MGMT(Child HSM):
+
+      [orthogonal region 1: ENERGY MODE]:
+        - IDLE(no sun, no load, sleep, everything off)
+        - CHARGE_ONLY(sun, no load, buck on, charge battery)
+        - CHARGE_AND_LOAD(sun, load, buck on, charge battery and feed loads, includes allowed_chg == 0 where buck feeds loads, battery floats or discharges as buffer)
+        - DISCHARGE_ONLY (no sun, load, battery feeds loads alone )
+        - SAFE_MODE (bat_low + load, shed loads)
+
+      [orthogonal region 2: CHARGER]:
+        - PRECHARGE (V_bat < 3V, gentle current)
+        - CC (constant current, target = allowed_chg(current))
+        - CV (constant voltage, target = 3650mV)
+
+      [orthogonal region 3: MPPT]:
+        - DISABLED (panel not limited, mppt_limit=BUCK_MAX)
+        - TRACKING (perturbing PWM, incremental conductance)
+        - HOLD (converged, wait for the next MPPT call)
+
+    FAULT_MGR(Child HSM):
+
+    UI_MGR(Child HSM):
+
+
+## Orthogonal regions:
+
+The 3 states inside ENERGY_MGMT run **in paralel**
+
+1. **ENERGY MODE** decides what the system does (charge, discharge, idle, safe mode). It controls hardware enable switches (`CHARGER_EN BATTERY_EN, OUTPUT_EN, USB_EN`). It activates/deactivates the CHARGER region. It decides if the buck runs(`has_sun`).
+
+2. **CHARGER** decides how to charge (PRECHARGE, CC, CV). It controls the buck PWM. it recives `allowed_chg` from the power budget as its CC target. It does now know about loads, that information is taken from `allowed_chg` in the power budget.
+
+3. **MPPT** optimizes the solar panel operating piont. It temporarily takes control of PWM during `TRACKING`. When it finishes, PWM carries over to CC and it writes `mppt_limit` back into the power budget context
+
+
+
+
 
