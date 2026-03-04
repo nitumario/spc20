@@ -4,8 +4,7 @@ index, Signal name    , Pin no., Pin name           , Functionality             
     3, SWCLK          ,      13, PA20/SWCLK         , Serial Wire Debug                                                                            , SWCLK         , NA
     4, I_CHARGE       ,      18, PA22/CLK_OUT/A0_7  , "Analog input for charging current measurement from current sense amplifier.
                                                       I =0 -> V = VCS/2 (Vcs + VMCU when Q9 is ON) "                                               , ANALOG INPUT  , 
-    5, VBAT_M         ,      23, PB24/A0_5          , "Analog input for battery voltage measurement.
-                                                      V-BATM = VBAT/2 when Q6 is ON"                                                               , ANALOG INPUT  , 
+    5, VBAT_M         ,      23, PB24/A0_5          , "Analog input for battery voltage measurement. V-BATM = VBAT/2 when Q6 is ON"                                                               , ANALOG INPUT  , 
     6, V_PANEL        ,       8, PA15/A1_0          , "Input voltage from solar panel or Power supply.
                                                       V_PANEL = VIn/11
                                                       MAX VIn + 30V. MIN VIN - to be specified and tested at bring up."                            , ANALOG INPUT  , 
