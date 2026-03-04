@@ -2,7 +2,7 @@
 
 ## Overview
 
-SPC_20 is a solar-powered battery charging and load management system built on the TI MSPM0G3507 microcontroller. It charges a LiFePO4 battery from a solar panel through a buck converter, while simultaneously powering LED lamps and USB outputs.
+SPC_20 is a solar-powered battery charging and load management system built on the TI MSPM0 microcontroller. It charges a LiFePO4 battery from a solar panel through a buck converter, while simultaneously powering LED lamps and USB outputs.
 
 The battery acts as a **buffer** on a shared bus and it absorbs excess power when solar exceeds load demand, and supplies the deficit when loads exceed solar. The firmware manages this power flow through a buck converter controlled by PWM.
 
@@ -41,7 +41,7 @@ when: I_buck > I_load, I_bat is positive, battery is CHARGING
     I_buck < I_load, I_bat is negative, battery is DISCHARGING
 
 
-The battery charges or discharges **automatically by physics**. The firmware does not command the battery to discharge — it happens when loads exceed buck output. The firmware's only control input is the buck PWM.
+The battery charges or discharges **automatically by physics**. The firmware does not command the battery to discharge,it happens when loads exceed buck output. The firmware's only control input is the buck PWM.
 
 
 ### The Buck Runs Whenever There's Sun
