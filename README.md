@@ -154,6 +154,13 @@ Three states. Activated/deactivated by ENERGY MODE. Only active when ENERGY MODE
 
 ### States
 
+| state     | regulation | target                                     | entry_from                                       | exit_to                                         |
+|-----------|------------|--------------------------------------------|--------------------------------------------------|-------------------------------------------------|
+| PRECHARGE | current    | allowed_chg(budget limits to <=200mA)      | Activation with V_bat < 3000mV                   | CC when V_bat ≥ 3000mV or 15min timeout failure |
+| CC        | current    | allowed_chg(takes load into consideration) | Activation with V_bat ≥ 3000mV or from PRECHARGE | CV when V_bat ≥ 3650mV                          |
+| CV        | voltage    | 3650mV (3650-3660mV)                       | CC                                               | Signal bat_full when I_charge < 200mA for 30s   |
+
+
 see [charger_states](docs/charger_states.csv)
 
 
@@ -183,11 +190,6 @@ Incremental conductance with adaptive step size. Runs parallel to the charger st
 
 ### States
 
-| state     | regulation | target                                     | entry_from                                       | exit_to                                         |
-|-----------|------------|--------------------------------------------|--------------------------------------------------|-------------------------------------------------|
-| PRECHARGE | current    | allowed_chg(budget limits to <=200mA)      | Activation with V_bat < 3000mV                   | CC when V_bat ≥ 3000mV or 15min timeout failure |
-| CC        | current    | allowed_chg(takes load into consideration) | Activation with V_bat ≥ 3000mV or from PRECHARGE | CV when V_bat ≥ 3650mV                          |
-| CV        | voltage    | 3650mV (3650-3660mV)                       | CC                                               | Signal bat_full when I_charge < 200mA for 30s   |
 
 
 
