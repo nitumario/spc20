@@ -190,8 +190,16 @@ Incremental conductance with adaptive step size. Runs parallel to the charger st
 
 ### States
 
+| state    | functionality                                                 | PWM_control                                                          | mppt_limit_output              |
+|----------|---------------------------------------------------------------|----------------------------------------------------------------------|--------------------------------|
+| DISABLED | nothing                                                       | CC controls pwm                                                      | BUCK_MAX(no panel constraint)  |
+| TRACKING | perturbs PWM measures V/I and applies incremental conductance | MPPT controls PWM. CC skips regulation but still runs safety checks. | previous value                 |
+| HOLD     | Waits MPPT_HOLD_TIME before re-tracking                       | CC controls PWM (inherits MPPT's position)                           | Computed from best power found |
 
 
 
 
+
+
+see [MPPT_states](docs/MPPT_states.csv)
 
