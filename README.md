@@ -227,3 +227,21 @@ Incremental conductance with adaptive step size. Runs parallel to the charger st
 | HOLD     | !panel_limited AND panel_limited    | DISABLED |
 
 [MPPT_transition_table](docs/MPPT_transition_table.csv)
+
+
+## File Structure
+
+```
+├── hw_config.h         — all hardware constants and thresholds
+├── system_types.h      — all enums, structs, typedefs (the architecture in types)
+├── measurements.h/c    — ADC
+├── power_budget.h/c    — the allowed_chg equation and flags
+├── charger.h/c         — PRECHARGE  CC  CV state machine
+├── mppt.h/c            — DISABLED  TRACKING  HOLD state machine
+├── energy_mode.h/c     — IDLE  CHARGE  DISCHARGE  SAFE state machine
+├── fault_mgr.h/c       — fault detection and management
+├── hw_hal.h/c          — GPIO/PWM hardware abstraction layer
+├── main.c              — system state machine, main loop, SysTick ISR
+├── SPC_20.syscfg       — TI SysConfig peripheral configuration
+└── ARCHITECTURE.md     — this file
+```
