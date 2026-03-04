@@ -161,7 +161,7 @@ Three states. Activated/deactivated by ENERGY MODE. Only active when ENERGY MODE
 | CV        | voltage    | 3650mV (3650-3660mV)                       | CC                                               | Signal bat_full when I_charge < 200mA for 30s   |
 
 
-see [charger_states](docs/charger_states.csv)
+[charger_states](docs/charger_states.csv)
 
 
 
@@ -201,5 +201,29 @@ Incremental conductance with adaptive step size. Runs parallel to the charger st
 
 
 
-see [MPPT_states](docs/MPPT_states.csv)
+[MPPT_states](docs/MPPT_states.csv)
 
+
+### TRACKING Entry Actions
+
+- V_prev = V_panel (fresh)
+- I_prev = I_panel (fresh)
+- step_size = MPPT_MAX_STEP_SIZE
+- max_reversals = 0
+- max_panel_power = 0
+- Force first perturbation: pwm -= step_size
+- Record tracking_start_ms
+
+
+### MPPT transition table
+
+| from     | guard                               | to       |
+|----------|-------------------------------------|----------|
+| DISABLED | panel_limited AND has_sun           | TRACKING |
+| TRACKING | converged (step==1 AND reversals>6) | HOLD     |
+| TRACKING | timeout (MPPT_RUNTIME expired)      | HOLD     |
+| TRACKING | !has_sun                            | DISABLED |
+| HOLD     | hold_time expired AND panel_limited | TRACKING |
+| HOLD     | !panel_limited AND panel_limited    | DISABLED |
+
+[MPPT_transition_table](docs/MPPT_transition_table.csv)

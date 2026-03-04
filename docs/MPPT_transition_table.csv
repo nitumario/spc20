@@ -1,0 +1,7 @@
+from,guard,to
+DISABLED,panel_limited AND has_sun,TRACKING
+TRACKING,converged (step==1 AND reversals>6),HOLD
+TRACKING,timeout (MPPT_RUNTIME expired),HOLD
+TRACKING,!has_sun,DISABLED
+HOLD,hold_time expired AND panel_limited,TRACKING
+HOLD,!panel_limited AND panel_limited,DISABLED
