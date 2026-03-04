@@ -20,12 +20,13 @@ Solar panel -> buck converter ----(through the battery bus)---> battery AND load
 
 
 ### Kirchhoff's Current Law at the Bus Node
-
+```
 I_buck = I_bat + I_load
-
+```
 Rearranged:
+```
 I_bat = I_buck − I_load
-
+```
 Where:
   I_buck ≥ 0     always (buck can only source current)
   I_load ≥ 0     always (loads can only sink current)
@@ -47,22 +48,22 @@ The battery charges or discharges **automatically by physics**. The firmware doe
 
 The buck converter runs in any mode with sun, even if the charger target is zero.
 
-
+```
 buck_needed = has_sun    (always, regardless of charging)
 can_charge  = has_sun AND allowed_chg > 0
-
+```
 
 ## Power budgeting 
 
 The power budget runs every 100ms? and computes how much charging current the CC loop should target
 
 ### equation
-
+```
 i_buck_max  = MIN(BUCK_MAX_CURRENT, mppt_limit)
 allowed_chg = i_buck_max − I_load
 clamp:  if allowed_chg > battery_limit → allowed_chg = battery_limit
         if allowed_chg < 0             → allowed_chg = 0
-
+```
 
 ### Legentd
 
@@ -73,6 +74,25 @@ clamp:  if allowed_chg > battery_limit → allowed_chg = battery_limit
 - **battery limkit** = maximum safe current that the battery can take based on its voltage( it can be in 3 zones, precharge(V_bat < 3000mv -> 200ma), CC(v_bat < 3650mV -> 2000mA), CV(v_bat >= 3650mV -> 200mA))
 - **allowed_chg** = the CC regulation target. How much current CC should push into the battery. This is the value that it's left after loads and clamped to battery safety. Can be zero if loads consume all available power.
 
-## Why is allowed_chg >= 0 (never negative)
+### Why is allowed_chg >= 0 (never negative)
 
 allowed_chg is a  CC regulation target, it has nothing to do with what the battery is doing. When allowed_chg is 0, the charger stops pushing current into the battery. the battery may still discharge to cover loads but that happens automatically. This code does not command negative charging.
+
+s
+### Net battery current (for monitoring)
+
+The system tracks actual net battery current as a signed value.
+
+```
+i_bat_net = I_charge − I_load    (signed, from measurements)
+
+Positive = battery gaining energy
+Zero     = battery stable
+Negative = battery losing energy
+```
+
+
+This is used by the ENERGY_MGMT state machine to detect that the battery is draining even during charging mode, and to trigger safe mode, and shed loads if needed.
+
+###
+
