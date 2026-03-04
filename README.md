@@ -148,5 +148,29 @@ The 3 states inside ENERGY_MGMT run **in paralel**
 
 
 
+## CHARGER state machine
+
+Three states. Activated/deactivated by ENERGY MODE. Only active when ENERGY MODE is in CHARGE_ONLY, CHARGE_AND_LOAD, or SAFE_MODE (with sun).
+
+### States
+
+see [charger_states](charger_states.csv)
+
+
+
+## CC internal logic(per cycle)
+
+1. **Transition check:** if V_bat >= 3650mV -> transition to CV
+2. **Panel safety:** if V_panel < 10V? -> increase PWM, return 
+3. **MPPT check** if MPPT is in `TRACKING` -> return(MPPT has PWM control, CC skips regulation)
+4. **Current regulation:** 
+```
+target = allowed_chg
+   if I_charge < target − 25mA:  pwm -= 1  (increase duty, push more current)
+   if I_charge > target + 25mA:  pwm += 1  (decrease duty, reduce current)
+   else: do nothing (within +-25mA deadband, stable)
+```  
+
+
 
 
