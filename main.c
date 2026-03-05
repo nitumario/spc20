@@ -35,3 +35,18 @@ static system_ctx_t sys;
     }
     return false;
 }
+
+
+/* System init */
+
+static void system_init(void){
+
+    SYSCFG_DL_init();
+
+    /*disable all outputs so its in a safe starting state*/
+    hal_charger_enable(false);
+    hal_battery_enable(false);
+    hal_output_enable(false);
+    
+
+}
