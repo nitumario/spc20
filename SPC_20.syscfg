@@ -9,14 +9,30 @@
 /**
  * Import the modules used in this configuration.
  */
-const Board  = scripting.addModule("/ti/driverlib/Board");
-const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
-const GPIO1  = GPIO.addInstance();
-const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
+const ADC12   = scripting.addModule("/ti/driverlib/ADC12", {}, false);
+const ADC121  = ADC12.addInstance();
+const ADC122  = ADC12.addInstance();
+const Board   = scripting.addModule("/ti/driverlib/Board");
+const GPIO    = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const GPIO1   = GPIO.addInstance();
+const RTC     = scripting.addModule("/ti/driverlib/RTC");
+const SYSCTL  = scripting.addModule("/ti/driverlib/SYSCTL");
+const SYSTICK = scripting.addModule("/ti/driverlib/SYSTICK");
+const UART    = scripting.addModule("/ti/driverlib/UART", {}, false);
+const UART1   = UART.addInstance();
+const VREF    = scripting.addModule("/ti/driverlib/VREF");
 
 /**
  * Write custom configuration values to the imported modules.
  */
+ADC121.$name                             = "ADC0";
+ADC121.adcPin0Config.$name               = "ti_driverlib_gpio_GPIOPinGeneric0";
+ADC121.adcPin0Config.hideOutputInversion = scripting.forceWrite(false);
+
+ADC122.$name                             = "ADC1";
+ADC122.adcPin0Config.$name               = "ti_driverlib_gpio_GPIOPinGeneric1";
+ADC122.adcPin0Config.hideOutputInversion = scripting.forceWrite(false);
+
 Board.configureUnused = true;
 
 GPIO1.$name                                  = "GPIO_GRP_0";
@@ -60,13 +76,38 @@ GPIO1.associatedPins[10].assignedPort        = "PORTB";
 GPIO1.associatedPins[10].assignedPortSegment = "Upper";
 GPIO1.associatedPins[10].assignedPin         = "16";
 
-SYSCTL.forceDefaultClkConfig = true;
+
+SYSCTL.forceDefaultClkConfig  = true;
+SYSCTL.powerPolicy            = "STANDBY0";
+SYSCTL.flashInterruptPriority = "2";
+SYSCTL.clockTreeEn            = true;
+
+SYSTICK.periodEnable    = true;
+SYSTICK.interruptEnable = true;
+SYSTICK.systickEnable   = true;
+SYSTICK.period          = 4000;
+
+UART1.$name             = "UART_0";
+UART1.targetBaudRate    = 115200;
+UART1.txPinConfig.$name = "ti_driverlib_gpio_GPIOPinGeneric4";
+UART1.rxPinConfig.$name = "ti_driverlib_gpio_GPIOPinGeneric5";
+
+VREF.basicIntVolt                  = "DL_VREF_BUFCONFIG_OUTPUT_2_5V";
+VREF.checkVREFReady                = true;
+VREF.basicVrefPins                 = "VREF+-";
+VREF.vrefPosPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric2";
+VREF.peripheral.vrefPosPin.$assign = "PA23";
+VREF.vrefNegPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric3";
 
 /**
  * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
  * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
  * re-solve from scratch.
  */
+ADC121.peripheral.$suggestSolution            = "ADC1";
+ADC121.peripheral.adcPin0.$suggestSolution    = "PA15";
+ADC122.peripheral.$suggestSolution            = "ADC0";
+ADC122.peripheral.adcPin0.$suggestSolution    = "PA27";
 Board.peripheral.$suggestSolution             = "DEBUGSS";
 Board.peripheral.swclkPin.$suggestSolution    = "PA20";
 Board.peripheral.swdioPin.$suggestSolution    = "PA19";
@@ -80,4 +121,9 @@ GPIO1.associatedPins[7].pin.$suggestSolution  = "PB5";
 GPIO1.associatedPins[8].pin.$suggestSolution  = "PB1";
 GPIO1.associatedPins[9].pin.$suggestSolution  = "PB2";
 GPIO1.associatedPins[10].pin.$suggestSolution = "PB16";
-SYSCTL.peripheral.$suggestSolution            = "SYSCTL";
+RTC.peripheral.$suggestSolution               = "RTC";
+UART1.peripheral.$suggestSolution             = "UART0";
+UART1.peripheral.rxPin.$suggestSolution       = "PA1";
+UART1.peripheral.txPin.$suggestSolution       = "PA0";
+VREF.peripheral.$suggestSolution              = "VREF";
+VREF.peripheral.vrefNegPin.$suggestSolution   = "PA21";
