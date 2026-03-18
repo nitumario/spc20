@@ -1,4 +1,4 @@
-#[v0.01] - 18.03.26
+# [v0.01] - 18.03.26
 ## format change for tables
 
  - added priority column: integer per source state, evaluated as strict if/else chains (lower - first checked, higher - checked later)
