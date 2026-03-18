@@ -161,7 +161,20 @@ Three states. Activated/deactivated by ENERGY MODE. Only active when ENERGY MODE
 | CV        | voltage    | 3650mV (3650-3660mV)                       | CC                                               | Signal bat_full when I_charge < 200mA for 30s   |
 
 
-[charger_states](docs/charger_states.csv)
+| PRIORITY | FROM | GUARD | TO | NOTES |
+|----------|------|-------|-----|-------|
+| - | INACTIVE | activated AND V_bat < 3000mV | PRECHARGE | region activated by ENERGY_MODE — low battery starts gentle |
+| - | INACTIVE | activated AND V_bat >= 3000mV | CC | region activated by ENERGY_MODE — normal battery starts CC |
+| 1 | PRECHARGE | V_bat >= 3000mV | CC | battery recovered — move to full current |
+| 2 | PRECHARGE | timeout (15min) | FAULT | precharge timeout — battery may be damaged |
+| 3 | PRECHARGE | deactivated | INACTIVE | EXIT ACTION: pwm = PWM_MIN_DUTY (399), assert BUCK_DIS, reset state |
+| 4 | PRECHARGE | \<default\> | PRECHARGE | stay — regulate at allowed_chg (budget-clamped to <=200mA) |
+| 1 | CC | V_bat >= 3650mV | CV | voltage threshold reached |
+| 2 | CC | deactivated | INACTIVE | EXIT ACTION: pwm = PWM_MIN_DUTY (399), assert BUCK_DIS, reset state |
+| 3 | CC | \<default\> | CC | stay — regulate at allowed_chg (load-aware target) |
+| 1 | CV | I_charge < 200mA for 30s | SIGNAL_BAT_FULL | charge complete — signal ENERGY_MODE |
+| 2 | CV | deactivated | INACTIVE | EXIT ACTION: pwm = PWM_MIN_DUTY (399), assert BUCK_DIS, reset state |
+| 3 | CV | \<default\> | CV | stay — regulate voltage at 3650mV |
 
 
 
@@ -216,15 +229,19 @@ Incremental conductance with adaptive step size. Runs parallel to the charger st
 
 
 ### MPPT transition table
+| PRIORITY | FROM     | GUARD                                           | TO       | NOTES                                                                                                     |
+|----------|----------|-------------------------------------------------|----------|-----------------------------------------------------------------------------------------------------------|
+| 1        | DISABLED | panel_limited AND has_sun                       | TRACKING | panel is limiting — start optimization                                                                    |
+| 2        | DISABLED | <default>                                       | DISABLED | stay                                                                                                      |
+| 1        | TRACKING | !has_sun                                        | DISABLED | safety first — sun lost kills tracking immediately                                                        |
+| 2        | TRACKING | converged (step_size == 1 AND reversals > 6)    | HOLD     | algorithm converged                                                                                       |
+| 3        | TRACKING | timeout (MPPT_RUNTIME expired)                  | HOLD     | time limit reached                                                                                        |
+| 4        | TRACKING | <default>                                       | TRACKING | continue tracking                                                                                         |
+| 1        | HOLD     | !panel_limited                                  | DISABLED | FIXED: was '!panel_limited AND panel_limited' (contradiction). Panel no longer limiting — MPPT not needed |
+| 2        | HOLD     | hold_time expired AND panel_limited AND has_sun | TRACKING | time to re-track — added has_sun guard for safety                                                         |
+| 3        | HOLD     | !has_sun                                        | DISABLED | sun lost — disable                                                                                        |
+| 4        | HOLD     | <default>                                       | HOLD     | wait                                                                                                      |
 
-| from     | guard                               | to       |
-|----------|-------------------------------------|----------|
-| DISABLED | panel_limited AND has_sun           | TRACKING |
-| TRACKING | converged (step==1 AND reversals>6) | HOLD     |
-| TRACKING | timeout (MPPT_RUNTIME expired)      | HOLD     |
-| TRACKING | !has_sun                            | DISABLED |
-| HOLD     | hold_time expired AND panel_limited | TRACKING |
-| HOLD     | !panel_limited AND panel_limited    | DISABLED |
 
 [MPPT_transition_table](docs/MPPT_transition_table.csv)
 
