@@ -37,6 +37,14 @@ static system_ctx_t sys;
 }
 
 
+/* timestamps for periodic tasks */
+static uint32_t last_fault_ms;
+static uint32_t last_budget_ms;
+static uint32_t last_charger_ms;
+static uint32_t last_mppt_ms;
+static uint32_t last_fault_recovery_ms;
+
+
 /* System init */
 
 static void system_init(void){
@@ -47,6 +55,22 @@ static void system_init(void){
     hal_charger_enable(false);
     hal_battery_enable(false);
     hal_output_enable(false);
+    hal_usb_enable(false);
+    hal_led_driver_enable(false);
+    hal_buck_set_pwm(PWM_MAX); /*minimum duty cycle*/
+
+
+    /* initialize all modules */
+
+    measurements_init();
+    power_budget_init(&sys.budget);
+    energy_mode_init(&sys.energy);
+    charger_init(&sys.charger);
+    mppt_init(&sys.mppt);
+    fault_mgr_init(&sys.faults);
+
+
+
     
 
 }
