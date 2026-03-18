@@ -1,19 +1,26 @@
-FROM           , GUARD                                    , TO
-IDLE           , has_sun AND !has_load AND !bat_full      , CHARGE_ONLY
-IDLE           , !has_sun AND has_load AND !bat_low       , DISCHARGE_ONLY
-IDLE           , has_sun AND has_load AND !bat_full       , CHARGE_AND_LOAD
-CHARGE_ONLY    , has_load                                 , CHARGE_AND_LOAD
-CHARGE_ONLY    , !has_sun OR bat_full                     , IDLE
-CHARGE_AND_LOAD, !has_load                                , CHARGE_ONLY
-CHARGE_AND_LOAD, !has_sun AND !bat_low                    , DISCHARGE_ONLY
-CHARGE_AND_LOAD, !has_sun AND bat_low                     , SAFE_MODE
-CHARGE_AND_LOAD, bat_full AND !has_load                   , IDLE
-CHARGE_AND_LOAD, bat_full AND has_load                    , DISCHARGE_ONLY
-DISCHARGE_ONLY , !has_load                                , IDLE
-DISCHARGE_ONLY , has_sun AND has_load                     , CHARGE_AND_LOAD
-DISCHARGE_ONLY , has_sun AND !has_load                    , CHARGE_ONLY
-DISCHARGE_ONLY , bat_low AND !has_load AND !has_sun       , SAFE_MODE
-SAFE_MODE      , V_bat > 3200mV AND has_sun               , CHARGE_ONLY
-SAFE_MODE      , V_bat > 3200mV AND has_load AND !bat_full, CHARGE_AND_LOAD
-SAFE_MODE      , !has_load                                , IDLE
-SAFE_MODE      , V_bat > 3200mV AND !has_sun              , IDLE
+PRIORITY,FROM,GUARD,TO,NOTES
+1,IDLE,has_sun AND has_load AND !bat_full,CHARGE_AND_LOAD,most specific first — both sun and load
+2,IDLE,has_sun AND !has_load AND !bat_full,CHARGE_ONLY,sun only
+3,IDLE,!has_sun AND has_load AND !bat_low,DISCHARGE_ONLY,load only — battery must not be low
+4,IDLE,!has_sun AND has_load AND bat_low,SAFE_MODE,load present but battery low and no sun — go safe immediately
+5,IDLE,<default>,IDLE,no actionable condition — stay idle
+1,CHARGE_ONLY,has_load,CHARGE_AND_LOAD,highest priority — load appeared
+2,CHARGE_ONLY,!has_sun,IDLE,sun lost — stop charging
+3,CHARGE_ONLY,bat_full,IDLE,battery full — stop charging
+4,CHARGE_ONLY,<default>,CHARGE_ONLY,stay
+1,CHARGE_AND_LOAD,!has_sun AND bat_low,SAFE_MODE,safety first — no sun and battery low
+2,CHARGE_AND_LOAD,!has_sun AND !bat_low,DISCHARGE_ONLY,sun lost but battery ok
+3,CHARGE_AND_LOAD,bat_full AND !has_load,IDLE,full and no load
+4,CHARGE_AND_LOAD,bat_full AND has_load,DISCHARGE_ONLY,full but load still present — stop charging and feed from battery
+5,CHARGE_AND_LOAD,!has_load AND !bat_full,CHARGE_ONLY,load removed — keep charging
+6,CHARGE_AND_LOAD,<default>,CHARGE_AND_LOAD,stay
+1,DISCHARGE_ONLY,bat_low AND has_load,SAFE_MODE,"FIXED: was missing — battery low under load is the critical case, must shed"
+2,DISCHARGE_ONLY,bat_low AND !has_load,IDLE,"battery low but no load — just go idle, nothing to shed"
+3,DISCHARGE_ONLY,has_sun AND has_load,CHARGE_AND_LOAD,sun appeared with load
+4,DISCHARGE_ONLY,has_sun AND !has_load,CHARGE_ONLY,sun appeared without load
+5,DISCHARGE_ONLY,!has_load,IDLE,load removed
+6,DISCHARGE_ONLY,<default>,DISCHARGE_ONLY,stay
+1,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND has_load AND !bat_full,CHARGE_AND_LOAD,recovered with sun and load
+2,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND !has_load,CHARGE_ONLY,recovered with sun only
+3,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND !has_load,IDLE,recovered and nothing connected
+4,SAFE_MODE,<default>,SAFE_MODE,"FIXED: removed '!has_load → IDLE' to prevent oscillation after load shedding. Recovery requires V_bat > SAFE_RECOVER_MV (3200mV). Loads stay shed until battery recovers."

@@ -1,7 +1,11 @@
-from,guard,to
-DISABLED,panel_limited AND has_sun,TRACKING
-TRACKING,converged (step==1 AND reversals>6),HOLD
-TRACKING,timeout (MPPT_RUNTIME expired),HOLD
-TRACKING,!has_sun,DISABLED
-HOLD,hold_time expired AND panel_limited,TRACKING
-HOLD,!panel_limited AND panel_limited,DISABLED
+PRIORITY,FROM,GUARD,TO,NOTES
+1,DISABLED,panel_limited AND has_sun,TRACKING,panel is limiting — start optimization
+2,DISABLED,<default>,DISABLED,stay
+1,TRACKING,!has_sun,DISABLED,safety first — sun lost kills tracking immediately
+2,TRACKING,converged (step_size == 1 AND reversals > 6),HOLD,algorithm converged
+3,TRACKING,timeout (MPPT_RUNTIME expired),HOLD,time limit reached
+4,TRACKING,<default>,TRACKING,continue tracking
+1,HOLD,!panel_limited,DISABLED,"FIXED: was '!panel_limited AND panel_limited' (contradiction). Panel no longer limiting — MPPT not needed"
+2,HOLD,hold_time expired AND panel_limited AND has_sun,TRACKING,time to re-track — added has_sun guard for safety
+3,HOLD,!has_sun,DISABLED,sun lost — disable
+4,HOLD,<default>,HOLD,wait

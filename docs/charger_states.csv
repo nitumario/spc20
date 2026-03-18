@@ -1,4 +1,13 @@
-state    , regulation, target                                    , entry_from                                      , exit_to
-PRECHARGE, current   , allowed_chg(budget limits to <=200mA)     , Activation with V_bat < 3000mV                  , CC when V_bat ≥ 3000mV or 15min timeout failure
-CC       , current   , allowed_chg(takes load into consideration), Activation with V_bat ≥ 3000mV or from PRECHARGE, CV when V_bat ≥ 3650mV
-CV       , voltage   , 3650mV (3650-3660mV)                      , CC                                              , Signal bat_full when I_charge < 200mA for 30s
+PRIORITY,FROM,GUARD,TO,NOTES
+-,INACTIVE,activated AND V_bat < 3000mV,PRECHARGE,region activated by ENERGY_MODE — low battery starts gentle
+-,INACTIVE,activated AND V_bat >= 3000mV,CC,region activated by ENERGY_MODE — normal battery starts CC
+1,PRECHARGE,V_bat >= 3000mV,CC,battery recovered — move to full current
+2,PRECHARGE,timeout (15min),FAULT,precharge timeout — battery may be damaged
+3,PRECHARGE,deactivated,INACTIVE,"EXIT ACTION: pwm = PWM_MIN_DUTY (399), assert BUCK_DIS, reset state"
+4,PRECHARGE,<default>,PRECHARGE,stay — regulate at allowed_chg (budget-clamped to <=200mA)
+1,CC,V_bat >= 3650mV,CV,voltage threshold reached
+2,CC,deactivated,INACTIVE,"EXIT ACTION: pwm = PWM_MIN_DUTY (399), assert BUCK_DIS, reset state"
+3,CC,<default>,CC,stay — regulate at allowed_chg (load-aware target)
+1,CV,I_charge < 200mA for 30s,SIGNAL_BAT_FULL,charge complete — signal ENERGY_MODE
+2,CV,deactivated,INACTIVE,"EXIT ACTION: pwm = PWM_MIN_DUTY (399), assert BUCK_DIS, reset state"
+3,CV,<default>,CV,stay — regulate voltage at 3650mV
