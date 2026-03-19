@@ -62,7 +62,3 @@
 - **Old:** "15min timeout failure" — destination unspecified.
 - **New:** Explicit `timeout → FAULT` transition. A battery that can't exit precharge in 15 minutes is likely damaged or disconnected.
 
-
-# [v0.02] - 19.03.26
-
-## NEW: added magic numbers, constants, thresholds, limits and timing constants in hw_config.h
