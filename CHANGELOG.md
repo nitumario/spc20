@@ -1,3 +1,38 @@
+# [v0.02] - 20.03.26
+## SPCBoardAPI refactor — HAL/application split
+
+Stripped application logic from SPCBoardAPI so it is a pure HAL.
+All removed items are either replaced by the new module architecture
+(energy_mode, charger, mppt, UI_MGR) or are pending move there.
+
+### Removed — application logic that doesn't belong in HAL
+- `power_manager()` — replaced by energy_mode + charger + power_budget
+- `apply_mppt_perturb_observe_step()` and `MpptStep` enum — replaced by mppt module
+- `handle_button_input()` — button reading stays in HAL; action policy moves to UI_MGR
+- `handle_ir()`, `receive_command()`, `get_command()` — IR command interpretation is application logic
+- `receive_command_sw()`, `on_received_edge()`, `get_decoded_value()`, `get_msg_led()`, `l_sw_init()`, `reset_sw_receive()` — entire light switch decoder removed
+- `handle_uart()`, `UARTReceive()`, `get_UART_buffer()` — UART receive/parse is application logic; `printToUART()` kept
+- `turn_on_outputs()`, `turn_off_outputs()` — energy_mode calls individual enable/disable functions directly
+- `startup_safe_connect()` — replaced by new init sequence in main
+- `get_system_state()` — replaced by ctx_print() style logging from system_ctx_t
+
+### Removed — toggle functions
+- `toggle_charger_switch()`, `toggle_battery_switch()`, `toggle_output_switch()`, `toggle_usb()`, `toggle_buck()`, `toggle_led()` — dangerous in a state machine; state machine uses explicit enable/disable so switch state is always known
+
+### Removed — _log measurement variants
+- `get_charge_current_log()`, `get_battery_voltage_log()`, and all other `_log` getters — logging reads `ctx->meas` directly; no need for a parallel getter set
+- Internal `buffer_log`, `sum_log`, `avg_readings_log`, `add_sample_log()`, `get_average_log()` also removed
+
+### Removed — display policy functions
+- `display_time()`, `display_error_fault()`, `display_ovp_fault()`, `display_ocp_fault()`, `displayCurrentPower()`, `displayChargeStorage()` — what to show is UI_MGR policy; HAL keeps `update_led_bar()` and `update_seven_segment_display()` as raw primitives
+- `update_led_display()` mux timing kept; policy calls replaced with `/* UI_MGR sets content here */` comment
+
+### Changed — return types
+- `get_temperature()`: `float` → `int16_t` (°C truncated). Thermistor math unchanged internally.
+- `get_charge_current()`: `int32_t` → `int16_t`. Max range is ~±2500 mA; int16_t (±32767) is sufficient and avoids wasting a register pair on M0+.
+
+---
+
 # [v0.01] - 18.03.26
 ## format change for tables
 

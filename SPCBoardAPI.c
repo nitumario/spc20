@@ -196,78 +196,6 @@ void disable_battery_switch(void){
     System_Status.battery_switch = false;
 }
 
-/* ============================================================================
- * GPIO CONTROL - TOGGLE HELPERS
- * ============================================================================ */
-
-void toggle_charger_switch(void){
-    if(System_Status.charger_switch){
-        disable_charge_switch();
-    } else {
-        enable_charge_switch();
-    }
-}
-
-void toggle_battery_switch(void){
-    if(System_Status.battery_switch){
-        disable_battery_switch();
-    } else {
-        enable_battery_switch();
-    }
-}
-
-void toggle_output_switch(void){
-    if(System_Status.output_switch){
-        disable_output_switch();
-    } else {
-        enable_output_switch();
-    }
-}
-
-void toggle_usb(void){
-    if(System_Status.usb_boost){
-        disable_usb_boost();
-    } else {
-        enable_usb_boost();
-    }
-}
-
-void toggle_buck(void){
-    if(System_Status.buck){
-        disable_input_buck();
-    } else {
-        enable_input_buck();
-    }
-}
-
-void toggle_led(void){
-    if(System_Status.led_boost){
-        disable_led_boost();
-    } else {
-        enable_led_boost();
-    }
-}
-
-/*
- * Writes current System_Status values into a caller-provided array.
- * Returns:
- *  0  on success
- * -1  if output buffer is too small
- */
-int get_system_state(int *output_array, int output_array_size){
-    if(output_array_size < 6){
-        return -1;
-    }
-
-    output_array[0] = System_Status.buck;
-    output_array[1] = System_Status.led_boost;
-    output_array[2] = System_Status.usb_boost;
-    output_array[3] = System_Status.charger_switch;
-    output_array[4] = System_Status.battery_switch;
-    output_array[5] = System_Status.output_switch;
-
-    return 0;
-}
 
 /* ============================================================================
  * ADC MODULE - CONFIGURATION, FILTERING, AND CONVERSION
@@ -525,9 +453,6 @@ float _convertToTemp(uint16_t voltage_value, float supply_voltage, NTC ntc){
 #define ALPHA2 1.0f
 uint32_t num_reads = 0;
 
-volatile bool receiving_b_int = false;
-volatile uint16_t leds_1[2] = {0, 0};
-
 /*
  * Simple deadband filter to suppress small fluctuations.
  * If delta exceeds threshold, accept new input; otherwise keep previous value.
@@ -543,26 +468,19 @@ uint32_t deadband_filter(uint32_t current_input, uint32_t accepted_input, uint8_
 #define DEADBAND_THRESHOLD_ADC 1
 #define NUM_VARS     14
 #define WINDOW_SIZE  64
-#define WINDOW_SIZE_LOG  64
 
 /*
- * Moving average buffers:
- * - buffer: live averaging window
- * - buffer_log: longer-term / logging window
+ * Moving average buffer for live readings.
  */
 uint32_t buffer[NUM_VARS * WINDOW_SIZE];
-uint32_t buffer_log[NUM_VARS * WINDOW_SIZE_LOG];
 
 uint8_t index_1[NUM_VARS] = {0};
-uint8_t index_1_log[NUM_VARS] = {0};
 
 uint32_t sum[NUM_VARS] = {0};
-uint32_t sum_log[NUM_VARS] = {0};
 
 volatile bool new_data_flag = false;
 
 uint32_t avg_readings[NUM_VARS] = {0};
-uint32_t avg_readings_log[NUM_VARS] = {0};
 
 /*
  * Adds sample to rolling window and updates running sum.
@@ -583,21 +501,6 @@ uint32_t get_average(uint8_t var_id) {
     return sum[var_id] / WINDOW_SIZE;
 }
 
-void add_sample_log(uint8_t var_id, uint32_t sample) {
-    uint8_t pos = index_1_log[var_id];
-    uint16_t buf_pos = var_id * WINDOW_SIZE_LOG + pos;
-
-    sum_log[var_id] -= buffer_log[buf_pos];
-    buffer_log[buf_pos] = sample;
-    sum_log[var_id] += sample;
-
-    index_1_log[var_id] = (pos + 1) % WINDOW_SIZE_LOG;
-}
-
-uint32_t get_average_log(uint8_t var_id) {
-    return sum_log[var_id] / WINDOW_SIZE_LOG;
-}
-
 /*
  * ADC channel mapping in averaging arrays:
  * (0)IDISCHARGE, (1)VOUTM, (2)VBATM, (3)TEMP3, (4)ICHARGE, (5)IPANEL,
@@ -611,21 +514,15 @@ void read_adc_values(void){
 
         for(uint8_t i = 0; i < 9; i++){
             uint16_t raw = DL_ADC12_getMemResult(ADC0_INST, i);
-
             add_sample(var_id, raw);
-            add_sample_log(var_id, raw);
             var_id++;
-
             ADC.Adc0Result[i] = raw;
         }
 
         for(uint8_t i = 0; i <= 4; i++){
             uint16_t raw = DL_ADC12_getMemResult(ADC1_INST, i);
-
             add_sample(var_id, raw);
-            add_sample_log(var_id, raw);
             var_id++;
-
             ADC.Adc1Result[i] = raw;
         }
 
@@ -638,25 +535,10 @@ void read_adc_values(void){
             }
             new_data_flag = true;
         }
-
-        if(num_reads >= WINDOW_SIZE_LOG){
-            for(uint8_t i = 0; i < NUM_VARS; i++){
-                avg_readings_log[i] = get_average_log(i);
-            }
-        }
     }
 
     gCheckADC1 = false;
     gCheckADC2 = false;
-
-    /*
-     * During message reception, evaluate LED lines to detect activity
-     * and infer the active LED channel.
-     */
-    if(receiving_b_int){
-        if(ADC.Adc1Result[1] > 1420) leds_1[0] += 1;
-        if(ADC.Adc1Result[2] > 1420) leds_1[1] += 1;
-    }
 
     // Re-arm and restart conversions for continuous sampling
     DL_ADC12_enableConversions(ADC0_INST);
@@ -668,12 +550,12 @@ void read_adc_values(void){
 
 /* Conversion helpers */
 
-int32_t get_charge_current(void){
+int16_t get_charge_current(void){
     if(!System_Status.charger_switch) return 0;
 
     // Offset-adjusted measurement conversion
     float v_icharge = ((ADC.VREF*(float)avg_readings[4])/(ADC.max_adc0_value)) - 1260.0;
-    return (int32_t)(v_icharge/CHG_CUR_GAIN/CHG_CUR_RES);
+    return (int16_t)(v_icharge/CHG_CUR_GAIN/CHG_CUR_RES);
 }
 
 uint16_t get_charge_voltage(void){
@@ -748,20 +630,17 @@ uint16_t get_vdd(){
     return gAdcResultVolts;
 }
 
-float get_temperature(TEMP_SENSOR temp_sensor){
-    float gAdcResultVolts;
-    uint16_t adcResultVDD;
-
-    adcResultVDD = ADC.Adc0Result[6];
-    gAdcResultVolts = (adcResultVDD * ADC.VREF*3) / (ADC.max_adc0_value);
+int16_t get_temperature(TEMP_SENSOR temp_sensor){
+    uint16_t adcResultVDD = ADC.Adc0Result[6];
+    float gAdcResultVolts = (adcResultVDD * ADC.VREF*3) / (ADC.max_adc0_value);
 
     switch(temp_sensor){
         case TEMP1:
-            return _convertToTemp((uint16_t)(ADC.VREF*ADC.Adc1Result[4]/(ADC.max_adc1_value)), gAdcResultVolts, NTCC_10K);
+            return (int16_t)_convertToTemp((uint16_t)(ADC.VREF*ADC.Adc1Result[4]/(ADC.max_adc1_value)), gAdcResultVolts, NTCC_10K);
         case TEMP3:
-            return _convertToTemp((uint16_t)(ADC.VREF*ADC.Adc0Result[3]/(ADC.max_adc0_value)), gAdcResultVolts, NCP18X);
+            return (int16_t)_convertToTemp((uint16_t)(ADC.VREF*ADC.Adc0Result[3]/(ADC.max_adc0_value)), gAdcResultVolts, NCP18X);
         default:
-            return INVALID_RESULT;
+            return (int16_t)INVALID_RESULT;
     }
 }
 
@@ -1161,130 +1040,11 @@ void get_time(DL_RTC_Common_Calendar* time_struct){
 
 
 /*
- * Displays battery storage level by illuminating a bar graph.
- * Thresholds are in millivolts; adjust according to battery chemistry curve.
+ * Multiplex display update — drives DIG1/DIG2 switching at 4ms intervals.
+ * Content (LED states) must be set by UI_MGR via update_led_bar() before
+ * calling this function, or directly via GPIO before each DIG enable.
  */
-void displayChargeStorage() {
-    uint16_t VBATT = get_battery_voltage();
-
-    if (VBATT <= 3020) {
-        // All off
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED1_PIN |
-                        DISP_CTRL_DISP_LED2_PIN |
-                        DISP_CTRL_DISP_LED3_PIN |
-                        DISP_CTRL_DISP_LED4_PIN |
-                        DISP_CTRL_DISP_LED5_PIN);
-
-    } else if((VBATT <= 3120)&&( VBATT > 3020)) {
-        DL_GPIO_clearPins(GPIOA, DISP_CTRL_DISP_LED1_PIN);
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED2_PIN |
-                        DISP_CTRL_DISP_LED3_PIN |
-                        DISP_CTRL_DISP_LED4_PIN |
-                        DISP_CTRL_DISP_LED5_PIN);
-
-    } else if ((VBATT <= 3240)&&(VBATT > 3120)) {
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED1_PIN |
-                          DISP_CTRL_DISP_LED2_PIN);
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED3_PIN |
-                        DISP_CTRL_DISP_LED4_PIN |
-                        DISP_CTRL_DISP_LED5_PIN);
-
-    } else if ((VBATT <= 3360)&&(VBATT > 3240)) {
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED1_PIN |
-                          DISP_CTRL_DISP_LED2_PIN |
-                          DISP_CTRL_DISP_LED3_PIN);
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED4_PIN |
-                        DISP_CTRL_DISP_LED5_PIN);
-
-    } else if ((VBATT <= 3480)&&(VBATT > 3360)){
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED1_PIN |
-                          DISP_CTRL_DISP_LED2_PIN |
-                          DISP_CTRL_DISP_LED3_PIN |
-                          DISP_CTRL_DISP_LED4_PIN);
-        DL_GPIO_setPins(GPIOA, DISP_CTRL_DISP_LED5_PIN);
-
-    } else {
-        // Full (all on)
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED1_PIN |
-                          DISP_CTRL_DISP_LED2_PIN |
-                          DISP_CTRL_DISP_LED3_PIN |
-                          DISP_CTRL_DISP_LED4_PIN |
-                          DISP_CTRL_DISP_LED5_PIN);
-    }
-}
-
-/*
- * Displays charging current level using the same bar graph LEDs.
- * This is a quick visual feedback for charge intensity.
- */
-void displayCurrentPower() {
-    uint16_t CHG_PWR = get_charge_current();
-
-    if (CHG_PWR <= 0) {
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED1_PIN |
-                        DISP_CTRL_DISP_LED2_PIN |
-                        DISP_CTRL_DISP_LED3_PIN |
-                        DISP_CTRL_DISP_LED4_PIN |
-                        DISP_CTRL_DISP_LED5_PIN);
-
-    } else if((CHG_PWR <= 400)&&( CHG_PWR > 0)) {
-        DL_GPIO_clearPins(GPIOA, DISP_CTRL_DISP_LED5_PIN);
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED4_PIN |
-                        DISP_CTRL_DISP_LED3_PIN |
-                        DISP_CTRL_DISP_LED2_PIN |
-                        DISP_CTRL_DISP_LED1_PIN);
-
-    } else if ((CHG_PWR<= 800)&&(CHG_PWR > 400)) {
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED5_PIN |
-                          DISP_CTRL_DISP_LED4_PIN);
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED3_PIN |
-                        DISP_CTRL_DISP_LED2_PIN |
-                        DISP_CTRL_DISP_LED1_PIN);
-
-    } else if ((CHG_PWR <= 1200)&&(CHG_PWR > 800)) {
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED5_PIN |
-                          DISP_CTRL_DISP_LED4_PIN |
-                          DISP_CTRL_DISP_LED3_PIN);
-        DL_GPIO_setPins(GPIOA,
-                        DISP_CTRL_DISP_LED2_PIN |
-                        DISP_CTRL_DISP_LED1_PIN);
-
-    } else if ((CHG_PWR <= 1600)&&(CHG_PWR > 1200)){
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED5_PIN |
-                          DISP_CTRL_DISP_LED4_PIN |
-                          DISP_CTRL_DISP_LED3_PIN |
-                          DISP_CTRL_DISP_LED2_PIN);
-        DL_GPIO_setPins(GPIOA, DISP_CTRL_DISP_LED1_PIN);
-
-    } else if (CHG_PWR > 1600){
-        DL_GPIO_clearPins(GPIOA,
-                          DISP_CTRL_DISP_LED1_PIN |
-                          DISP_CTRL_DISP_LED2_PIN |
-                          DISP_CTRL_DISP_LED3_PIN |
-                          DISP_CTRL_DISP_LED4_PIN |
-                          DISP_CTRL_DISP_LED5_PIN);
-    }
-}
-
-/*
- * Multiplex display update.
- * Alternates between display modes at a fixed interval using time_now().
- */
-void update_led_display() {
+void update_led_display(void) {
     static uint8_t com_on = 0;
     static uint32_t last_change_time = 0;
 
@@ -1302,9 +1062,8 @@ void update_led_display() {
                             DISP_CTRL_DISP_LED3_PIN |
                             DISP_CTRL_DISP_LED4_PIN |
                             DISP_CTRL_DISP_LED5_PIN);
-
             DL_GPIO_clearPins(GPIOB, DISP_CTRL_DIG2_PIN);
-            displayChargeStorage();
+            /* UI_MGR sets content here via update_led_bar() */
             break;
 
         case 1:
@@ -1315,9 +1074,8 @@ void update_led_display() {
                             DISP_CTRL_DISP_LED3_PIN |
                             DISP_CTRL_DISP_LED4_PIN |
                             DISP_CTRL_DISP_LED5_PIN);
-
             DL_GPIO_clearPins(GPIOA, DISP_CTRL_DIG1_PIN);
-            displayCurrentPower();
+            /* UI_MGR sets content here via update_led_bar() */
             break;
 
         default:
@@ -1418,262 +1176,11 @@ void update_buttons(void)
     }
 }
 
-/*
- * Handles button actions for LED brightness control:
- * - Long press: turn off ALL LED output
- * - Short press: cycle through predefined brightness steps
- */
-void handle_button_input(void){
-    update_buttons();
 
-    if (BUTTONS[0].longPress) {
-        set_led_voltage(0);
-
-    }
-
-    if (BUTTONS[1].longPress) {
-        set_led_voltage(0);
-
-    }
-
-    if(BUTTONS[0].wasPressed){
-        buttonPressed = true;
-        set_led_voltage(9500);
-        switch(led1_value){
-            case LED1_VALUE_0:
-                set_led_current(0, LED1);
-                led1_value = LED1_VALUE_1;
-                break;
-            case LED1_VALUE_1:
-                set_led_current(10,LED1);
-                led1_value=LED1_VALUE_2;
-                break;
-            case LED1_VALUE_2:
-                set_led_current(20, LED1);
-                led1_value=LED1_VALUE_3;
-                break;
-            case LED1_VALUE_3:
-                set_led_current(30, LED1);
-                led1_value=LED1_VALUE_4;
-                break;
-            case LED1_VALUE_4:
-                set_led_current(50, LED1);
-                led1_value=LED1_VALUE_0;
-                break;
-            default:
-                break;
-        }
-    }
-
-    if(BUTTONS[1].wasPressed){
-        buttonPressed = true;
-        set_led_voltage(9500);
-        switch(led2_value){
-            case LED2_VALUE_0:
-                set_led_current(0, LED2);
-                led2_value = LED2_VALUE_1;
-                break;
-            case LED2_VALUE_1:
-                set_led_current(10, LED2);
-                led2_value=LED2_VALUE_2;
-                break;
-            case LED2_VALUE_2:
-                set_led_current(20, LED2);
-                led2_value=LED2_VALUE_3;
-                break;
-            case LED2_VALUE_3:
-                set_led_current(30, LED2);
-                led2_value=LED2_VALUE_4;
-                break;
-            case LED2_VALUE_4:
-                set_led_current(50, LED2);
-                led2_value=LED2_VALUE_0;
-                break;
-            default:
-                break;
-        }
-    }
-}
-
-/* ============================================================================
- * LIGHT SWITCH / EDGE CAPTURE DECODER
- * ============================================================================ */
-
-/*
- * This module decodes edge timing intervals into a 2-nibble payload.
- * It uses a timer capture input (B_INT_INST) and a watchdog timer
- * (B_INT_TIMER_INST) to enforce expected timing windows.
- */
-
-volatile uint32_t decoded_value;
-
-#define NIB_LOW_BOUND 7599
-#define NIB_HIGH_BOUND 14399
-#define INIT_LOW_BOUND 19599
-#define INIT_HIGH_BOUND 20399
-#define NIB_ZERO 20
-
-typedef enum {
-    INIT1,INIT2,INIT3, NIB1,NIB2
-} DATA_PARTS;
-
-DATA_PARTS flag = INIT1;
-
-volatile int8_t led = -1;
-
-volatile uint32_t t1, t2, dt = 0;
-volatile uint8_t received_edges = 0;
-volatile uint32_t value = 0;
-volatile uint32_t decoded_value = 0;
-volatile uint32_t wait_durations[5] = { INIT_HIGH_BOUND, INIT_HIGH_BOUND, INIT_HIGH_BOUND, NIB_HIGH_BOUND, NIB_HIGH_BOUND};
-
-void reset_sw_receive(){
-    t1 = 0;
-    t2 = 0;
-    dt = 0;
-    flag = INIT1;
-    received_edges = 0;
-    value = 0;
-}
-
-/*
- * Arms the decode watchdog timer with the expected timeout for the current state.
- */
-void run_sw_timer(){
-    DL_TimerG_stopCounter(B_INT_TIMER_INST);
-    DL_TimerG_setTimerCount(B_INT_TIMER_INST, (wait_durations[flag] * 10) + 9);
-    DL_TimerG_startCounter(B_INT_TIMER_INST);
-}
-
-volatile int8_t _LED = -1;
-
-uint8_t get_msg_led(){
-    return _LED;
-}
-
-/*
- * Maps message "brightness index" to LED current in mA.
- * This provides fine control via external message encoding.
- */
-static uint16_t brightness_mapping_fine_mA[11] = {
-    0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500
-};
-
-/*
- * Edge ISR handler (expected to be called from capture interrupt).
- * Computes delta time between edges and advances decode state machine.
- */
-void on_received_edge(){
-    t2 = B_INT_INST_LOAD_VALUE - (DL_Timer_getCaptureCompareValue(B_INT_INST, DL_TIMER_CC_1_INDEX));
-
-    if(received_edges > 0){
-        if(t2 < t1){
-            dt = ((t2 - t1 + B_INT_INST_LOAD_VALUE) * 150) / B_INT_INST_LOAD_VALUE;
-        } else {
-            dt = ((t2 - t1) * 150) / B_INT_INST_LOAD_VALUE;
-        }
-
-        switch(flag){
-            case INIT1:
-                receiving_msg_led = true;
-                leds_1[0] = 0;
-                leds_1[1] = 0;
-                /* fallthrough intentional */
-
-            case INIT2:
-            case INIT3: {
-                    if(dt >= 49 && dt <= 51){
-                        receiving_b_int = false;
-                        flag += 1;
-                        t1 = t2;
-                        received_edges++;
-                        run_sw_timer();
-                        receiving_b_int = true;
-                        return;
-                    }
-                    return;
-                }
-
-            case NIB1:
-                if(dt >= 19 && dt <= 36){
-                    value = (dt - NIB_ZERO) << 4;
-                    flag += 1;
-                    t1 = t2;
-                    received_edges++;
-                    run_sw_timer();
-                    receiving_msg_led = true;
-                    return;
-                }
-                return;
-
-            case NIB2:
-                if(dt >= 19 && dt <= 36){
-                    receiving_msg_led = false;
-                    receiving_b_int = false;
-                    value = value | (dt - NIB_ZERO);
-
-                    // Message validity check: expect multiples of 25
-                    if(value % 25 != 0) return;
-
-                    decoded_value = value;
-                    flag = INIT1;
-                    t1 = t2 = 0;
-                    received_edges = 0;
-
-                    // Determine which LED line had the most activity during reception
-                    uint16_t max = 0;
-                    for(int i = 0; i < 4; i++){
-                        if(leds_1[i] > max){
-                            max = leds_1[i];
-                            _LED = i;
-                        }
-                    }
-
-                    // Apply brightness command
-                    uint8_t index = (decoded_value) / 25;
-                    set_led_current(brightness_mapping_fine_mA[index], _LED);
-
-                    DL_TimerG_stopCounter(B_INT_TIMER_INST);
-                    return;
-                }
-                return;
-
-            default:
-                break;
-        }
-    } else {
-        t1 = t2;
-        received_edges++;
-        run_sw_timer();
-        return;
-    }
-}
-
-/*
- * Initializes light-switch capture interface and enables related interrupts.
- */
-void l_sw_init(void){
-    received_edges = 0;
-
-    NVIC_ClearPendingIRQ(B_INT_INST_INT_IRQN);
-    NVIC_EnableIRQ(B_INT_INST_INT_IRQN);
-    NVIC_EnableIRQ(B_INT_TIMER_INST_INT_IRQN);
-    DL_TimerG_startCounter(B_INT_INST);
-}
-
-uint32_t get_decoded_value(){
-    return decoded_value;
-}
 
 /* ============================================================================
  * UART MODULE
  * ============================================================================ */
-
-#define MAX_BUFFER_SIZE 64
-
-char UART_Buffer[MAX_BUFFER_SIZE];
-volatile bool data_received = false;
-volatile uint8_t char_index = 0;
 
 /*
  * invokeBSLAsm():
@@ -1719,7 +1226,6 @@ __STATIC_INLINE void invokeBSLAsm(void)
 }
 
 void uart_init(void){
-    data_received = false;
     NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
     NVIC_EnableIRQ(UART_0_INST_INT_IRQN);
 }
@@ -1749,44 +1255,6 @@ void printToUART(char* string, char end_char){
     }
 }
 
-/*
- * UART receive handler:
- * Buffers input until newline / terminator or buffer limit.
- * Special case: receiving 0x22 triggers BSL entry if battery is low enough.
- */
-void UARTReceive(){
-    if(data_received == true){
-        DL_UART_receiveData(UART_0_INST);
-        return;
-    }
-
-    char c = DL_UART_receiveData(UART_0_INST);
-
-    if (c == 0x22) {
-        if(get_battery_voltage() > 3000){
-            return;
-        }
-        invokeBSLAsm();
-        return;
-    }
-
-    if(c == '\r' && char_index == 0) return;
-
-    UART_Buffer[char_index] = c;
-    char_index = char_index + 1;
-
-    if(char_index > MAX_BUFFER_SIZE - 2 || c == '\n' || c == '~'){
-        UART_Buffer[char_index] = '\0';
-        data_received = true;
-        char_index = 0;
-    }
-}
-
-void get_UART_buffer(char* output_buffer){
-    strcpy(output_buffer, UART_Buffer);
-    memset(UART_Buffer, 0, MAX_BUFFER_SIZE);
-    data_received = false;
-}
 
 /* ============================================================================
  * SYSTEM TIMEBASE (SYSTICK COUNTER)
@@ -1806,23 +1274,6 @@ uint32_t time_now(void){
     return timestamp;
 }
 
-/* ============================================================================
- * OUTPUT CONTROL
- * ============================================================================ */
-
-void turn_on_leds(){
-    set_led_voltage(9500);
-}
-
-void turn_on_outputs(void){
-    enable_led_boost();
-    enable_usb_boost();
-}
-
-void turn_off_outputs(void){
-    disable_led_boost();
-    disable_usb_boost();
-}
 
 
 
