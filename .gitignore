@@ -2,3 +2,6 @@
 .settings/
 Debug/
 architecture.md
+claude_instructions.txt
+.gitignore
+CLAUDE.md
