@@ -1,3 +1,33 @@
+# [v0.03] - 20.03.26
+## Implement measurements module (pipeline steps 1 & 2)
+
+New files: `measurements.h`, `measurements.c`
+
+### NEW: measurements_update() — pipeline step 1
+- Reads all ADC channels via HAL `get_*()` functions into `ctx->meas`
+- Clamps `panel_current` to 0 if HAL returns negative (sensor noise protection)
+- Computes derived values: `panel_power` (mW), `i_bat_net` (signed mA)
+
+### NEW: flags_update() — pipeline step 2
+- `bat_low`: debounced (3-count) + hysteresis (2800/2900 mV) — unchanged from prior design
+- `has_sun`: debounced (3-count) + hysteresis (9000/8000 mV) — **upgraded from plain bool** to `debounce_flag_t` to filter cloud transients
+- `has_load`: hysteresis only (50/30 mA) — load events are clean, no debounce needed
+- `panel_limited`: guards against unsigned underflow when `allowed_chg < PANEL_LIMITED_MARGIN_MA`
+- `temp_charge_ok`: 10°C hysteresis on recovery (blocked at 0/45°C, resumes at 10/35°C)
+- `bat_full`: not touched — owned by charger module
+
+### NEW: debounce_update() helper — static in measurements.c
+- Generic debounce logic for any `debounce_flag_t`: counts consecutive set-condition readings, clears on clear-condition
+
+### Changed: system_types.h
+- `has_sun` (plain `bool`) → `flag_has_sun` (`debounce_flag_t`) — state machines will read `ctx->flag_has_sun.value`
+- `ctx_init()`: added `flag_has_sun` debounce configuration (count_threshold = 3)
+
+### Changed: hw_config.h
+- Added `HAS_SUN_DEBOUNCE_COUNT` (3) — consecutive readings before `has_sun` sets (×50 ms = 150 ms)
+
+---
+
 # [v0.02] - 20.03.26
 ## SPCBoardAPI refactor — HAL/application split
 
