@@ -22,5 +22,6 @@ PRIORITY,FROM,GUARD,TO,NOTES
 6,DISCHARGE_ONLY,<default>,DISCHARGE_ONLY,stay
 1,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND has_load AND !bat_full,CHARGE_AND_LOAD,recovered with sun and load
 2,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND !has_load,CHARGE_ONLY,recovered with sun only
-3,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND !has_load,IDLE,recovered and nothing connected
-4,SAFE_MODE,<default>,SAFE_MODE,"FIXED: removed '!has_load → IDLE' to prevent oscillation after load shedding. Recovery requires V_bat > SAFE_RECOVER_MV (3200mV). Loads stay shed until battery recovers."
+3,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND has_load,DISCHARGE_ONLY,"FIXED: was missing — battery recovered overnight (no sun) but load still present; battery can supply load"
+4,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND !has_load,IDLE,recovered and nothing connected
+5,SAFE_MODE,<default>,SAFE_MODE,"FIXED: removed '!has_load → IDLE' to prevent oscillation after load shedding. Recovery requires V_bat > SAFE_RECOVER_MV (3200mV). Loads stay shed until battery recovers."
