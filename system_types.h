@@ -405,10 +405,10 @@ typedef struct {
      * for transition decisions.
      */
     debounce_flag_t flag_bat_low;    /* V_bat < BAT_LOW_MV                  */
-    bool has_sun;                    /* V_panel > PANEL_MIN_MV              */
-    bool has_load;                   /* I_load > LOAD_DETECT_MA             */
+    debounce_flag_t flag_has_sun;    /* V_panel > PANEL_MIN_MV (debounced)  */
+    bool has_load;                   /* I_dsg > LOAD_DETECT_MA (hysteresis) */
     bool bat_full;                   /* charger signaled taper complete     */
-    bool panel_limited;              /* I_chg < allowed_chg - margin AND sun*/
+    bool panel_limited;              /* I_chg < allowed_chg - margin AND sun */
     bool temp_charge_ok;             /* battery temp within charge range    */
 
     /* ── Power budget (written by power_budget_update, step 3) ── */
@@ -487,6 +487,11 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->flag_bat_low.value = false;
     ctx->flag_bat_low.count = 0;
     ctx->flag_bat_low.count_threshold = BAT_LOW_DEBOUNCE_COUNT;
+
+    /* has_sun debounce configuration */
+    ctx->flag_has_sun.value = false;
+    ctx->flag_has_sun.count = 0;
+    ctx->flag_has_sun.count_threshold = HAS_SUN_DEBOUNCE_COUNT;
 
     /* Assume temperature OK until first measurement */
     ctx->temp_charge_ok = true;

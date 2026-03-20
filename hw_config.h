@@ -71,6 +71,7 @@
 
 #define PANEL_MIN_MV              9000    /* has_sun flag sets above this                         */
 #define PANEL_MIN_CLEAR_MV        8000    /* has_sun clears below this (1 V hysteresis)           */
+#define HAS_SUN_DEBOUNCE_COUNT    3       /* consecutive readings before flag sets (×50 ms)       */
 #define PANEL_SAFETY_MV           10000   /* CC backs off below this to avoid collapsing panel    */
 
 /* =========================================================================
