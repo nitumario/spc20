@@ -15,6 +15,7 @@ const ADC122  = ADC12.addInstance();
 const Board   = scripting.addModule("/ti/driverlib/Board");
 const GPIO    = scripting.addModule("/ti/driverlib/GPIO", {}, false);
 const GPIO1   = GPIO.addInstance();
+const GPIO2   = GPIO.addInstance();
 const RTC     = scripting.addModule("/ti/driverlib/RTC");
 const SYSCTL  = scripting.addModule("/ti/driverlib/SYSCTL");
 const SYSTICK = scripting.addModule("/ti/driverlib/SYSTICK");
@@ -35,7 +36,7 @@ ADC122.adcPin0Config.hideOutputInversion = scripting.forceWrite(false);
 
 Board.configureUnused = true;
 
-GPIO1.$name                                  = "GPIO_GRP_0";
+GPIO1.$name                                  = "EN";
 GPIO1.associatedPins.create(11);
 GPIO1.associatedPins[0].$name                = "BATTERY_ENABLE";
 GPIO1.associatedPins[0].assignedPort         = "PORTB";
@@ -75,6 +76,17 @@ GPIO1.associatedPins[10].$name               = "CRT_SNS_EN";
 GPIO1.associatedPins[10].assignedPort        = "PORTB";
 GPIO1.associatedPins[10].assignedPortSegment = "Upper";
 GPIO1.associatedPins[10].assignedPin         = "16";
+
+GPIO2.$name                         = "BTNS";
+GPIO2.port                          = "PORTB";
+GPIO2.associatedPins.create(2);
+GPIO2.associatedPins[0].$name       = "BTN1";
+GPIO2.associatedPins[0].direction   = "INPUT";
+GPIO2.associatedPins[0].assignedPin = "6";
+GPIO2.associatedPins[0].pin.$assign = "PB6";
+GPIO2.associatedPins[1].$name       = "BTN2";
+GPIO2.associatedPins[1].direction   = "INPUT";
+GPIO2.associatedPins[1].assignedPin = "7";
 
 
 SYSCTL.forceDefaultClkConfig  = true;
@@ -121,6 +133,7 @@ GPIO1.associatedPins[7].pin.$suggestSolution  = "PB5";
 GPIO1.associatedPins[8].pin.$suggestSolution  = "PB1";
 GPIO1.associatedPins[9].pin.$suggestSolution  = "PB2";
 GPIO1.associatedPins[10].pin.$suggestSolution = "PB16";
+GPIO2.associatedPins[1].pin.$suggestSolution  = "PB7";
 RTC.peripheral.$suggestSolution               = "RTC";
 UART1.peripheral.$suggestSolution             = "UART0";
 UART1.peripheral.rxPin.$suggestSolution       = "PA1";
