@@ -1,3 +1,19 @@
+# [v0.04] - 27.03.26
+## Implement power budget module (pipeline step 3)
+
+New files: `power_budget.h`, `power_budget.c`
+
+### NEW: power_budget_update() — pipeline step 3
+- Computes `i_buck_max = MIN(BUCK_MAX_CURRENT_MA, mppt_limit_ma)`
+- Computes `allowed_chg = i_buck_max - I_load`, clamped to `[0, bat_limit]`
+- Three battery voltage zones for `bat_limit`:
+  - V_bat < 3000 mV → 200 mA (precharge, gentle trickle)
+  - V_bat < 3650 mV → 2000 mA (CC, normal bulk charge)
+  - V_bat >= 3650 mV → 200 mA (near-full safety cap, defense-in-depth against one-tick CC overshoot before charger transitions to CV)
+- Signed arithmetic prevents unsigned underflow when loads exceed buck capacity
+
+---
+
 # [v0.03] - 20.03.26
 ## Implement measurements module (pipeline steps 1 & 2)
 
