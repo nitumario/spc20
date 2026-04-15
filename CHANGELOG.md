@@ -1,3 +1,48 @@
+# [v0.07] - 15.04.26
+## Implement charger module (pipeline step 7)
+
+New files: `charger.h`, `charger.c`
+
+### NEW: charger_update() — pipeline step 7
+- Runs after `mppt_update()` and before `apply_pwm()` so the charger can yield PWM control when MPPT is TRACKING, and its regulation output is what ends up in the timer
+- Four-state machine per `docs/charger_states.csv`: `CHG_INACTIVE`, `CHG_PRECHARGE`, `CHG_CC`, `CHG_CV`
+- Activation gated by `energy_mode ∈ {EM_CHARGE_ONLY, EM_CHARGE_AND_LOAD}` AND no charge-blocking fault latched; otherwise forced to `CHG_INACTIVE` with `pwm = PWM_MIN_DUTY`
+
+### Self-activation from INACTIVE
+- `energy_mode` enables buck + charge switch and leaves `state = CHG_INACTIVE`. The charger picks:
+  - `V_bat < 3000 mV` → `CHG_PRECHARGE`
+  - `V_bat ≥ 3000 mV` → `CHG_CC`
+- Falls through to run a regulation tick in the new state — no wasted tick
+- PWM is **not** reset on state entry (per README contract): PRECHARGE → CC → CV hand off the PWM value
+
+### Transitions (per charger_states.csv)
+- `PRECHARGE → CC` on `V_bat ≥ BAT_PRECHARGE_MV` (3000 mV)
+- `PRECHARGE → FAULT` on 15-minute timeout (`BAT_PRECHARGE_TIMEOUT_MS`) — raises `FAULT_PRECHARGE_TIMEOUT` via `fault_raise()` and parks pwm at `PWM_MIN_DUTY`
+- `CC → CV` on `V_bat ≥ BAT_CV_VOLTAGE_MV` (3650 mV) — falls through to CV regulation on the same tick
+- `CV → bat_full` when `I_charge < BAT_CV_TAPER_MA` (200 mA) held **continuously** for `BAT_FULL_HOLD_MS` (30 s). Any sample above taper resets the window. Sets `ctx->bat_full = true` which `energy_mode` consumes to exit charging
+
+### Regulation (bang-bang with deadband, identical order across all active states)
+1. **Panel safety** (runs first): `V_panel < PANEL_SAFETY_MV` (10 V) → `pwm += PANEL_BACKOFF_STEP` (5), skip remaining regulation. Runs **before** the MPPT gate so the panel is protected even during MPPT perturbations that caused the collapse
+2. **MPPT gate**: if `ctx->mppt.state == MPPT_TRACKING`, skip regulation. Transition guards and CV taper tracking still run — they observe measurements regardless of who owns PWM
+3. **Bang-bang regulator**:
+   - CC/PRECHARGE: target = `ctx->allowed_chg`, deadband `±CC_DEADBAND_MA` (25 mA). Outside deadband, step pwm by `CC_PWM_STEP` (1)
+   - CV: target window `[BAT_CV_VOLTAGE_MV, BAT_CV_VOLTAGE_MV + CV_DEADBAND_MV]` (3650..3655 mV), step pwm by `CV_PWM_STEP` (1)
+
+### PRECHARGE target derivation
+- No separate 200 mA clamp in the charger — `power_budget_update()` already clamps `allowed_chg` to `BAT_PRECHARGE_MAX_MA` (200 mA) when `V_bat < 3000 mV`. CC regulation is therefore reused directly; "precharge-ness" is enforced upstream
+
+### Fault interaction
+- Charge-blocking fault mask: `FAULT_OVERTEMP | FAULT_BAT_OVERVOLT | FAULT_OVERCURRENT_CHG | FAULT_PRECHARGE_TIMEOUT | FAULT_TEMP_CHARGE_BLOCK`
+- When any is latched, the charger deactivates but does **not** touch GPIO switches — `fault_mgr` already took the hardware action, `energy_mode` owns the enables. Avoids double-ownership of hardware state
+- `FAULT_BAT_UNDERVOLT` deliberately excluded: by the time it trips, `energy_mode` has already moved to `EM_SAFE_MODE` which deactivates the charger path
+
+### PWM sign convention (codified in helpers)
+- `pwm_clamp()` enforces range `[PWM_MAX_DUTY=1, PWM_MIN_DUTY=399]`
+- `pwm_step(delta)` is the only mutation path: `delta < 0` → higher duty → more current; `delta > 0` → lower duty → less current
+- Comments repeat the convention on every regulation step so a future edit can't silently flip a sign
+
+---
+
 # [v0.06] - 15.04.26
 ## Implement MPPT module (pipeline step 6)
 
