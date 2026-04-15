@@ -1,3 +1,50 @@
+# [v0.06] - 15.04.26
+## Implement MPPT module (pipeline step 6)
+
+New files: `mppt.h`, `mppt.c`
+
+### NEW: mppt_update() — pipeline step 6
+- Runs after `energy_mode_update()` and before `charger_update()` so the charger can see whether MPPT currently owns PWM
+- Three-state machine per `docs/MPPT_transition_table.csv`: `DISABLED`, `TRACKING`, `HOLD`
+- Activation gated by the charger region being active (`EM_CHARGE_ONLY` or `EM_CHARGE_AND_LOAD`); otherwise forced to `DISABLED` with `mppt_limit_ma = BUCK_MAX_CURRENT_MA` (no panel constraint)
+
+### Algorithm: incremental conductance, integer math only
+- Decision quantity: `X = dI·V + I·dV`, signed by `dV` to recover `sign(dP/dV)`:
+  - `X > 0` → left of MPP → raise V → `pwm += step` (lower duty)
+  - `X < 0` → right of MPP → lower V → `pwm -= step` (higher duty)
+  - `X == 0` or `dV == 0 && dI == 0` → hold last direction
+- Edge case `dV == 0, dI != 0`: direction chosen from sign of `dI` (V stuck, I moving means we're on a flat stretch)
+- Overflow safe on int32: max term `15000 mV × 2000 mA = 3e7` ≪ 2.1e9
+- PWM convention explicit in code comments: lower pwm value = higher duty = more current drawn = V_panel falls
+
+### Adaptive step size
+- Starts at `MPPT_MAX_STEP_SIZE` (8), halved on every direction reversal down to `MPPT_MIN_STEP_SIZE` (1)
+- Convergence: `step_size == 1 AND reversals >= MPPT_CONVERGE_REVERSALS` (6) → transition to HOLD
+- Runtime safety: `tracking_start_ms` timer forces HOLD after `MPPT_RUNTIME_MS` (300 ms) even without convergence — handles fast-changing irradiance
+
+### TRACKING entry actions (matches README spec)
+- `V_prev = V_panel`, `I_prev = I_panel`, `step_size = MAX`, `reversals = 0`, `max_power = 0`, `last_direction = -1`
+- Forces first perturbation `pwm -= step_size` so next tick has a valid `dV`/`dI`
+- Records `tracking_start_ms`
+
+### HOLD entry actions
+- Parks `ctx->pwm = max_power_pwm` (best operating point seen during the session)
+- Publishes `mppt_limit_ma = (max_power_mW × 1000) / V_bat_mV`, clamped to `[0, BUCK_MAX_CURRENT_MA]`. This is what `power_budget_update()` consumes next tick to cap `i_buck_max`
+- `V_bat` floored at 1000 mV to avoid a divide-by-near-zero on a missing/disconnected battery
+
+### Transitions implemented (per MPPT_transition_table.csv)
+- `DISABLED → TRACKING` on `panel_limited AND has_sun`
+- `TRACKING → DISABLED` on `!has_sun` (safety-first, priority 1)
+- `TRACKING → HOLD` on convergence or runtime timeout
+- `HOLD → DISABLED` on `!panel_limited` or `!has_sun`
+- `HOLD → TRACKING` on `hold_time expired AND panel_limited AND has_sun` (`MPPT_HOLD_TIME_MS` = 30 s)
+
+### Contract with charger module
+- While `ctx->mppt.state == MPPT_TRACKING`, the charger must skip its CC regulation step — MPPT writes `ctx->pwm`. Outside of TRACKING, CC/CV owns the PWM
+- `enter_disabled()` resets `step_size`, `reversals`, `last_direction` so a subsequent reactivation starts from a clean state
+
+---
+
 # [v0.05] - 15.04.26
 ## Implement fault manager module (pipeline step 4)
 
