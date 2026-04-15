@@ -1,3 +1,37 @@
+# [v0.05] - 15.04.26
+## Implement fault manager module (pipeline step 4)
+
+New files: `fault_mgr.h`, `fault_mgr.c`
+
+### NEW: fault_mgr_update() — pipeline step 4
+- Runs every TICK_MAIN_MS between `power_budget_update()` and `energy_mode_update()`
+- Two-phase: detection pass raises/latches faults; recovery pass throttled to `FAULT_RECOVER_WAIT_MS` (10 s) clears latched bits whose recovery condition holds
+- Detection covers all 8 fault bits already defined in `system_types.h`:
+  - `FAULT_OVERTEMP`: `bat_temp > 60°C` or `board_temp > 60°C`
+  - `FAULT_BAT_OVERVOLT`: `V_bat > 3700 mV`
+  - `FAULT_BAT_UNDERVOLT`: `V_bat < 2000 mV` — gated by a 500 mV floor so a disconnected battery on boot doesn't false-trip
+  - `FAULT_OVERCURRENT_CHG`: `I_chg > 2200 mA`
+  - `FAULT_OVERCURRENT_DSG`: `I_dsg > 5000 mA`
+  - `FAULT_USB_OVERVOLT`: either USB output > 6000 mV
+  - `FAULT_TEMP_CHARGE_BLOCK`: mirror of `!temp_charge_ok` (hysteresis already applied in `flags_update()`)
+- `FAULT_PRECHARGE_TIMEOUT` is **not** detected here — it is raised externally by `charger_update()` via `fault_raise()`
+- Recovery thresholds use the `*_RECOVER_MV` constants from `hw_config.h` (e.g., overvolt trips at 3700, clears at 3400 — 300 mV hysteresis)
+
+### NEW: fault_raise() helper — public
+- Idempotent: re-raising a latched fault is a no-op
+- Applies immediate protective hardware action on first raise, scoped per fault class:
+  - Charge-side faults (overvolt, chg overcurrent, precharge timeout, temp-charge-block) → disable buck + charge switch
+  - Discharge-side (dsg overcurrent) → disable output switch + USB boost
+  - Overtemp → disable buck + charger + output + USB (full shutdown)
+  - USB overvolt → disable USB boost only
+  - Undervolt → disable loads AND charger (prevents further drain + prevents re-triggering overvolt during recovery ramp)
+- Exposed in the header so `charger_update()` can signal `FAULT_PRECHARGE_TIMEOUT` when the 15 min precharge timer expires
+
+### Design note
+- `energy_mode_update()` does not yet consult `ctx->fault.code`. The immediate hardware shutdown in `fault_take_action()` contains the fault for the current tick, but energy_mode's next-tick entry actions may re-enable switches. A follow-up change should gate energy_mode transitions on `ctx->fault.active` (likely forcing `EM_IDLE` or `EM_SAFE_MODE` when a hard fault is latched).
+
+---
+
 # [v0.04] - 27.03.26
 ## Implement power budget module (pipeline step 3)
 
