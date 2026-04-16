@@ -139,6 +139,7 @@ typedef struct {
 
 void     pwm_init(void);
 void     set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle);
+void     set_buck_pwm(uint16_t pwm_value);
 uint16_t set_charging_voltage(uint16_t voltage);
 void     set_led_voltage(uint16_t voltage);
 void     set_led_current(uint16_t current, LED_OUTPUT led);

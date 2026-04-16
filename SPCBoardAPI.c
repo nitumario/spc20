@@ -897,6 +897,14 @@ void set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle){
 }
 
 /*
+ * Writes a raw PWM value [1..399] to the buck converter channel.
+ * This is the only function that main's apply_pwm step should call.
+ */
+void set_buck_pwm(uint16_t pwm_value){
+    set_pwm_duty_cycle(&_pwm_outputs[0], pwm_value);
+}
+
+/*
  * Sets charging voltage by selecting the closest LUT entry and applying
  * the corresponding PWM duty cycle.
  */

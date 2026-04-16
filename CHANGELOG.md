@@ -1,4 +1,45 @@
-# [v0.07] - 15.04.26
+# [v0.10] - 16.04.26
+## Implement full main loop with deterministic pipeline
+
+Changed files: `main.c` (rewritten), `SPCBoardAPI.h`, `SPCBoardAPI.c`
+
+### REWRITE: main.c — bringup stub → production pipeline
+- Replaces the v0.05 bringup version (measurements + UART only) with the full 8-step deterministic pipeline
+- All modules wired in strict order: `measurements → flags → power_budget → fault_mgr → energy_mode → mppt → charger → apply_pwm`
+- Three independent tick rates in the super-loop:
+  - 20 ms: button polling (`update_buttons()`)
+  - 50 ms: deterministic pipeline (steps 1–8)
+  - 1000 ms: UART diagnostic logging
+
+### NEW: apply_pwm() — pipeline step 8
+- The **only** function that touches the buck timer register
+- Reads `ctx->pwm` (written by charger or MPPT in steps 6/7) and commits to hardware via `set_buck_pwm()`
+- Defense-in-depth clamping to `[PWM_MAX_DUTY=1, PWM_MIN_DUTY=399]` — prevents inductor saturation (0) or counter overflow (400) even if upstream has a bug
+
+### NEW: SysTick_Handler — 1 ms ISR
+- Increments millisecond timestamp via `update_timestamp()`
+- Kicks ADC conversions every `TICK_ADC_MS` (10 ms): `read_adc_values()` harvests completed conversions, `adc_read_step()` starts next pair
+
+### NEW: SYS_INIT → SYS_RUN sequence
+- `system_init()` → `timer_init()` → `buttons_init()` → `ctx_init()`
+- Enables battery switch early so V_bat is available from the first ADC sample
+- Transitions to `SYS_RUN`, sends UART header, enters super-loop
+
+### NEW: idle sleep support
+- When `energy_mode` signals `idle_sleep_pending`, main loop disables LED bar and enters `__WFI()` low-power stop mode
+- On wake (GPIO or RTC interrupt), clears pending flag, resets idle timer, and resumes pipeline
+
+### UPGRADED: UART logging
+- Now logs full system state: all measurements, all flags, energy mode / charger / MPPT state names, power budget outputs, PWM, and fault code
+- Tab-separated format preserved for spreadsheet compatibility
+
+### NEW: set_buck_pwm() — HAL function (SPCBoardAPI)
+- Thin wrapper: writes a raw PWM value `[1..399]` to the buck converter channel via `set_pwm_duty_cycle(&_pwm_outputs[0], ...)`
+- Single point of contact between the pipeline and the buck timer — `apply_pwm()` calls only this function
+
+---
+
+# [v0.09] - 15.04.26
 ## Implement charger module (pipeline step 7)
 
 New files: `charger.h`, `charger.c`
@@ -43,7 +84,7 @@ New files: `charger.h`, `charger.c`
 
 ---
 
-# [v0.06] - 15.04.26
+# [v0.08] - 15.04.26
 ## Implement MPPT module (pipeline step 6)
 
 New files: `mppt.h`, `mppt.c`
@@ -90,7 +131,7 @@ New files: `mppt.h`, `mppt.c`
 
 ---
 
-# [v0.05] - 15.04.26
+# [v0.07] - 15.04.26
 ## Implement fault manager module (pipeline step 4)
 
 New files: `fault_mgr.h`, `fault_mgr.c`
@@ -121,6 +162,52 @@ New files: `fault_mgr.h`, `fault_mgr.c`
 
 ### Design note
 - `energy_mode_update()` does not yet consult `ctx->fault.code`. The immediate hardware shutdown in `fault_take_action()` contains the fault for the current tick, but energy_mode's next-tick entry actions may re-enable switches. A follow-up change should gate energy_mode transitions on `ctx->fault.active` (likely forcing `EM_IDLE` or `EM_SAFE_MODE` when a hard fault is latched).
+
+---
+
+# [v0.06] - 03.04.26
+## Implement energy mode finite state machine (pipeline step 5)
+
+New files: `energy_mode.h`, `energy_mode.c`
+
+### NEW: energy_mode_update() — pipeline step 5
+- Runs after `fault_mgr_update()` and before `mppt_update()` — the traffic controller that decides which hardware power paths are active
+- Five-state machine per `docs/transition_table.csv`: `EM_IDLE`, `EM_CHARGE_ONLY`, `EM_CHARGE_AND_LOAD`, `EM_DISCHARGE_ONLY`, `EM_SAFE_MODE`
+- Guard inputs are all read-only fields set by earlier pipeline steps: `flag_has_sun.value`, `flag_bat_low.value`, `has_load`, `bat_full`, `meas.bat_voltage`
+
+### Hardware enable matrix (set on entry)
+| State            | CHARGER_EN | BATTERY_EN | OUTPUT_EN | USB_EN | BUCK_DIS |
+|------------------|------------|------------|-----------|--------|----------|
+| IDLE             | off        | off        | off       | off    | asserted |
+| CHARGE_ONLY      | on         | on         | off       | off    | released |
+| CHARGE_AND_LOAD  | on         | on         | on        | on     | released |
+| DISCHARGE_ONLY   | off        | on         | on        | on     | asserted |
+| SAFE_MODE        | off        | on         | off       | off    | asserted |
+
+### Charger/MPPT region control
+- `activate_charger_region()`: on entry to CHARGE_ONLY or CHARGE_AND_LOAD — enables buck + charge switch; charger self-determines PRECHARGE vs CC on its next tick. Guarded by `charger.state == CHG_INACTIVE` to avoid resetting a running charge cycle (e.g., CHARGE_ONLY → CHARGE_AND_LOAD keeps charger state intact)
+- `deactivate_charger_region()`: on exit from a charging state to a non-charging state — parks PWM at `PWM_MIN_DUTY`, asserts `BUCK_DIS`, resets charger → `CHG_INACTIVE`, MPPT → `MPPT_DISABLED`, clears `bat_full`
+
+### Transition guards — priority-ordered per state
+- Each state has a dedicated `eval_*()` function with guards checked in strict if/else priority order (lower number = higher priority = checked first)
+- Safety-critical transitions (→ SAFE_MODE) are always highest priority where applicable
+- SAFE_MODE recovery requires `V_bat > BAT_SAFE_RECOVER_MV` (3200 mV) — raw voltage, intentionally not debounced. All exits require genuine battery recovery; `!has_load` alone is not an exit (prevents oscillation — see CHANGELOG v0.01)
+
+### Idle sleep timeout
+- In IDLE with no transition, tracks time since `idle_start_ms`. After `IDLE_SLEEP_TIMEOUT_MS` (2 min), sets `ctx->idle_sleep_pending = true` for main loop to enter low-power mode
+
+---
+
+# [v0.05] - 01.04.26
+## Implement main system entry point with measurements and UART logging
+
+New files: `main.c` (bringup stub)
+
+### NEW: main.c — bringup version
+- Minimal entry point for hardware validation: initialises system, runs measurements + flags on a 50 ms tick, logs all ADC values over UART on a 1 s tick
+- No state machines, no charger, no MPPT, no fault management — purely for verifying ADC readings and flag behaviour on physical hardware
+- SysTick ISR at 1 ms: increments timestamp, kicks ADC conversions every 10 ms
+- Tab-separated UART output for spreadsheet import
 
 ---
 
