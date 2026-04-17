@@ -32,6 +32,18 @@ const VREF     = scripting.addModule("/ti/driverlib/VREF");
 /**
  * Write custom configuration values to the imported modules.
  */
+const divider4       = system.clockTree["PLL_CLK0_DIV"];
+divider4.divideValue = 32;
+
+const divider6       = system.clockTree["PLL_CLK2X_DIV"];
+divider6.divideValue = 16;
+
+const multiplier2         = system.clockTree["PLL_QDIV"];
+multiplier2.multiplyValue = 4;
+
+const mux8       = system.clockTree["HSCLKMUX"];
+mux8.inputSelect = "HSCLKMUX_SYSPLL0";
+
 ADC121.$name                             = "ADC0";
 ADC121.adcPin0Config.$name               = "ti_driverlib_gpio_GPIOPinGeneric0";
 ADC121.adcPin0Config.hideOutputInversion = scripting.forceWrite(false);
@@ -106,16 +118,16 @@ PWM1.peripheral.ccp0Pin.$assign         = "PB4";
 PWM1.PWM_CHANNEL_0.$name                = "ti_driverlib_pwm_PWMTimerCC0";
 PWM1.PWM_CHANNEL_0.ccValue              = 99;
 PWM1.PWM_CHANNEL_1.$name                = "ti_driverlib_pwm_PWMTimerCC1";
-PWM1.ccp0PinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric7";
 PWM1.ccp0PinConfig.direction            = scripting.forceWrite("OUTPUT");
 PWM1.ccp0PinConfig.hideOutputInversion  = scripting.forceWrite(false);
 PWM1.ccp0PinConfig.onlyInternalResistor = scripting.forceWrite(false);
 PWM1.ccp0PinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-PWM1.ccp1PinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric8";
+PWM1.ccp0PinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric7";
 PWM1.ccp1PinConfig.direction            = scripting.forceWrite("OUTPUT");
 PWM1.ccp1PinConfig.hideOutputInversion  = scripting.forceWrite(false);
 PWM1.ccp1PinConfig.onlyInternalResistor = scripting.forceWrite(false);
 PWM1.ccp1PinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+PWM1.ccp1PinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric8";
 
 
 SYSCTL.forceDefaultClkConfig  = true;
@@ -123,10 +135,9 @@ SYSCTL.powerPolicy            = "STANDBY0";
 SYSCTL.flashInterruptPriority = "2";
 SYSCTL.clockTreeEn            = true;
 
-SYSTICK.periodEnable    = true;
-SYSTICK.interruptEnable = true;
-SYSTICK.systickEnable   = true;
-SYSTICK.period          = 4000;
+SYSTICK.periodEnable  = true;
+SYSTICK.systickEnable = true;
+SYSTICK.period        = 4000;
 
 TIMER1.$name              = "B_INT_TIMER";
 TIMER1.timerClkSrc        = "LFCLK";

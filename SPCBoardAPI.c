@@ -1282,6 +1282,15 @@ uint32_t time_now(void){
     return timestamp;
 }
 
+/* ============================================================================
+ * STUBS — buttons + LED display not wired up yet
+ * ============================================================================ */
 
+volatile bool check_buttons = false;
 
+void buttons_init(void) { }
+
+void led_display_init(void) { }
+
+bool get_button_state(const Button *btn) { (void)btn; return false; }
 

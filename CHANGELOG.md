@@ -1,3 +1,15 @@
+# [v0.11] - 17.04.26
+## Stub unimplemented HAL button/display functions
+
+Changed files: `SPCBoardAPI.c`
+
+### FIX: link errors on buttons_init / led_display_init / get_button_state
+- `SPCBoardAPI.h` declared these plus `extern volatile bool check_buttons`, but none were defined in `SPCBoardAPI.c`. `main.c:171` calls `buttons_init()` → unresolved symbol at link time, no `.elf` produced.
+- Added empty stubs for `buttons_init()` and `led_display_init()`, a `get_button_state()` that returns `false`, and a definition `volatile bool check_buttons = false`.
+- Buttons/display are intentionally inert for now; `update_buttons()` and `update_led_display()` were already implemented and remain functional if called.
+
+---
+
 # [v0.10] - 16.04.26
 ## Implement full main loop with deterministic pipeline
 
