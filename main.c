@@ -244,6 +244,17 @@ int main(void)
      * ──────────────────────────────────────────────────────────────────── */
 
     system_init();     /* SYSCFG, ADC, PWM, UART, RTC, sensing rails */
+
+    /*
+     * SysConfig leaves the buck timer's capture-compare register at whatever
+     * value the .syscfg file specified at reset. Force it to the known-safe
+     * minimum-duty value before any code path can release BUCK_DIS, so the
+     * first transition into a charging state cannot expose the inductor to
+     * a random (potentially near-100%) duty between enable_input_buck() and
+     * the first apply_pwm() at step 8.
+     */
+    set_buck_pwm(PWM_MIN_DUTY);
+
     timer_init();      /* SysTick @ 1 ms */
     buttons_init();
 

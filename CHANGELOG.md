@@ -1,3 +1,19 @@
+# [v0.15] - 29.04.26
+## Force buck PWM to safe duty before any switch enable
+
+Changed files: `main.c`
+
+### BUG FIX: buck timer CC starts at SysConfig default, not minimum duty (critical)
+- `SYSCFG_DL_init()` programs the buck PWM timer via SysConfig-generated code. The capture-compare register's reset value is whatever was specified in `SPC_20.syscfg`. If that default isn't exactly 1 (which encodes `PWM_MIN_DUTY = 399` after `set_pwm_duty_cycle()`'s `400 - duty` inversion in `SPCBoardAPI.c:959`), the timer holds a non-safe duty from the moment the counter starts.
+- `ctx_init()` sets `ctx.pwm = PWM_MIN_DUTY` (`system_types.h:469`), but that only initialises the C struct — the hardware register is untouched until the first `apply_pwm()` call at the end of the first 50 ms pipeline tick.
+- Risky window: the first transition into `EM_CHARGE_ONLY` or `EM_CHARGE_AND_LOAD` runs `activate_charger_region()` (`energy_mode.c:107-118`) at pipeline step 5, which calls `enable_input_buck()` — releasing BUCK_DIS. The gate driver immediately starts switching with whatever CC the SysConfig default left in the register. Steps 6 (`mppt_update`) and 7 (`charger_update`) write `ctx->pwm`, and step 8 (`apply_pwm`) finally commits it to hardware — but until that commit, the inductor sees the SysConfig default. At a high-duty default (CC near full scale) the inductor can saturate in microseconds.
+
+### FIX: `set_buck_pwm(PWM_MIN_DUTY)` immediately after `system_init()` in `main()`
+- One call inserted between `system_init()` and `timer_init()`. By the time `system_init()` returns, the buck timer has been initialised and started by SysConfig; `set_buck_pwm()` stops the counter, writes the inverted CC for `PWM_MIN_DUTY`, and restarts. From that point onward, every code path that asserts `enable_input_buck()` sees a guaranteed-safe duty in the register, regardless of when `apply_pwm()` next runs.
+- Defense-in-depth: `apply_pwm()`'s clamp and `ctx_init()`'s `ctx.pwm = PWM_MIN_DUTY` both still apply — this fix closes the hardware-register gap that neither addressed.
+
+---
+
 # [v0.14] - 28.04.26
 ## Add HardFault_Handler with UART post-mortem
 
