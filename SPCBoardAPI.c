@@ -530,6 +530,47 @@ void ADC1_INST_IRQHandler(void){
 }
 
 /*
+ * Minimal ISRs for armed-but-unused interrupt sources.
+ *
+ * UART, RTC, and GPIO group 1 all have their NVIC slots enabled (see
+ * uart_init(), start_rtc(), and usb_fault_init() — the last enables IRQ 1
+ * because FAULT_USB_FLT_PIN == DL_GPIO_PIN_0 == 1 == GPIOA_INT_IRQn).
+ * SysConfig enables peripheral-side interrupt sources on each of them
+ * (UART RX/TX, RTC READY, GPIO edges on PA0/PB6/PB7). Without a handler
+ * the first edge would vector to the SDK's weak Default_Handler (while(1))
+ * and freeze the MCU — SysTick stops, the main pipeline never runs again.
+ *
+ * Today none of these IRQs drive any application logic (UART is TX-only,
+ * the RTC is polled, buttons are polled in update_buttons()). Each handler
+ * therefore just reads-and-clears the pending status and returns, which is
+ * sufficient to release the IRQ line and let the main loop continue.
+ */
+void UART_0_INST_IRQHandler(void){
+    switch(DL_UART_getPendingInterrupt(UART_0_INST)){
+        case DL_UART_IIDX_RX:
+            (void)DL_UART_Main_receiveData(UART_0_INST);
+            break;
+        default:
+            break;
+    }
+}
+
+void RTC_IRQHandler(void){
+    (void)DL_RTC_getPendingInterrupt(RTC);
+}
+
+void GROUP1_IRQHandler(void){
+    uint32_t a_status = DL_GPIO_getEnabledInterruptStatus(GPIOA, 0xFFFFFFFFu);
+    if(a_status){
+        DL_GPIO_clearInterruptStatus(GPIOA, a_status);
+    }
+    uint32_t b_status = DL_GPIO_getEnabledInterruptStatus(GPIOB, 0xFFFFFFFFu);
+    if(b_status){
+        DL_GPIO_clearInterruptStatus(GPIOB, b_status);
+    }
+}
+
+/*
  * ADC channel mapping in averaging arrays:
  * (0)IDISCHARGE, (1)VOUTM, (2)VBATM, (3)TEMP3, (4)ICHARGE, (5)IPANEL,
  * (6)VDD, (7)VUSB1, (8)VUSB2, (9)VPANEL, (10)VLED1, (11)VLED2,

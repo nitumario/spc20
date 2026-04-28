@@ -1,3 +1,22 @@
+# [v0.13] - 28.04.26
+## Add missing UART / RTC / GPIO-group IRQ handlers
+
+Changed files: `SPCBoardAPI.c`
+
+### BUG FIX: three armed IRQs trap the CPU in Default_Handler (critical)
+- `uart_init()` calls `NVIC_EnableIRQ(UART_0_INST_INT_IRQN)` (UART0_INT_IRQn = 15) and SysConfig enables RX/TX interrupts on UART0 (`UART1.enabledInterrupts = ["RX","TX"]`). A single received byte — including a noise spike on PA11 — would fire the IRQ.
+- `start_rtc()` calls `NVIC_EnableIRQ(RTC_INT_IRQn)` (= 30) and SysConfig enables the RTC `READY` interrupt. The READY edge fires shortly after `DL_RTC_Common_initCalendar()`.
+- SysConfig enables GPIO edge interrupts on PA0 (USB_FLT, FALL) and PB6/PB7 (BTN1/BTN2, RISE_FALL). On MSPM0G3507 both `GPIOA_INT_IRQn` and `GPIOB_INT_IRQn` resolve to NVIC slot 1 (the GROUP1 line). `usb_fault_init()` calls `NVIC_EnableIRQ(FAULT_USB_FLT_PIN)`, and `FAULT_USB_FLT_PIN == DL_GPIO_PIN_0 == 1U`, so it coincidentally arms the GROUP1 slot. Any button press or USB fault edge would vector through it.
+- None of `UART0_IRQHandler`, `RTC_IRQHandler`, or `GROUP1_IRQHandler` were defined in the project. The SDK startup file (`startup_mspm0g350x_ticlang.c`) provides each as a weak alias to `Default_Handler` (body: `while (1) {}`). The first edge on any of these sources would freeze the MCU permanently — SysTick stops, the main pipeline never runs again.
+
+### NEW: UART_0_INST_IRQHandler / RTC_IRQHandler / GROUP1_IRQHandler
+- Each handler reads-and-clears its pending interrupt status, which is sufficient to release the IRQ line and prevent immediate re-entry. The application does not consume any of these events today — UART is TX-only, the RTC is polled via `gRTCReadReady`, and buttons are polled in `update_buttons()`.
+- `UART_0_INST_IRQHandler` reads the UART IIDX (auto-clears it); on `DL_UART_IIDX_RX` it drains the receive register so a held byte does not keep the RX line asserted.
+- `RTC_IRQHandler` reads `DL_RTC_getPendingInterrupt(RTC)` to clear the IIDX.
+- `GROUP1_IRQHandler` reads enabled interrupt status on both `GPIOA` and `GPIOB` and clears whatever is set, covering the PA0 fault edge and the PB6/PB7 button edges through the same vector.
+
+---
+
 # [v0.12] - 28.04.26
 ## Add missing ADC IRQ handlers
 
