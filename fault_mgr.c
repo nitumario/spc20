@@ -140,8 +140,14 @@ static bool fault_recovery_met(const system_ctx_t *ctx, uint16_t fault_bit)
  * Idempotent — re-raising a latched fault does nothing. */
 void fault_raise(system_ctx_t *ctx, uint16_t fault_bit)
 {
+    /* Sticky history records every fault ever raised this boot, even
+     * if the live bit is later cleared by recovery. Set unconditionally
+     * — including for re-raises — so a fault that flickers in and out
+     * of recovery still leaves a trace. */
+    ctx->fault.history |= fault_bit;
+
     if (ctx->fault.code & fault_bit) {
-        return;  /* already latched */
+        return;  /* already latched live — protective action already taken */
     }
 
     ctx->fault.code |= fault_bit;

@@ -356,6 +356,9 @@ typedef struct {
 
 typedef struct {
     uint16_t code;              /* bitmask of active faults                    */
+    uint16_t history;           /* sticky OR of every bit ever raised this boot;
+                                 * never cleared by recovery. Cleared only on
+                                 * power-on / reset (ctx_init zeroes it).      */
     bool     active;            /* shorthand: (code != FAULT_NONE)             */
     uint32_t last_recovery_ms;  /* timestamp of last recovery attempt          */
 } fault_ctx_t;
@@ -481,6 +484,7 @@ static inline void ctx_init(system_ctx_t *ctx)
 
     /* No faults */
     ctx->fault.code = FAULT_NONE;
+    ctx->fault.history = FAULT_NONE;
     ctx->fault.active = false;
 
     /* bat_low debounce configuration */
