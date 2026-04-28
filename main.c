@@ -273,6 +273,16 @@ int main(void)
      * ──────────────────────────────────────────────────────────────────── */
     ctx.system_state = SYS_RUN;
 
+    /*
+     * Anchor the idle-sleep window at SYS_RUN entry. ctx_init() zeroes the
+     * struct so idle_start_ms = 0; enter_idle() would set it but only fires
+     * on a transition, and the FSM starts in EM_IDLE — so booting dark with
+     * no transition leaves the unsigned (time_now() - 0) comparison ticking
+     * from the zero epoch and trips IDLE_SLEEP_TIMEOUT_MS at exactly 2 min,
+     * dropping the MCU into __WFI() and killing any attached JTAG session.
+     */
+    ctx.idle_start_ms = time_now();
+
     /* Send UART column header (once) */
     log_header();
 

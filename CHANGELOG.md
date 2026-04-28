@@ -1,3 +1,20 @@
+# [v0.16] - 29.04.26
+## Anchor idle-sleep window at SYS_RUN entry
+
+Changed files: `main.c`
+
+### BUG FIX: board enters __WFI() exactly 2 minutes after boot (critical, bring-up blocker)
+- `ctx_init()` zeroes the entire context struct, so `ctx.idle_start_ms = 0`. The initial energy mode is `EM_IDLE` (the zero enum value).
+- `enter_idle()` (`energy_mode.c:122-132`) is the only place that writes `idle_start_ms = time_now()`, but entry actions only fire on a *state transition* — not when the FSM initialises in `EM_IDLE` already.
+- If the board boots dark (no sun, no load — common indoors during bring-up), `eval_idle()` returns `EM_IDLE` every tick, no transition fires, and the no-transition branch in `energy_mode_update()` (`energy_mode.c:340-348`) compares `(time_now() - 0) >= IDLE_SLEEP_TIMEOUT_MS`. With `time_now()` counting from 0, this trips at exactly t = 120,000 ms = 2 minutes.
+- Main loop sees `ctx.idle_sleep_pending = true` and calls `__WFI()`. With a JTAG debugger attached this drops the XDS110 debug session.
+
+### FIX: `ctx.idle_start_ms = time_now()` after SYS_RUN entry in `main()`
+- One line added immediately after `ctx.system_state = SYS_RUN`. Anchors the 2-minute idle window to the SYS_RUN epoch instead of the zero epoch.
+- No change to `enter_idle()` — its existing assignment still owns the timer for every subsequent re-entry into IDLE.
+
+---
+
 # [v0.15] - 29.04.26
 ## Force buck PWM to safe duty before any switch enable
 
