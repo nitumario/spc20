@@ -61,6 +61,20 @@ static void send_string(const char *str)
     printToUART((char *)str, '\0');
 }
 
+/*
+ * Boot banner — emitted once before the column header so a freshly
+ * attached terminal can see "the firmware just (re)started" without
+ * waiting for the next 1 s log tick. Distinguishes a clean reset from
+ * a HardFault post-mortem (which prints "!! HARDFAULT !!").
+ */
+static void log_boot_banner(void)
+{
+    send_string("\r\n"
+                "==============================================\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.17\r\n"
+                "==============================================\r\n");
+}
+
 static void log_header(void)
 {
     send_string(
@@ -70,8 +84,46 @@ static void log_header(void)
         "Tbat\tTboard\t"
         "bat_low\thas_sun\thas_load\ttemp_ok\tp_limited\tbat_full\t"
         "i_buck_max\tallowed_chg\t"
-        "EM\tCHG\tMPPT\tpwm\tfault\r\n"
+        "EM\tCHG\tMPPT\tpwm\tfault\tflt_hist\r\n"
     );
+}
+
+/*
+ * State-transition logger — emits one line per FSM region (EM / CHG /
+ * MPPT) when its state differs from the snapshot taken before the
+ * pipeline ran. Snapshot/compare lives here in main.c so the FSM
+ * modules don't need to know about UART or each other's state.
+ *
+ * Output is plain text, distinct from the tab-separated log line, so
+ * it's grep-able after the fact:
+ *   "EM: IDLE -> CHARGE_ONLY @ 12345 ms"
+ */
+static void log_state_transitions(uint32_t now,
+                                  energy_mode_state_t em_old,
+                                  charger_state_t chg_old,
+                                  mppt_state_t mppt_old)
+{
+    if (ctx.energy_mode != em_old) {
+        int len = snprintf(uart_buf, UART_BUF_SIZE,
+            "EM: %s -> %s @ %lu ms\r\n",
+            em_state_name(em_old), em_state_name(ctx.energy_mode),
+            (unsigned long)now);
+        if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
+    }
+    if (ctx.charger.state != chg_old) {
+        int len = snprintf(uart_buf, UART_BUF_SIZE,
+            "CHG: %s -> %s @ %lu ms\r\n",
+            chg_state_name(chg_old), chg_state_name(ctx.charger.state),
+            (unsigned long)now);
+        if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
+    }
+    if (ctx.mppt.state != mppt_old) {
+        int len = snprintf(uart_buf, UART_BUF_SIZE,
+            "MPPT: %s -> %s @ %lu ms\r\n",
+            mppt_state_name(mppt_old), mppt_state_name(ctx.mppt.state),
+            (unsigned long)now);
+        if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
+    }
 }
 
 static void log_measurements(void)
@@ -85,7 +137,7 @@ static void log_measurements(void)
         "%d\t%d\t"
         "%u\t%u\t%u\t%u\t%u\t%u\t"
         "%u\t%u\t"
-        "%s\t%s\t%s\t%u\t0x%04X\r\n",
+        "%s\t%s\t%s\t%u\t0x%04X\t0x%04X\r\n",
         (unsigned long)time_now(),
         m->bat_voltage, m->chg_voltage, m->out_voltage,
         m->panel_voltage, m->usb1_voltage, m->usb2_voltage,
@@ -103,7 +155,8 @@ static void log_measurements(void)
         chg_state_name(ctx.charger.state),
         mppt_state_name(ctx.mppt.state),
         ctx.pwm,
-        ctx.fault.code);
+        ctx.fault.code,
+        ctx.fault.history);
 
     if (len > 0 && len < UART_BUF_SIZE) {
         send_string(uart_buf);
@@ -283,7 +336,9 @@ int main(void)
      */
     ctx.idle_start_ms = time_now();
 
-    /* Send UART column header (once) */
+    /* Send boot banner before anything else so a fresh terminal
+     * sees the reset, then the column header for the periodic log. */
+    log_boot_banner();
     log_header();
 
     /* Timing baselines */
@@ -313,6 +368,12 @@ int main(void)
         if ((now - last_main) >= TICK_MAIN_MS) {
             last_main = now;
 
+            /* Snapshot FSM states so we can log any region that
+             * transitioned during this tick. Cheap (3 enum copies). */
+            energy_mode_state_t em_old   = ctx.energy_mode;
+            charger_state_t     chg_old  = ctx.charger.state;
+            mppt_state_t        mppt_old = ctx.mppt.state;
+
             /* Step 1: read all sensors → ctx->meas */
             measurements_update(&ctx);
 
@@ -336,6 +397,9 @@ int main(void)
 
             /* Step 8: commit ctx->pwm to the buck timer */
             apply_pwm(&ctx);
+
+            /* One-line UART log per region whose state changed. */
+            log_state_transitions(now, em_old, chg_old, mppt_old);
         }
 
         /* ── 1 s tick: UART diagnostic logging ── */

@@ -1,3 +1,30 @@
+# [v0.17] - 29.04.26
+## Bring-up diagnostics: boot banner, transition log, sticky fault history, 1 KB stack
+
+Changed files: `main.c`, `system_types.h`, `fault_mgr.c`, `spc20_linker_overrides.cmd` (new), `.cproject`
+
+### NEW: Boot banner over UART before main loop (`main.c`)
+- `log_boot_banner()` emits a fixed three-line banner over UART (via `printToUART()`) immediately after the `SYS_INIT → SYS_RUN` transition, before `log_header()`. A terminal attached partway through bring-up now sees a clear "the firmware just started" marker without waiting for the next 1 s log line, and the banner is visually distinct from the `!! HARDFAULT !!` post-mortem so the two can't be confused on a noisy serial trace.
+- Banner string lives in flash (`const`) — no RAM cost. Sent before any periodic logging, so it cannot interleave with a tab-separated data line.
+
+### NEW: State-transition logger — 1 line per EM/CHG/MPPT change (`main.c`)
+- `log_state_transitions()` snapshots `ctx.energy_mode`, `ctx.charger.state`, and `ctx.mppt.state` at the top of each 50 ms pipeline tick, then compares against the post-tick values and prints one line per region that moved (e.g., `EM: IDLE -> CHARGE_ONLY @ 12345 ms`).
+- Snapshot/compare lives in `main.c` rather than inside each FSM module — the FSM modules stay free of UART awareness, and adding/removing the logger is a single-file change. The 1 s periodic log already includes the current state names; transition lines fire only on the edge so quiet operation produces no extra UART traffic.
+- The same snprintf buffer (`uart_buf`) used by `log_measurements()` is reused — the two callers run sequentially in `main()`, so there is no overlap.
+
+### NEW: Sticky fault-history bitmask alongside live `fault.code` (`system_types.h`, `fault_mgr.c`, `main.c`)
+- Added `uint16_t history` to `fault_ctx_t`. `fault_raise()` ORs the bit into `ctx->fault.history` on every call (including re-raises of an already-latched fault), and the recovery pass in `fault_recover()` deliberately leaves `history` alone — only `ctx_init()` (i.e., reset) clears it.
+- Without this, `fault.code` shows only what is *currently* active. A fault that triggers, takes its protective action, then clears via the 10 s recovery cadence becomes invisible by the next log tick — exactly the case during bring-up where transient overcurrent or overvolt events disappear before the operator can read them. `flt_hist` now appears as the last column in the periodic log (`%04X`) and the bit-OR survives until reset.
+- Re-raising a latched fault still short-circuits the protective action (no double-disable), but the `history |=` happens above the early return so the trace is faithful even for repeated trips.
+
+### FIX: Linker stack 512 → 1024 B via project-local override fragment (`spc20_linker_overrides.cmd`, `.cproject`)
+- `--stack_size=512` is the SDK default for MSPM0G3507 — see `LINKERMSPM0options.js:16` in the MSPM0 SDK (`StackSizeOptions["MSPM0G3507"] = 512`). The `HardFault_Handler` post-mortem path added in v0.14 prints nine `uint32_t` fields with eight blocking UART writes per field (`hf_puthex32`); a deeply-nested call (e.g., HardFault during a printf inside a logger) approached the budget, and the pipeline's snprintf paths in `log_measurements()` already burn ~200 B of stack per invocation.
+- Editing `Debug/device_linker.cmd` directly is non-durable: SysConfig regenerates that file from the SDK template (`source/ti/project_config/.meta/linker/device_linker.cmd.xdt` → `LINKERMSPM0options.js`) on every build, reverting the value. The whole `Debug/` tree is gitignored, so a direct edit also can't be committed.
+- Solution: a tracked, project-local linker fragment `spc20_linker_overrides.cmd` containing `--stack_size=1024`, added to the linker LIBRARY list in `.cproject`. The TI Arm linker resolves `--stack_size=` last-wins, and the override is sourced AFTER `device_linker.cmd`, so the SysConfig-generated 512 is overridden by 1024 regardless of how often the SDK template regenerates. CCS regenerates `Debug/makefile` from `.cproject` on next build, picking up the new `-Wl,-lspc20_linker_overrides.cmd` automatically.
+- SRAM has 32 KB total, so the extra 512 B is negligible against `.data + .bss + .stack` headroom.
+
+---
+
 # [v0.16] - 29.04.26
 ## Anchor idle-sleep window at SYS_RUN entry
 
