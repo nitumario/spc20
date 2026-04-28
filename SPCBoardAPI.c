@@ -502,6 +502,34 @@ uint32_t get_average(uint8_t var_id) {
 }
 
 /*
+ * ADC completion ISRs.
+ * Each ADC peripheral signals end-of-sequence on the last MEM index loaded
+ * (MEM8 for ADC0, MEM4 for ADC1). When that fires we raise the flag that
+ * read_adc_values() polls. Without these handlers the NVIC entry would land
+ * in startup's Default_Handler (while(1)) and freeze the MCU on the first
+ * conversion completion.
+ */
+void ADC0_INST_IRQHandler(void){
+    switch(DL_ADC12_getPendingInterrupt(ADC0_INST)){
+        case DL_ADC12_IIDX_MEM8_RESULT_LOADED:
+            gCheckADC1 = true;
+            break;
+        default:
+            break;
+    }
+}
+
+void ADC1_INST_IRQHandler(void){
+    switch(DL_ADC12_getPendingInterrupt(ADC1_INST)){
+        case DL_ADC12_IIDX_MEM4_RESULT_LOADED:
+            gCheckADC2 = true;
+            break;
+        default:
+            break;
+    }
+}
+
+/*
  * ADC channel mapping in averaging arrays:
  * (0)IDISCHARGE, (1)VOUTM, (2)VBATM, (3)TEMP3, (4)ICHARGE, (5)IPANEL,
  * (6)VDD, (7)VUSB1, (8)VUSB2, (9)VPANEL, (10)VLED1, (11)VLED2,

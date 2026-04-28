@@ -1,3 +1,19 @@
+# [v0.12] - 28.04.26
+## Add missing ADC IRQ handlers
+
+Changed files: `SPCBoardAPI.c`
+
+### BUG FIX: ADC interrupt traps the CPU in Default_Handler (critical)
+- `adc_init()` calls `NVIC_EnableIRQ(ADC0_INST_INT_IRQN)` and `NVIC_EnableIRQ(ADC1_INST_INT_IRQN)`, and SysConfig enables MEM-result interrupts on each peripheral (MEM0/5/8 on ADC0, MEM1/2/4 on ADC1). However, `ADC0_IRQHandler` and `ADC1_IRQHandler` were never defined in the project.
+- The MSPM0 SDK startup file (`startup_mspm0g350x_ticlang.c`) provides both as weak aliases to `Default_Handler`, whose body is `while (1) {}`. The first conversion-complete IRQ would land there and freeze the MCU permanently — no measurements, no pipeline, no UART.
+- Even without the lockup, `read_adc_values()` gates on `gCheckADC1 && gCheckADC2`, but nothing in the codebase ever sets those flags — so the moving average would have stayed at zero and every getter (`get_battery_voltage`, `get_charge_current`, `get_temperature`, …) would return 0.
+
+### NEW: ADC0_INST_IRQHandler / ADC1_INST_IRQHandler
+- Each handler calls `DL_ADC12_getPendingInterrupt()` (which reads + clears the highest-priority pending IIDX) and sets the corresponding `gCheckADCx` flag only on the **last** memory in the configured sequence — `MEM8` for ADC0 (V_USB_2 is the final channel) and `MEM4` for ADC1 (TEMP1 is the final channel). Earlier-mem interrupts in the sequence are auto-cleared by the read; the IRQ tail-chains to drain them before exiting.
+- Using only the last index as the "data ready" signal preserves the existing contract in `read_adc_values()`: the function only copies results when **both** sequences are complete, then re-arms and restarts conversions.
+
+---
+
 # [v0.11] - 17.04.26
 ## Stub unimplemented HAL button/display functions
 
