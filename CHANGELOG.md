@@ -1,3 +1,20 @@
+# [v0.14] - 28.04.26
+## Add HardFault_Handler with UART post-mortem
+
+Changed files: `main.c`
+
+### BUG FIX: hard faults silently freeze the MCU (critical, bring-up blocker)
+- The SDK startup file (`startup_mspm0g350x_ticlang.c`) declares `HardFault_Handler` as a weak alias to `Default_Handler`, whose body is `while (1) {}`. The project did not override it.
+- On Cortex-M0+ the HardFault vector catches every CPU exception: invalid memory access, executing from unmapped flash, unaligned word access, stack overflow into an invalid region, bad PC after a corrupted return, etc. Without an override, the first fault traps the CPU in `Default_Handler`'s infinite loop — externally indistinguishable from a hung `while(1)` in the main loop. SysTick keeps firing but the pipeline never runs again, and there is no clue on the wire as to what went wrong.
+- Especially load-bearing during bring-up: any of the IRQ-handler gaps fixed in v0.12 / v0.13, or any uninitialized-pointer call in module stubs being filled in, would have surfaced as a frozen board with no diagnostic output.
+
+### NEW: HardFault_Handler — naked entry + C body in `main.c`
+- Naked stub inspects bit 2 of `EXC_RETURN` (= the value of LR on exception entry) to pick MSP vs PSP, then tail-calls `HardFault_HandlerC(stack, exc_return)` with the active stack pointer in r0 and EXC_RETURN in r1. Cortex-M0+ has no CFSR / HFSR / MMFAR / BFAR, so the hardware-pushed 8-word frame (R0–R3, R12, LR, PC, xPSR) is the only forensics available.
+- C handler prints all eight stacked registers, the EXC_RETURN, and the active SP via blocking UART writes (`DL_UART_Main_transmitDataBlocking` on `UART_0_INST`). Output is plain hex with a fixed-format printer (no `snprintf`, no varargs, no heap) so it survives a corrupt BSS or stack. The PC value points directly at the faulting instruction — addr2line / disasm of the `.elf` resolves it to a source line.
+- Final state is `while (1) { __asm("wfi"); }` to keep the CPU pinned for JTAG attach without burning power.
+
+---
+
 # [v0.13] - 28.04.26
 ## Add missing UART / RTC / GPIO-group IRQ handlers
 

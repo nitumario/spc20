@@ -134,6 +134,83 @@ static void apply_pwm(system_ctx_t *c)
 }
 
 /* =========================================================================
+ * HardFault_Handler — Cortex-M0+ fault trap with UART post-mortem
+ * =========================================================================
+ *
+ * The SDK startup file declares HardFault_Handler as a weak alias to
+ * Default_Handler (an unconditional while(1)). Without this override, any
+ * fault — bad PC, unaligned access, executing from unmapped memory, stack
+ * overflow into invalid regions — would silently freeze the MCU and look
+ * identical to a hung main loop.
+ *
+ * On entry to the exception, the CPU has already pushed an 8-word frame
+ * (R0, R1, R2, R3, R12, LR, PC, xPSR) onto whichever stack was active.
+ * Bit 2 of EXC_RETURN (= the LR value at exception entry) selects MSP/PSP.
+ * Cortex-M0+ has no CFSR/HFSR/MMFAR/BFAR — the stacked PC and LR are the
+ * primary forensics.
+ *
+ * The naked entry stub picks the right stack pointer and tail-calls the C
+ * handler, which prints registers via blocking UART writes (no interrupts,
+ * no snprintf — minimal dependencies in case the heap or BSS is corrupt).
+ */
+static void hf_putc(char c)
+{
+    DL_UART_Main_transmitDataBlocking(UART_0_INST, (uint8_t)c);
+}
+
+static void hf_puts(const char *s)
+{
+    while (*s) hf_putc(*s++);
+}
+
+static void hf_puthex32(uint32_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; --i) {
+        hf_putc(hex[(v >> (i * 4)) & 0xF]);
+    }
+}
+
+void HardFault_HandlerC(uint32_t *stack, uint32_t exc_return)
+{
+    hf_puts("\r\n!! HARDFAULT !!\r\n");
+    hf_puts("PC  = 0x"); hf_puthex32(stack[6]); hf_puts("\r\n");
+    hf_puts("LR  = 0x"); hf_puthex32(stack[5]); hf_puts("\r\n");
+    hf_puts("PSR = 0x"); hf_puthex32(stack[7]); hf_puts("\r\n");
+    hf_puts("R0  = 0x"); hf_puthex32(stack[0]); hf_puts("\r\n");
+    hf_puts("R1  = 0x"); hf_puthex32(stack[1]); hf_puts("\r\n");
+    hf_puts("R2  = 0x"); hf_puthex32(stack[2]); hf_puts("\r\n");
+    hf_puts("R3  = 0x"); hf_puthex32(stack[3]); hf_puts("\r\n");
+    hf_puts("R12 = 0x"); hf_puthex32(stack[4]); hf_puts("\r\n");
+    hf_puts("EXC = 0x"); hf_puthex32(exc_return); hf_puts("\r\n");
+    hf_puts("SP  = 0x"); hf_puthex32((uint32_t)stack); hf_puts("\r\n");
+    hf_puts("frozen.\r\n");
+
+    while (1) {
+        __asm volatile ("wfi");
+    }
+}
+
+__attribute__((naked))
+void HardFault_Handler(void)
+{
+    __asm volatile (
+        "movs r0, #4         \n"
+        "mov  r1, lr         \n"
+        "tst  r0, r1         \n"   /* EXC_RETURN bit 2: 0=MSP, 1=PSP */
+        "bne  1f             \n"
+        "mrs  r0, msp        \n"
+        "b    2f             \n"
+        "1:                  \n"
+        "mrs  r0, psp        \n"
+        "2:                  \n"
+        "mov  r1, lr         \n"   /* pass EXC_RETURN as second arg */
+        "ldr  r2, =HardFault_HandlerC\n"
+        "bx   r2             \n"
+    );
+}
+
+/* =========================================================================
  * SysTick ISR — fires every 1 ms
  * =========================================================================
  *
