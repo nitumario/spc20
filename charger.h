@@ -1,12 +1,9 @@
 /*
- * charger.h — Charge Controller (Pipeline Step 7)
+ * charger.h — Charge Controller
  * =========================================================================
  *
  * Implements the CHARGER orthogonal region of ENERGY_MGMT.
  * See docs/charger_states.csv for the authoritative transition table.
- *
- * Pipeline position (step 7):
- *   ... → energy_mode (5) → mppt (6) → charger (7) → apply_pwm (8)
  *
  *   Runs AFTER mppt so the charger can observe ctx->mppt.state and
  *   yield PWM control while MPPT is TRACKING. Runs BEFORE apply_pwm

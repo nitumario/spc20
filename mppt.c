@@ -92,6 +92,7 @@ static void enter_tracking(system_ctx_t *ctx)
     m->i_prev         = (int32_t)ctx->meas.panel_current;
     m->step_size      = MPPT_MAX_STEP_SIZE;
     m->reversals      = 0;
+    m->stuck_ticks    = 0;
     m->max_power      = 0;
     m->max_power_pwm  = ctx->pwm;
     m->last_direction = -1;  /* first perturbation is pwm -= step (V falls) */
@@ -115,11 +116,14 @@ static void enter_hold(system_ctx_t *ctx)
     m->state = MPPT_HOLD;
     m->hold_start_ms = time_now();
 
-    /* Park at best operating point. If we never improved on the entry
-     * point (max_power == 0), leave pwm where it is. */
-    if (m->max_power > 0) {
-        ctx->pwm = m->max_power_pwm;
-    }
+    /* Park at best operating point. max_power_pwm is seeded with the
+     * entry pwm in enter_tracking(), so this is also the safe fallback
+     * when nothing was learned (max_power == 0) — e.g. stiff bench PSU
+     * where dV=dI=0 makes tracking march monotonically into a high-duty
+     * zone. Leaving pwm at the last walked-down value would park HOLD at
+     * the most aggressive point tried, which is the worst possible
+     * default. */
+    ctx->pwm = m->max_power_pwm;
 
     /* Derive I_bus max from P_max / V_bat. Guard against tiny V_bat. */
     uint16_t v_bat = ctx->meas.bat_voltage;
@@ -141,6 +145,7 @@ static void enter_disabled(system_ctx_t *ctx)
     ctx->mppt.mppt_limit_ma = BUCK_MAX_CURRENT_MA;
     ctx->mppt.step_size = MPPT_MAX_STEP_SIZE;
     ctx->mppt.reversals = 0;
+    ctx->mppt.stuck_ticks = 0;
     ctx->mppt.last_direction = 0;
 }
 
@@ -188,15 +193,28 @@ static void tracking_step(system_ctx_t *ctx)
     }
 
     /* ── Adaptive step: halve on direction reversal ── */
-    if (direction != 0 &&
-        m->last_direction != 0 &&
-        direction != m->last_direction) {
-
+    bool reversed = (direction != 0 &&
+                     m->last_direction != 0 &&
+                     direction != m->last_direction);
+    if (reversed) {
         if (m->reversals < 255) m->reversals++;
         if (m->step_size > MPPT_MIN_STEP_SIZE) {
             m->step_size = (uint8_t)(m->step_size >> 1);  /* halve */
             if (m->step_size < MPPT_MIN_STEP_SIZE) m->step_size = MPPT_MIN_STEP_SIZE;
         }
+    }
+
+    /* ── Stiff-source detector ──
+     * Count consecutive ticks at MAX step with no reversal. With a
+     * current-limited PV panel the buck pulls V_panel down the I-V
+     * curve and dV/dI provide the feedback that drives reversals.
+     * With a stiff source (bench PSU), dV ≈ dI ≈ 0 and direction
+     * stays pinned at last_direction — the loop marches one way at
+     * full step until something trips. Bail to HOLD before that. */
+    if (m->step_size >= MPPT_MAX_STEP_SIZE && !reversed) {
+        if (m->stuck_ticks < 255) m->stuck_ticks++;
+    } else {
+        m->stuck_ticks = 0;
     }
 
     /* ── Apply perturbation to PWM ──
@@ -261,9 +279,23 @@ void mppt_update(system_ctx_t *ctx)
     switch (m->state) {
 
     case MPPT_DISABLED:
-        /* P1: panel_limited AND has_sun → TRACKING */
-        if (panel_limited && has_sun) {
-            enter_tracking(ctx);
+        /* P1: panel_limited AND has_sun AND charger past settle window → TRACKING.
+         *
+         * Settle gate: when the charger has just activated from
+         * CHG_INACTIVE, ctx->pwm starts at PWM_MIN_DUTY (off) and
+         * chg_current=0 trivially makes panel_limited=true. Without
+         * this gate, MPPT would steal PWM control on the very first
+         * charging tick and walk PWM down by MAX_STEP_SIZE before any
+         * current measurement comes back — slamming a stiff source
+         * straight into FAULT_OVERCURRENT_CHG. CC_PWM_STEP=1 needs
+         * ~1 s to descend through the responsive PWM range first. */
+        {
+            uint32_t since_active = time_now() - ctx->charger.active_start_ms;
+            bool settled = (ctx->charger.state != CHG_INACTIVE) &&
+                           (since_active >= CHARGER_MPPT_SETTLE_MS);
+            if (panel_limited && has_sun && settled) {
+                enter_tracking(ctx);
+            }
         }
         /* P2: stay DISABLED */
         break;
@@ -288,21 +320,35 @@ void mppt_update(system_ctx_t *ctx)
             enter_hold(ctx);
             break;
         }
-        /* P4: continue tracking (already stepped above) */
+        /* P4: stiff source → HOLD (parks PWM at max_power_pwm = entry pwm,
+         *     since stuck means dV=dI=0 and max_power never updated). */
+        if (m->stuck_ticks >= MPPT_STUCK_TICK_LIMIT) {
+            enter_hold(ctx);
+            break;
+        }
+        /* P5: continue tracking (already stepped above) */
         break;
 
     case MPPT_HOLD:
-        /* P1: !panel_limited → DISABLED */
-        if (!panel_limited) {
-            enter_disabled(ctx);
-            break;
-        }
-        /* P3 (checked before P2 for safety): !has_sun → DISABLED */
+        /* P3 (checked first for safety): !has_sun → DISABLED */
         if (!has_sun) {
             enter_disabled(ctx);
             break;
         }
-        /* P2: hold time expired AND panel_limited AND has_sun → TRACKING */
+        /* P1: !panel_limited → DISABLED, EXCEPT when the mppt cap itself
+         *     is what's holding allowed_chg below PANEL_LIMITED_MARGIN_MA.
+         *     In that case panel_limited is structurally forced false by
+         *     the measurements guard (allowed_chg <= margin), and dropping
+         *     to DISABLED would release mppt_limit to BUCK_MAX, re-trigger
+         *     panel_limited, and bounce us straight back into TRACKING.
+         *     Stay parked in HOLD instead — the panel really can't deliver
+         *     more, and the periodic re-entry to TRACKING after
+         *     MPPT_HOLD_TIME_MS will retest. */
+        if (!panel_limited && m->mppt_limit_ma > PANEL_LIMITED_MARGIN_MA) {
+            enter_disabled(ctx);
+            break;
+        }
+        /* P2: hold time expired AND has_sun → TRACKING */
         if (hold_expired(m)) {
             enter_tracking(ctx);
             break;

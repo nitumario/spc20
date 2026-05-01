@@ -81,6 +81,8 @@ static void deactivate_charger_region(system_ctx_t *ctx)
     /* Charger → INACTIVE, clear timing state */
     ctx->charger.state = CHG_INACTIVE;
     ctx->charger.precharge_start_ms = 0;
+    ctx->charger.active_start_ms = 0;
+    ctx->charger.cc_last_downstep_ms = 0;
     ctx->charger.bat_full_timing = false;
     ctx->charger.bat_full_signaled = false;
 
@@ -321,10 +323,45 @@ static energy_mode_state_t eval_safe_mode(const system_ctx_t *ctx)
  *      - In IDLE: check sleep timeout
  *      - Otherwise: nothing (hardware stays as-is)
  */
+/*
+ * apply_entry_actions — dispatch the entry action for a given state.
+ * Idempotent: GPIO writes are unconditional, so calling it on the
+ * already-current state is harmless. Used both on real transitions and
+ * to re-arm hardware after a fault clears.
+ */
+static void apply_entry_actions(system_ctx_t *ctx, energy_mode_state_t s)
+{
+    switch (s) {
+        case EM_IDLE:            enter_idle(ctx);            break;
+        case EM_CHARGE_ONLY:     enter_charge_only(ctx);     break;
+        case EM_CHARGE_AND_LOAD: enter_charge_and_load(ctx); break;
+        case EM_DISCHARGE_ONLY:  enter_discharge_only(ctx);  break;
+        case EM_SAFE_MODE:       enter_safe_mode(ctx);       break;
+        default:                 enter_idle(ctx);            break;
+    }
+}
+
 void energy_mode_update(system_ctx_t *ctx)
 {
     energy_mode_state_t old_state = ctx->energy_mode;
     energy_mode_state_t new_state;
+
+    /* ── Fault-clear edge detection ──
+     *
+     * fault_take_action() in fault_mgr can disable hardware (input buck,
+     * charge switch, output switch, USB boost) when a fault is raised.
+     * When the fault later auto-recovers, fault_mgr clears the bit but
+     * does NOT re-enable any GPIOs — that is energy_mode's job, and
+     * energy_mode only writes GPIOs on a state transition. If no
+     * transition fires (e.g. still in CHARGE_ONLY because conditions
+     * never changed), the GPIOs stay disabled silently and the buck
+     * appears "running" (PWM toggling) but actually delivers no current.
+     *
+     * Detect fault.code falling edge (non-zero → zero) and re-apply the
+     * current state's entry actions to restore the correct enables. */
+    bool fault_just_cleared = (ctx->fault.prev_code != FAULT_NONE) &&
+                              (ctx->fault.code      == FAULT_NONE);
+    ctx->fault.prev_code = ctx->fault.code;
 
     /* ── Evaluate transition ── */
     switch (old_state) {
@@ -338,6 +375,10 @@ void energy_mode_update(system_ctx_t *ctx)
 
     /* ── No transition → handle in-state behaviour ── */
     if (new_state == old_state) {
+        if (fault_just_cleared) {
+            /* Re-arm any GPIOs the fault path tore down. */
+            apply_entry_actions(ctx, old_state);
+        }
         if (old_state == EM_IDLE) {
             /* Idle sleep timeout: if nothing happens for IDLE_SLEEP_TIMEOUT_MS,
              * signal that main loop should enter low-power mode. */
@@ -371,12 +412,5 @@ void energy_mode_update(system_ctx_t *ctx)
     ctx->energy_mode = new_state;
 
     /* ── Entry actions ── */
-    switch (new_state) {
-        case EM_IDLE:            enter_idle(ctx);            break;
-        case EM_CHARGE_ONLY:     enter_charge_only(ctx);     break;
-        case EM_CHARGE_AND_LOAD: enter_charge_and_load(ctx); break;
-        case EM_DISCHARGE_ONLY:  enter_discharge_only(ctx);  break;
-        case EM_SAFE_MODE:       enter_safe_mode(ctx);       break;
-        default:                 enter_idle(ctx);            break;
-    }
+    apply_entry_actions(ctx, new_state);
 }
