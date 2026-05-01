@@ -252,6 +252,18 @@ typedef struct {
     /* Precharge timing — start timestamp for timeout detection */
     uint32_t precharge_start_ms;
 
+    /* Charger activation timestamp — set when leaving CHG_INACTIVE.
+     * MPPT consults this to enforce CHARGER_MPPT_SETTLE_MS so it does
+     * not steal PWM control before the CC ramp has had a chance to
+     * regulate down from PWM_MIN_DUTY. */
+    uint32_t active_start_ms;
+
+    /* Last tick CC issued a pwm DOWN step (more current). Used by
+     * cc_regulate to throttle descent to CC_DOWNSTEP_INTERVAL_MS so
+     * the regulator does not outrun the chg_current ADC moving
+     * average. */
+    uint32_t cc_last_downstep_ms;
+
     /* CV taper detection:
      * Battery is full when I_charge stays below BAT_CV_TAPER_MA
      * for BAT_FULL_HOLD_MS continuously.
@@ -296,6 +308,7 @@ typedef struct {
     uint8_t step_size;          /* current PWM perturbation magnitude          */
     uint8_t reversals;          /* direction changes at current step_size      */
     int8_t  last_direction;     /* +1 or -1: which way we perturbed last       */
+    uint8_t stuck_ticks;        /* monotonic walk counter for stiff-source bail */
 
     /* Best operating point found during this TRACKING session */
     int32_t  max_power;         /* best panel power (mW) seen this session     */
@@ -356,6 +369,10 @@ typedef struct {
 
 typedef struct {
     uint16_t code;              /* bitmask of active faults                    */
+    uint16_t prev_code;         /* code from previous tick — used by
+                                 * energy_mode to detect fault-clear falling
+                                 * edge and re-arm any GPIOs that
+                                 * fault_take_action had disabled.             */
     uint16_t history;           /* sticky OR of every bit ever raised this boot;
                                  * never cleared by recovery. Cleared only on
                                  * power-on / reset (ctx_init zeroes it).      */
@@ -484,6 +501,7 @@ static inline void ctx_init(system_ctx_t *ctx)
 
     /* No faults */
     ctx->fault.code = FAULT_NONE;
+    ctx->fault.prev_code = FAULT_NONE;
     ctx->fault.history = FAULT_NONE;
     ctx->fault.active = false;
 

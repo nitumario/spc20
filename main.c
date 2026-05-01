@@ -41,9 +41,16 @@
 /* ── The one context struct ── */
 static system_ctx_t ctx;
 
-/* ── UART transmit buffer ── */
+/* ── UART transmit buffers ──
+ *
+ * Two separate buffers so a state-transition log line emitted between
+ * ticks cannot clobber an in-flight per-tick telemetry line (and vice
+ * versa). printToUART is blocking, but snprintf into a shared buffer
+ * still corrupts a partially-formatted line if a second formatter runs
+ * after send_string() returns and before the caller is done with it. */
 #define UART_BUF_SIZE 512
-static char uart_buf[UART_BUF_SIZE];
+static char uart_buf[UART_BUF_SIZE];      /* per-tick telemetry */
+static char uart_evt_buf[128];            /* state-transition events */
 
 /* =========================================================================
  * UART LOGGING
@@ -78,13 +85,13 @@ static void log_boot_banner(void)
 static void log_header(void)
 {
     send_string(
-        "ms\t"
-        "Vbat\tVchg\tVout\tVpanel\tVusb1\tVusb2\t"
-        "Ipanel\tIchg\tIdsg\tPpanel\tIbat_net\t"
-        "Tbat\tTboard\t"
-        "bat_low\thas_sun\thas_load\ttemp_ok\tp_limited\tbat_full\t"
-        "i_buck_max\tallowed_chg\t"
-        "EM\tCHG\tMPPT\tpwm\tfault\tflt_hist\r\n"
+        "ms "
+        "Vbat Vchg Vout Vpanel Vusb1 Vusb2 "
+        "Ipanel Ichg Idsg Ppanel Ibat_net "
+        "Tbat Tboard "
+        "bat_low has_sun has_load temp_ok p_limited bat_full "
+        "i_buck_max allowed_chg "
+        "EM CHG MPPT pwm fault flt_hist\r\n"
     );
 }
 
@@ -104,65 +111,81 @@ static void log_state_transitions(uint32_t now,
                                   mppt_state_t mppt_old)
 {
     if (ctx.energy_mode != em_old) {
-        int len = snprintf(uart_buf, UART_BUF_SIZE,
+        int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
             "EM: %s -> %s @ %lu ms\r\n",
             em_state_name(em_old), em_state_name(ctx.energy_mode),
             (unsigned long)now);
-        if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
+        if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
     }
     if (ctx.charger.state != chg_old) {
-        int len = snprintf(uart_buf, UART_BUF_SIZE,
+        int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
             "CHG: %s -> %s @ %lu ms\r\n",
             chg_state_name(chg_old), chg_state_name(ctx.charger.state),
             (unsigned long)now);
-        if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
+        if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
     }
     if (ctx.mppt.state != mppt_old) {
-        int len = snprintf(uart_buf, UART_BUF_SIZE,
+        int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
             "MPPT: %s -> %s @ %lu ms\r\n",
             mppt_state_name(mppt_old), mppt_state_name(ctx.mppt.state),
             (unsigned long)now);
-        if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
+        if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
     }
 }
 
+/*
+ * Values-only telemetry. One line per tick, space-separated, in this order:
+ *
+ *   1  time_ms
+ *   2  bat_voltage         (mV)
+ *   3  chg_voltage         (mV)
+ *   4  out_voltage         (mV)
+ *   5  panel_voltage       (mV)
+ *   6  usb1_voltage        (mV)
+ *   7  usb2_voltage        (mV)
+ *   8  panel_current       (mA)
+ *   9  chg_current         (mA, signed)
+ *  10  dsg_current         (mA)
+ *  11  panel_power         (mW)
+ *  12  i_bat_net           (mA, signed)
+ *  13  bat_temp            (C)
+ *  14  board_temp          (C)
+ *  15  flag_bat_low
+ *  16  flag_has_sun
+ *  17  has_load
+ *  18  temp_charge_ok
+ *  19  panel_limited
+ *  20  bat_full
+ *  21  i_buck_max          (mA)
+ *  22  allowed_chg         (mA)
+ *  23  energy_mode         (name: IDLE/CHG_ONLY/CHG+LOAD/DSG_ONLY/SAFE)
+ *  24  charger.state       (name: OFF/PRE/CC/CV)
+ *  25  mppt.state          (name: OFF/TRK/HLD)
+ *  26  pwm
+ *  27  fault.code          (hex)
+ *  28  fault.history       (hex)
+ */
 static void log_measurements(void)
 {
     measurements_t *m = &ctx.meas;
-
     int len = snprintf(uart_buf, UART_BUF_SIZE,
-        "%lu\t"
-        "%u\t%u\t%u\t%u\t%u\t%u\t"
-        "%u\t%d\t%u\t%ld\t%ld\t"
-        "%d\t%d\t"
-        "%u\t%u\t%u\t%u\t%u\t%u\t"
-        "%u\t%u\t"
-        "%s\t%s\t%s\t%u\t0x%04X\t0x%04X\r\n",
+        "%lu %u %u %u %u %u %u %u %d %u %ld %ld %d %d %u %u %u %u %u %u %u %u %s %s %s %u %04X %04X\r\n",
         (unsigned long)time_now(),
         m->bat_voltage, m->chg_voltage, m->out_voltage,
         m->panel_voltage, m->usb1_voltage, m->usb2_voltage,
         m->panel_current, (int)m->chg_current, m->dsg_current,
         (long)m->panel_power, (long)m->i_bat_net,
         (int)m->bat_temp, (int)m->board_temp,
-        (unsigned)ctx.flag_bat_low.value,
-        (unsigned)ctx.flag_has_sun.value,
-        (unsigned)ctx.has_load,
-        (unsigned)ctx.temp_charge_ok,
-        (unsigned)ctx.panel_limited,
-        (unsigned)ctx.bat_full,
+        (unsigned)ctx.flag_bat_low.value, (unsigned)ctx.flag_has_sun.value,
+        (unsigned)ctx.has_load, (unsigned)ctx.temp_charge_ok,
+        (unsigned)ctx.panel_limited, (unsigned)ctx.bat_full,
         ctx.i_buck_max, ctx.allowed_chg,
         em_state_name(ctx.energy_mode),
         chg_state_name(ctx.charger.state),
         mppt_state_name(ctx.mppt.state),
-        ctx.pwm,
-        ctx.fault.code,
-        ctx.fault.history);
-
-    if (len > 0 && len < UART_BUF_SIZE) {
-        send_string(uart_buf);
-    }
+        ctx.pwm, ctx.fault.code, ctx.fault.history);
+    if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
 }
-
 /* =========================================================================
  * PIPELINE STEP 8: apply_pwm
  * =========================================================================
@@ -349,7 +372,7 @@ int main(void)
     /* ────────────────────────────────────────────────────────────────────
      * MAIN LOOP — runs forever inside SYS_RUN
      * ──────────────────────────────────────────────────────────────────── */
-    while (1) {
+    while (1       ) {
         uint32_t now = time_now();
 
         /* ── 20 ms tick: button polling ──

@@ -151,10 +151,24 @@ static void cc_regulate(system_ctx_t *ctx)
     int32_t err    = actual - target;
 
     if (err < -CC_DEADBAND_MA) {
-        /* Under-current: push harder. Lower pwm = higher duty. */
-        pwm_step(ctx, -CC_PWM_STEP);
+        /* Under-current: push harder. Lower pwm = higher duty.
+         *
+         * Rate-limit DOWN-steps to CC_DOWNSTEP_INTERVAL_MS. The
+         * chg_current ADC has ~320 ms group delay from its 64-sample
+         * moving average; stepping every 50 ms walks the buck 6+
+         * PWM counts past the regulation point before the filter
+         * catches up. With a current-limited PV panel that's masked
+         * by V_panel collapse → panel_safety_backoff. With a stiff
+         * source (bench PSU), it overshoots FAULT_OVERCURRENT_CHG_MA
+         * before any feedback arrives. */
+        uint32_t now = time_now();
+        if ((now - ctx->charger.cc_last_downstep_ms) >= CC_DOWNSTEP_INTERVAL_MS) {
+            pwm_step(ctx, -CC_PWM_STEP);
+            ctx->charger.cc_last_downstep_ms = now;
+        }
     } else if (err > CC_DEADBAND_MA) {
-        /* Over-current: back off. Higher pwm = lower duty. */
+        /* Over-current: back off. Higher pwm = lower duty.
+         * Up-steps are NOT throttled — protective reaction stays fast. */
         pwm_step(ctx, +CC_PWM_STEP);
     }
     /* Within deadband: stable, no change. */
@@ -314,6 +328,8 @@ void charger_update(system_ctx_t *ctx)
      * INACTIVE. Choose PRECHARGE or CC based on V_bat, then fall
      * through to run the first regulation tick in the new state. */
     if (c->state == CHG_INACTIVE) {
+        c->active_start_ms = time_now();
+        c->cc_last_downstep_ms = time_now();   /* arm the descent throttle */
         if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV) {
             enter_precharge(ctx);
         } else {

@@ -118,6 +118,18 @@
 #define CC_DEADBAND_MA            25      /* ±25 mA around target before adjusting                */
 #define CC_PWM_STEP               1       /* PWM adjustment per regulation cycle                  */
 
+/* CC down-step rate limit. The chg_current ADC uses a 64-sample moving
+ * average at 10 ms tick → ~320 ms group delay. If CC steps pwm DOWN
+ * (more current) every 50 ms tick, it will walk 6+ counts past the
+ * point of regulation before the filtered measurement catches up —
+ * fine for a current-limited PV panel where V_panel collapse triggers
+ * panel_safety_backoff, but on a stiff source the buck will overshoot
+ * past FAULT_OVERCURRENT_CHG_MA before any feedback arrives. Allow at
+ * most one down-step per CC_DOWNSTEP_INTERVAL_MS so the regulator
+ * never gets ahead of the measurement. UP-steps (back off) remain
+ * every tick — over-current reaction must stay fast. */
+#define CC_DOWNSTEP_INTERVAL_MS   300UL
+
 #define CV_DEADBAND_MV            5       /* regulate between CV_VOLTAGE and CV_VOLTAGE + this    */
 #define CV_PWM_STEP               1
 
@@ -140,6 +152,23 @@
 #define MPPT_CONVERGE_REVERSALS   6       /* reversals at min step → declare converged            */
 #define MPPT_RUNTIME_MS           300     /* max time in TRACKING before forced exit to HOLD      */
 #define MPPT_HOLD_TIME_MS         30000UL /* wait time in HOLD before re-entering TRACKING        */
+
+/* Charger settle window: after the charger activates from CHG_INACTIVE,
+ * MPPT is blocked from entering TRACKING for this long. Lets the slow
+ * CC regulator (CC_PWM_STEP=1) walk PWM down gradually from PWM_MIN_DUTY
+ * before MPPT takes over with MAX_STEP_SIZE=8 — otherwise the first
+ * MPPT step from "off" can slam the buck into a high-duty zone before
+ * any current measurement comes back, especially with a stiff source. */
+#define CHARGER_MPPT_SETTLE_MS    1000UL
+
+/* Stiff-source escape: while in TRACKING at MAX step, count how many
+ * consecutive ticks have walked PWM in the same direction with no
+ * reversal. If this exceeds the limit, the source is stiff (dV ≈ dI ≈
+ * 0 ⇒ direction stuck at last_direction) and the inc-conductance loop
+ * will march monotonically into a high-duty zone. Force exit to HOLD
+ * with PWM parked at the entry value. 8 ticks × MAX_STEP = 64 PWM
+ * counts walked — well past any real panel's MPP search range. */
+#define MPPT_STUCK_TICK_LIMIT     8
 
 /* Panel-limited detection:
  * If I_charge < allowed_chg - this margin, and has_sun,
