@@ -186,6 +186,27 @@ static void log_measurements(void)
         ctx.pwm, ctx.fault.code, ctx.fault.history);
     if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
 }
+
+/*
+ * TEMP: raw ADC1 dump for VCHG_M bring-up diagnosis.
+ * Bypasses the avg_readings[] pipeline + FP scaling. MEM3 is the raw
+ * 12-bit code at PA18/A1_3 (VCHG_M); MEM0 is V_PANEL on PA15/A1_0,
+ * read through the same ADC1 and used as a sanity reference.
+ * Called from the 1 s log tick. Remove once VCHG sense is verified.
+ */
+static void log_vchg_debug(void)
+{
+    int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
+        "VCHG_DBG raw_MEM3=%u raw_MEM0=%u Vchg=%u mV em=%s chg=%s pwm=%u\r\n",
+        (unsigned)DL_ADC12_getMemResult(ADC1_INST, 3),
+        (unsigned)DL_ADC12_getMemResult(ADC1_INST, 0),
+        (unsigned)get_charge_voltage(),
+        em_state_name(ctx.energy_mode),
+        chg_state_name(ctx.charger.state),
+        (unsigned)ctx.pwm);
+    if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
+}
+
 /* =========================================================================
  * PIPELINE STEP 8: apply_pwm
  * =========================================================================
@@ -430,6 +451,7 @@ int main(void)
         if ((now - last_log) >= TICK_LOG_MS) {
             last_log = now;
             log_measurements();
+            log_vchg_debug();   /* TEMP: raw VCHG_M bring-up probe */
         }
 
         /* ── Idle sleep ──
