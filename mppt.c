@@ -281,7 +281,8 @@ void mppt_update(system_ctx_t *ctx)
     switch (m->state) {
 
     case MPPT_DISABLED:
-        /* P1: panel_limited AND has_sun AND charger past settle window → TRACKING.
+        /* P1: panel_limited AND has_sun AND charger past settle window
+         *     AND chg_current below the entry-current gate → TRACKING.
          *
          * Settle gate: when the charger has just activated from
          * CHG_INACTIVE, ctx->pwm starts at PWM_MIN_DUTY (off) and
@@ -290,12 +291,36 @@ void mppt_update(system_ctx_t *ctx)
          * charging tick and walk PWM down by MAX_STEP_SIZE before any
          * current measurement comes back — slamming a stiff source
          * straight into FAULT_OVERCURRENT_CHG. CC_PWM_STEP=1 needs
-         * ~1 s to descend through the responsive PWM range first. */
+         * ~1 s to descend through the responsive PWM range first.
+         *
+         * Current gate (MPPT_ENTRY_CURRENT_GUARD_MA): mirrors V2.5.5's
+         * `chg_current < 1800` precondition in handle_cc. MPPT is only
+         * useful when the panel is the bottleneck. If chg_current is
+         * already at or above the gate, the panel clearly has headroom
+         * and CC is the right loop — letting MPPT in here would race
+         * CC for PWM and (on a stiff source where inc-conductance has
+         * no signal) walk PWM monotonically into the over-current zone.
+         *
+         * Chopper lockout (MPPT_CHOPPER_LOCKOUT_MS): the current-gate
+         * alone is not enough on a stiff source. When the chopper opens
+         * the MOSFET, chg_current samples drop to 0 and the 64-sample
+         * moving average decays toward 0 over its 640 ms window. During
+         * that decay the gate value can dip below 1500 even though the
+         * loop is overcurrent-saturated. Block entry for a few seconds
+         * after any chop tick so the average has time to re-stabilise
+         * at its true post-recovery value before MPPT can re-evaluate. */
         {
             uint32_t since_active = time_now() - ctx->charger.active_start_ms;
             bool settled = (ctx->charger.state != CHG_INACTIVE) &&
                            (since_active >= CHARGER_MPPT_SETTLE_MS);
-            if (panel_limited && has_sun && settled) {
+            bool current_below_gate =
+                (ctx->meas.chg_current < (int16_t)MPPT_ENTRY_CURRENT_GUARD_MA);
+            bool chopper_quiet =
+                (ctx->charger.chopper_last_active_ms == 0) ||
+                ((time_now() - ctx->charger.chopper_last_active_ms)
+                    >= MPPT_CHOPPER_LOCKOUT_MS);
+            if (panel_limited && has_sun && settled &&
+                current_below_gate && chopper_quiet) {
                 enter_tracking(ctx);
             }
         }
@@ -350,9 +375,27 @@ void mppt_update(system_ctx_t *ctx)
             enter_disabled(ctx);
             break;
         }
-        /* P2: hold time expired AND has_sun → TRACKING */
+        /* P2: hold time expired AND has_sun AND chg_current below the
+         *     entry-current gate AND chopper has been quiet → TRACKING.
+         *     Same gates as the MPPT_DISABLED → TRACKING path: don't
+         *     re-enter tracking when the panel is no longer the
+         *     bottleneck or when the soft-chopper is fighting
+         *     overcurrent. If any gate fails, refresh the hold timer
+         *     so the re-test happens again after another
+         *     MPPT_HOLD_TIME_MS window — PWM stays parked and CC keeps
+         *     owning the loop. */
         if (hold_expired(m)) {
-            enter_tracking(ctx);
+            bool current_below_gate =
+                (ctx->meas.chg_current < (int16_t)MPPT_ENTRY_CURRENT_GUARD_MA);
+            bool chopper_quiet =
+                (ctx->charger.chopper_last_active_ms == 0) ||
+                ((time_now() - ctx->charger.chopper_last_active_ms)
+                    >= MPPT_CHOPPER_LOCKOUT_MS);
+            if (current_below_gate && chopper_quiet) {
+                enter_tracking(ctx);
+            } else {
+                m->hold_start_ms = time_now();   /* defer next re-test */
+            }
             break;
         }
         /* P4: stay in HOLD (PWM parked, mppt_limit_ma already published) */

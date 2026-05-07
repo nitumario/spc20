@@ -293,6 +293,17 @@ typedef struct {
      * the next tick when the chopper releases the MOSFET. */
     bool     chopper_active;
 
+    /* Timestamp of the most recent tick on which the chopper opened the
+     * MOSFET. Used by mppt_update to keep MPPT_DISABLED → TRACKING
+     * locked out for MPPT_CHOPPER_LOCKOUT_MS after any chopper event.
+     * Without this, the chopper-induced dips in the 64-sample
+     * chg_current moving average let MPPT slip past its
+     * MPPT_ENTRY_CURRENT_GUARD_MA gate during the brief windows when
+     * the MOSFET is open and the average is still decaying — at which
+     * point MPPT walks PWM monotonically into a high-duty zone and
+     * makes the over-current cycle worse. 0 = never chopped. */
+    uint32_t chopper_last_active_ms;
+
     /* CV taper detection:
      * Battery is full when I_charge stays below BAT_CV_TAPER_MA
      * for BAT_FULL_HOLD_MS continuously.

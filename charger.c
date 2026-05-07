@@ -318,7 +318,7 @@ static bool fast_backoff_if_overcurrent(system_ctx_t *ctx)
  *
  * During this state:
  *   - charge MOSFET is OPEN (battery isolated from buck output)
- *   - PWM held at PWM_MIN_DUTY (buck commanded to ~2.79 V, < V_bat)
+ *   - PWM held at PWM_MIN_DUTY (buck commanded off, V_buck < V_bat)
  *   - no current path to the battery, so no fault risk
  *
  * When BUCK_SETTLE_MS has elapsed, enable the charge MOSFET and

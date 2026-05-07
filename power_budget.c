@@ -112,9 +112,10 @@ void power_budget_update(system_ctx_t *ctx)
      *     (fault_mgr handles that timeout).
      *
      *   CC (3000 mV <= V_bat < 3650 mV):
-     *     Normal bulk charging. Battery can accept up to 2000 mA
-     *     (1C for a 2Ah cell, 0.1C for 20Ah — safe for LiFePO4).
-     *     This is where most of the energy transfer happens.
+     *     Normal bulk charging. Regulator target is BAT_CC_MAX_MA
+     *     (1000 mA — 0.05C on a 20Ah pack, well below the LiFePO4
+     *     limit and well below BUCK_MAX_CURRENT_MA so the loop has
+     *     headroom). This is where most of the energy transfer happens.
      *
      *   NEAR-FULL (V_bat >= 3650 mV):
      *     Cell is approaching full charge. The charger SHOULD be in
@@ -130,7 +131,7 @@ void power_budget_update(system_ctx_t *ctx)
     if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV) {
         bat_limit = BAT_PRECHARGE_MAX_MA;       /* 200 mA — gentle trickle   */
     } else if (ctx->meas.bat_voltage < BAT_CV_VOLTAGE_MV) {
-        bat_limit = BAT_CC_MAX_MA;              /* 2000 mA — full rate       */
+        bat_limit = BAT_CC_MAX_MA;              /* 1000 mA — full rate       */
     } else {
         bat_limit = BAT_CV_TAPER_MA;            /* 200 mA — safety cap       */
     }

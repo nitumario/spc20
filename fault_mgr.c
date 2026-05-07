@@ -197,6 +197,10 @@ static void fault_detect(system_ctx_t *ctx)
         if (m->chg_current > (int16_t)FAULT_OVERCURRENT_CHG_MA) {
             disable_charge_switch();
             ctx->charger.chopper_active = true;
+            /* Timestamp every chop tick so the MPPT entry lockout
+             * window measures from the most recent chop, not the
+             * first one in a burst. */
+            ctx->charger.chopper_last_active_ms = time_now();
         } else if (ctx->charger.chopper_active) {
             /* We were chopping; current has dropped — release the MOSFET. */
             enable_charge_switch();

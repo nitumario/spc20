@@ -38,8 +38,16 @@
 #define BAT_PRECHARGE_MAX_MA      200     /* max current during precharge                        */
 #define BAT_PRECHARGE_TIMEOUT_MS  900000UL /* 15 minutes — if still below 3V, battery is damaged */
 
-/* Constant-current zone */
-#define BAT_CC_MAX_MA             2000    /* max charge current in CC phase                      */
+/* Constant-current zone.
+ *
+ * Target sits well below BUCK_MAX_CURRENT_MA (2000) and the chopper
+ * threshold FAULT_OVERCURRENT_CHG_MA (2500) so the cc_regulate ±25 mA
+ * deadband, 64-sample-average ripple, and stiff-PSU step response have
+ * room to oscillate without nicking the chopper line. Mirrors V2.5.5's
+ * validated bench envelope (chg_ctx.charge_current = 1000 in utils.c).
+ * The hardware ceiling stays at BUCK_MAX_CURRENT_MA; this is the
+ * regulator setpoint, not a hardware limit. */
+#define BAT_CC_MAX_MA             1000    /* max charge current in CC phase                      */
 
 /* Constant-voltage zone */
 #define BAT_CV_VOLTAGE_MV         3650    /* target voltage in CV phase                          */
@@ -87,25 +95,30 @@
  *   lower pwm value → higher V_buck → more charge current
  *   higher pwm value → lower V_buck → less charge current
  *
- * The legal range is anchored to the calibrated LUT in SPCBoardAPI.c
- * (`output_voltages_buck_mV[]`):
+ * The voltage→pwm LUT in SPCBoardAPI.c (`output_voltages_buck_mV[]`)
+ * covers pwm 1-344:
  *
  *   pwm = 1   → V_buck ≈ 3772 mV  (maximum output, maximum charge current)
- *   pwm = 344 → V_buck ≈ 2786 mV  (minimum regulated output — below any
- *                                  healthy V_bat, so the body diode of the
- *                                  charge MOSFET is reverse-biased and no
- *                                  current flows: this is "off")
+ *   pwm = 344 → V_buck ≈ 2786 mV  (lowest LUT entry — already below any
+ *                                  healthy V_bat in principle)
  *
- * pwm > 344 is OUTSIDE the calibrated LUT and the buck loses regulation
- * (FB filter saturates near VCC). With a stiff input source (e.g. a 12 V
- * bench PSU) the buck then delivers high uncontrolled current straight
- * into the battery and trips FAULT_OVERCURRENT_CHG. Solar panels mask the
- * problem because they current-limit, but the bench bring-up case fails.
- * Cap the application pwm at 344 to stay inside calibrated regulation.
+ * Empirically on a stiff input source (bench PSU), pwm = 344 is NOT
+ * actually low enough to push V_buck below V_bat — the buck still
+ * delivers several watts into the cell at this duty. Matching the
+ * reference firmware V2.5.5, the legal range extends to pwm = 399; at
+ * that duty the buck is genuinely off, the body diode of the charge
+ * MOSFET is reverse-biased, and no current flows. Pwm 345-399 is past
+ * the end of the voltage LUT, but the LUT is only consulted by
+ * `set_charging_voltage()` / `pwm_for_charging_voltage()` for
+ * voltage-target lookups; CC and the off-state path command pwm
+ * directly via `set_buck_pwm()`, which writes the timer with no LUT
+ * involvement. The 345-399 range is therefore the deliberate "off"
+ * zone — beyond LUT calibration, but still controlled by the same
+ * monotonic FB-injection circuit.
  */
 #define PWM_PERIOD                400
 #define PWM_MAX_DUTY              1       /* lowest pwm value → highest V_buck (max charge)        */
-#define PWM_MIN_DUTY              344     /* highest pwm value → lowest regulated V_buck (= off)   */
+#define PWM_MIN_DUTY              399     /* highest pwm value → buck genuinely off (V_buck < V_bat)*/
 #define BUCK_MAX_CURRENT_MA       2000    /* hardware current limit of the inductor/FET           */
 
 /* =========================================================================
@@ -213,10 +226,11 @@
  * the charge MOSFET body diode and cap-charging path.
  *
  * To avoid that, the charger keeps the charge MOSFET OPEN for this
- * long after enabling the buck, so the buck output cap settles to the
- * commanded ~2.79 V (below V_bat) before the battery is connected.
- * 250 ms is a comfortable margin over a typical TPS56347 soft-start
- * (~2-5 ms) plus FB-filter RC settle on a stiff input source. */
+ * long after enabling the buck, so the buck output cap settles to its
+ * off-zone level (PWM_MIN_DUTY commands V_buck < V_bat) before the
+ * battery is connected. 250 ms is a comfortable margin over a typical
+ * TPS56347 soft-start (~2-5 ms) plus FB-filter RC settle on a stiff
+ * input source. */
 #define BUCK_SETTLE_MS            250UL
 
 /* Stiff-source escape: while in TRACKING at MAX step, count how many
@@ -233,6 +247,49 @@
  * the panel can't deliver what the budget allows → MPPT needed. */
 #define PANEL_LIMITED_MARGIN_MA   100
 
+/* MPPT chopper lockout window.
+ *
+ * After any tick on which the soft-chopper (fault_mgr) opened the
+ * charge MOSFET, MPPT_DISABLED → TRACKING entry is blocked for this
+ * long. Without it, the chopper-induced dips in the 64-sample
+ * chg_current moving average defeat MPPT_ENTRY_CURRENT_GUARD_MA
+ * during the brief windows when the MOSFET is open and the average
+ * is still decaying — letting MPPT slip in and walk PWM down while
+ * CC is fighting overcurrent.
+ *
+ * Mirrors the structural exclusion V2.5.5 gets for free from its
+ * 10-second RECOVER_WAIT_TIME on cond_overcur_chg: while the fault is
+ * latched, charging state ≠ MPPT, so MPPT cannot run. We don't latch
+ * a fault (the chopper is non-latching by design), but we get the
+ * same effect by timing out MPPT entry after each chop event.
+ *
+ * 5 s is comfortable — well past the 640 ms moving-average window so
+ * the gate sees the post-event steady-state value, and short enough
+ * that real solar conditions (where the chopper should never fire)
+ * are unaffected. */
+#define MPPT_CHOPPER_LOCKOUT_MS   5000UL
+
+/* MPPT entry current gate.
+ *
+ * Block MPPT_DISABLED → TRACKING (and the periodic HOLD → TRACKING
+ * re-test) whenever chg_current is already at or above this threshold.
+ *
+ * Rationale: MPPT only makes sense when the panel is the bottleneck.
+ * If the buck is already pushing this much current into the cell, the
+ * panel clearly has plenty of headroom and CC is the right loop to be
+ * running. On a stiff source (bench PSU, or a panel well above its
+ * knee) the inc-conductance loop has no real signal — dV ≈ dI ≈ 0 —
+ * and walks PWM monotonically into the danger zone before the
+ * MPPT_STUCK_TICK_LIMIT escape kicks in.
+ *
+ * Mirrors V2.5.5 utils.c:257 (`if (m1.chg_current < 1800)` in
+ * handle_cc — only switches to MPPT when CC clearly cannot reach
+ * target). With BAT_CC_MAX_MA=1000 and BUCK_MAX_CURRENT_MA=2000, a
+ * threshold near 1500 sits comfortably above the CC target deadband
+ * yet far below the chopper line (2500), so normal regulation ripple
+ * cannot kick MPPT in or out. */
+#define MPPT_ENTRY_CURRENT_GUARD_MA  1500
+
 /* =========================================================================
  * 7. FAULT THRESHOLDS
  * =========================================================================
@@ -246,12 +303,13 @@
  * battery current — by construction the moving-average chg_current
  * cannot sustainedly exceed this value.
  *
- * Set slightly above BAT_CC_MAX_MA (2000) so the cc_regulate ±25 mA
- * deadband + 64-sample-average ripple do not trigger continuous chops
- * during normal operation. 2500 mA gives the regulator a 500 mA margin
- * on top of target before the chopper engages — empirically the bench
- * PSU operating envelope sits at 2070-2260 mA on V2.5.5, so 2500 lands
- * just above the natural ceiling.
+ * Set well above BAT_CC_MAX_MA (1000) and BUCK_MAX_CURRENT_MA (2000)
+ * so the cc_regulate ±25 mA deadband, 64-sample-average ripple, and
+ * stiff-PSU step response do not trigger continuous chops during
+ * normal operation. Empirically the bench PSU operating envelope sits
+ * at 2070-2260 mA on V2.5.5 with target=1000, so 2500 lands just above
+ * the natural ceiling — chopper engages on real overcurrent, not on
+ * regulation ripple.
  *
  * Same macro is reused by fast_backoff_if_overcurrent for its instant-
  * sample over-current trip. Both react to the same threshold; the
