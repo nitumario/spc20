@@ -6,9 +6,11 @@
  *   1. Decide whether the charger should run at all. It runs only when
  *      energy_mode has activated the region (EM_CHARGE_ONLY or
  *      EM_CHARGE_AND_LOAD) AND no charge-blocking fault is latched.
- *   2. From CHG_INACTIVE, self-activate into PRECHARGE (if V_bat < 3000
- *      mV) or CC (otherwise) — this is the "activated" transition from
- *      charger_states.csv.
+ *   2. From CHG_INACTIVE, self-activate into CHG_BUCK_SETTLE — hold the
+ *      charge MOSFET open and PWM at PWM_MIN_DUTY for BUCK_SETTLE_MS so
+ *      the buck soft-start completes with V_out below V_bat. After the
+ *      settle window, close the MOSFET and dispatch to PRECHARGE
+ *      (if V_bat < 3000 mV) or CC (otherwise).
  *   3. Evaluate in-state transition guards (V_bat thresholds, taper
  *      completion, precharge timeout).
  *   4. Regulate ctx->pwm:
@@ -29,8 +31,8 @@
  *
  * Sign convention
  * ---------------
- * - Lower pwm value  = higher duty cycle = more buck output current.
- * - Higher pwm value = lower duty cycle  = less current (pwm=399 → off).
+ * - Lower pwm value  = higher V_buck = more charge current.
+ * - Higher pwm value = lower V_buck  = less current (pwm=PWM_MIN_DUTY → off).
  * - To INCREASE charge current: pwm -= step.
  * - To DECREASE charge current: pwm += step.
  *
@@ -45,11 +47,12 @@
 
 /* Any of these latched faults should block the charger from running.
  * (Undervolt is excluded: by the time V_bat is that low, energy_mode
- *  is already in SAFE_MODE which deactivates the charger.) */
+ *  is already in SAFE_MODE which deactivates the charger. FAULT_OVERCURRENT_CHG
+ *  is excluded too: it is now a non-latching soft chopper handled by
+ *  fault_mgr per tick — see fault_detect.) */
 #define CHG_FAULT_BLOCK_MASK   \
     (FAULT_OVERTEMP            \
    | FAULT_BAT_OVERVOLT        \
-   | FAULT_OVERCURRENT_CHG     \
    | FAULT_PRECHARGE_TIMEOUT   \
    | FAULT_TEMP_CHARGE_BLOCK)
 
@@ -59,8 +62,8 @@
 
 static inline uint16_t pwm_clamp(int32_t p)
 {
-    if (p < PWM_MAX_DUTY) return PWM_MAX_DUTY;   /* 1   — highest duty */
-    if (p > PWM_MIN_DUTY) return PWM_MIN_DUTY;   /* 399 — effectively off */
+    if (p < PWM_MAX_DUTY) return PWM_MAX_DUTY;   /* highest V_buck */
+    if (p > PWM_MIN_DUTY) return PWM_MIN_DUTY;   /* off (V_buck < V_bat) */
     return (uint16_t)p;
 }
 
@@ -76,6 +79,25 @@ static inline void pwm_step(system_ctx_t *ctx, int32_t delta)
  * No PWM changes here — the previous PWM value is intentionally retained
  * so the buck can smoothly hand off between PRECHARGE → CC → CV.
  */
+
+static void enter_buck_settle(system_ctx_t *ctx)
+{
+    ctx->charger.state = CHG_BUCK_SETTLE;
+    ctx->charger.active_start_ms = time_now();
+
+    /* Buck has been enabled by energy_mode. Charge MOSFET stays OPEN
+     * for BUCK_SETTLE_MS so the buck output ramps up with no load.
+     *
+     * Pre-seed PWM to the LUT entry whose calibrated V_buck matches V_bat.
+     * This is FB-injected regulation, so the PWM → V_buck mapping is
+     * captured by the calibration LUT, not by V_out = D × V_in. */
+    disable_charge_switch();
+    ctx->pwm = pwm_for_charging_voltage(ctx->meas.bat_voltage);
+
+    ctx->charger.bat_full_timing    = false;
+    ctx->charger.bat_full_signaled  = false;
+    ctx->charger.fast_chop_consec   = 0;
+}
 
 static void enter_precharge(system_ctx_t *ctx)
 {
@@ -145,6 +167,13 @@ static inline bool mppt_owns_pwm(const system_ctx_t *ctx)
  */
 static void cc_regulate(system_ctx_t *ctx)
 {
+    /* If the soft-chopper is currently holding the MOSFET open,
+     * chg_current reads 0 — that is not a real "under-current"
+     * signal, so do not step PWM in either direction. The chopper
+     * will release on the next tick when current naturally drops,
+     * and regulation resumes from the unchanged operating point. */
+    if (ctx->charger.chopper_active) return;
+
     /* err > 0 means we are OVER target (too much current). */
     int32_t target = (int32_t)ctx->allowed_chg;
     int32_t actual = (int32_t)ctx->meas.chg_current;
@@ -223,13 +252,115 @@ static void cv_taper_track(system_ctx_t *ctx)
     }
 }
 
+/*
+ * fast_backoff_if_overcurrent — stiff-source safety guard for tick_cc.
+ *
+ * Problem: with a bench PSU (or any low-impedance source) the buck can
+ * deliver ripple peaks well above FAULT_OVERCURRENT_CHG_MA even when the
+ * 64-sample moving average reads ~1.5 A. cc_regulate's per-tick +1 PWM
+ * count up-step is too slow to escape the dangerous zone before the
+ * 640 ms moving-average fault check would latch.
+ *
+ * Response: when CC_FAST_CHOP_CONSEC consecutive raw 10 ms samples
+ * exceed FAULT_OVERCURRENT_CHG_MA, jump PWM up by CC_FAST_BACKOFF_STEP
+ * counts in a single tick and SKIP the rest of regulation for this
+ * tick. The charge MOSFET stays CLOSED and the charger stays in CC —
+ * we are nudging the buck's commanded duty, not isolating the battery.
+ *
+ * Re-entering CHG_BUCK_SETTLE here would buy nothing: SETL exists to
+ * cover the buck IC's soft-start ramp at first activation. By the time
+ * we are in CC the buck has been running steadily for hundreds of ms;
+ * the fix is to lower duty, not to disconnect and reconnect the cell.
+ */
+static bool fast_backoff_if_overcurrent(system_ctx_t *ctx)
+{
+    /* Ignore the unfiltered read for a brief window after MOSFET close.
+     * Cap-rebalance and inductor inrush peaks here exceed FAULT_OVERCURRENT_CHG_MA
+     * for one or two 10 ms ADC samples even when V_buck is already at V_bat. */
+    if ((time_now() - ctx->charger.mosfet_close_ms) < CC_INRUSH_IGNORE_MS) {
+        ctx->charger.fast_chop_consec = 0;
+        return false;
+    }
+
+    int16_t i_instant = get_charge_current_instant();
+    if (i_instant <= (int16_t)FAULT_OVERCURRENT_CHG_MA) {
+        /* Single in-range sample resets the streak. We want
+         * CC_FAST_CHOP_CONSEC UNINTERRUPTED ticks above threshold
+         * before reacting, so a lone ripple peak cannot kick the
+         * regulator. */
+        ctx->charger.fast_chop_consec = 0;
+        return false;
+    }
+
+    if (++ctx->charger.fast_chop_consec < CC_FAST_CHOP_CONSEC) {
+        /* Above threshold but not yet sustained — let cc_regulate's
+         * +CC_PWM_STEP up-step (runs every tick when actual > target)
+         * back the buck off before we escalate. */
+        return false;
+    }
+
+    /* Sustained over-current confirmed. Push PWM up by several counts
+     * in one tick — far enough that cc_regulate's slow descent will not
+     * walk straight back into the danger zone on the next tick. MOSFET
+     * stays closed, state stays CC. */
+    pwm_step(ctx, +CC_FAST_BACKOFF_STEP);
+    ctx->charger.fast_chop_consec = 0;
+    return true;
+}
+
 /* =========================================================================
  * PER-STATE TICK LOGIC
  * ========================================================================= */
 
+/*
+ * tick_buck_settle — wait for the buck soft-start to settle, then close
+ * the charge MOSFET and hand off to PRECHARGE/CC.
+ *
+ * During this state:
+ *   - charge MOSFET is OPEN (battery isolated from buck output)
+ *   - PWM held at PWM_MIN_DUTY (buck commanded to ~2.79 V, < V_bat)
+ *   - no current path to the battery, so no fault risk
+ *
+ * When BUCK_SETTLE_MS has elapsed, enable the charge MOSFET and
+ * dispatch to PRECHARGE or CC based on V_bat. Falling through to the
+ * destination state's tick on the same call is intentional (mirrors the
+ * existing PRECHARGE → CC and CC → CV fall-through pattern).
+ */
+static void tick_buck_settle(system_ctx_t *ctx)
+{
+    /* PWM was pre-seeded to the V_bat-matched duty in enter_buck_settle().
+     * Hold that value through the settle window so the buck output ramps
+     * up to V_bat with the MOSFET still open — closing onto a buck whose
+     * output already matches V_bat avoids inrush. */
+
+    if ((time_now() - ctx->charger.active_start_ms) < BUCK_SETTLE_MS) {
+        return;
+    }
+
+    /* Settle window elapsed — connect the battery. */
+    enable_charge_switch();
+    ctx->charger.mosfet_close_ms = time_now();
+
+    /* Arm the CC down-step throttle from this point so the regulator
+     * doesn't get a free first step the moment current sense comes
+     * online. */
+    ctx->charger.cc_last_downstep_ms = time_now();
+
+    if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV) {
+        enter_precharge(ctx);
+    } else {
+        enter_cc(ctx);
+    }
+    /* Do NOT fall through to a regulator step on this tick. Let the
+     * chg_current ADC ingest at least one sample post-MOSFET-close
+     * before allowing pwm_step to act on it. */
+}
+
 static void tick_precharge(system_ctx_t *ctx)
 {
     charger_ctx_t *c = &ctx->charger;
+
+    if (fast_backoff_if_overcurrent(ctx)) return;  /* defined above in helpers */
 
     /* P1: V_bat climbed above 3 V → move to CC (full rate). */
     if (ctx->meas.bat_voltage >= BAT_PRECHARGE_MV) {
@@ -255,6 +386,9 @@ static void tick_precharge(system_ctx_t *ctx)
 
 static void tick_cc(system_ctx_t *ctx)
 {
+    /* Fast-backoff guard must run before any PWM regulation. */
+    if (fast_backoff_if_overcurrent(ctx)) return;
+
     /* P1: V_bat ≥ 3.65 V → CV. */
     if (ctx->meas.bat_voltage >= BAT_CV_VOLTAGE_MV) {
         enter_cv(ctx);
@@ -317,6 +451,7 @@ void charger_update(system_ctx_t *ctx)
             c->precharge_start_ms = 0;
             c->bat_full_timing    = false;
             c->bat_full_signaled  = false;
+            c->fast_chop_consec   = 0;
             ctx->pwm = PWM_MIN_DUTY;
         }
         return;
@@ -324,24 +459,19 @@ void charger_update(system_ctx_t *ctx)
 
     /* ── Self-activation from INACTIVE ──
      *
-     * energy_mode has enabled buck + charge switch and left state at
-     * INACTIVE. Choose PRECHARGE or CC based on V_bat, then fall
-     * through to run the first regulation tick in the new state. */
+     * energy_mode has enabled the buck (BUCK_DIS deasserted) but left
+     * the charge MOSFET OPEN. Enter CHG_BUCK_SETTLE to wait out the
+     * buck soft-start before closing the MOSFET in tick_buck_settle. */
     if (c->state == CHG_INACTIVE) {
-        c->active_start_ms = time_now();
-        c->cc_last_downstep_ms = time_now();   /* arm the descent throttle */
-        if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV) {
-            enter_precharge(ctx);
-        } else {
-            enter_cc(ctx);
-        }
+        enter_buck_settle(ctx);
     }
 
     /* ── Per-state tick ── */
     switch (c->state) {
-        case CHG_PRECHARGE: tick_precharge(ctx); break;
-        case CHG_CC:        tick_cc(ctx);        break;
-        case CHG_CV:        tick_cv(ctx);        break;
+        case CHG_BUCK_SETTLE: tick_buck_settle(ctx); break;
+        case CHG_PRECHARGE:   tick_precharge(ctx);   break;
+        case CHG_CC:          tick_cc(ctx);          break;
+        case CHG_CV:          tick_cv(ctx);          break;
 
         /* Should not happen — handled by the gate above. */
         case CHG_INACTIVE:

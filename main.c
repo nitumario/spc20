@@ -78,7 +78,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.17\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.19\r\n"
                 "==============================================\r\n");
 }
 
@@ -194,17 +194,18 @@ static void log_measurements(void)
  * Reads ctx->pwm (written by charger or MPPT in steps 6/7) and commits
  * it to hardware via the HAL.
  *
- * Range enforcement: ctx->pwm should already be in [1, 399] — clamped
- * by mppt and charger. We clamp here as defense-in-depth so a bug
- * upstream can never write 0 (100% duty, inductor saturation) or 400
- * (counter overflow / glitch).
+ * Range enforcement: ctx->pwm should already be in [PWM_MAX_DUTY,
+ * PWM_MIN_DUTY] — clamped by mppt and charger. We clamp here as defense-
+ * in-depth so a bug upstream can never write a value outside the
+ * calibrated buck-regulation range (where the buck loses control and
+ * delivers uncontrolled current on a stiff input source).
  */
 static void apply_pwm(system_ctx_t *c)
 {
     uint16_t pwm = c->pwm;
 
-    if (pwm < PWM_MAX_DUTY) pwm = PWM_MAX_DUTY;   /* floor at 1   */
-    if (pwm > PWM_MIN_DUTY) pwm = PWM_MIN_DUTY;   /* ceil  at 399 */
+    if (pwm < PWM_MAX_DUTY) pwm = PWM_MAX_DUTY;   /* floor: highest V_buck */
+    if (pwm > PWM_MIN_DUTY) pwm = PWM_MIN_DUTY;   /* ceil:  off (in-LUT)   */
 
     set_buck_pwm(pwm);
 }

@@ -627,6 +627,14 @@ int16_t get_charge_current(void){
     return (int16_t)(v_icharge/CHG_CUR_GAIN/CHG_CUR_RES);
 }
 
+int16_t get_charge_current_instant(void){
+    /* Single 10 ms raw ADC sample — no 640 ms moving-average lag, no
+     * switch guard.  Used by tick_cc() to detect instantaneous
+     * overcurrent before the averaged reading catches up. */
+    float v_icharge = ((ADC.VREF*(float)ADC.Adc0Result[4])/(ADC.max_adc0_value)) - 1260.0f;
+    return (int16_t)(v_icharge/CHG_CUR_GAIN/CHG_CUR_RES);
+}
+
 uint16_t get_charge_voltage(void){
     return (uint16_t)(ADC.VREF*avg_readings[12]/(ADC.max_adc1_value)/VCHGM_DIV_RATIO);
 }
@@ -980,6 +988,18 @@ void set_buck_pwm(uint16_t pwm_value){
 uint16_t set_charging_voltage(uint16_t voltage){
     uint16_t duty_cycle_index = binary_search_closest_descending(voltage, output_voltages_buck_mV, 344);
     set_pwm_duty_cycle(&_pwm_outputs[0], duty_cycles_buck[duty_cycle_index]);
+    return duty_cycles_buck[duty_cycle_index];
+}
+
+/*
+ * Returns the PWM duty value whose calibrated buck output is closest to
+ * the requested voltage, without touching the timer. Lets the charger
+ * pre-seed ctx->pwm to an operating-point duty before closing the charge
+ * MOSFET, matching the V2.5.5 behaviour of set_charging_voltage(V_bat)
+ * at charge entry.
+ */
+uint16_t pwm_for_charging_voltage(uint16_t voltage){
+    uint16_t duty_cycle_index = binary_search_closest_descending(voltage, output_voltages_buck_mV, 344);
     return duty_cycles_buck[duty_cycle_index];
 }
 

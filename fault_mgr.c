@@ -54,7 +54,6 @@ static void fault_take_action(uint16_t fault_bit)
             break;
 
         case FAULT_BAT_OVERVOLT:
-        case FAULT_OVERCURRENT_CHG:
         case FAULT_PRECHARGE_TIMEOUT:
         case FAULT_TEMP_CHARGE_BLOCK:
             /* Charge-side faults — stop pushing current into the battery. */
@@ -103,11 +102,6 @@ static bool fault_recovery_met(const system_ctx_t *ctx, uint16_t fault_bit)
 
         case FAULT_BAT_OVERVOLT:
             return (m->bat_voltage < BAT_OVERVOLT_RECOVER_MV);
-
-        case FAULT_OVERCURRENT_CHG:
-            /* Auto-retry after wait period — current is only meaningful
-             * when charger is running. The wait itself is the debounce. */
-            return (m->chg_current < BAT_CC_MAX_MA);
 
         case FAULT_OVERCURRENT_DSG:
             return (m->dsg_current < BAT_CC_MAX_MA);
@@ -180,10 +174,41 @@ static void fault_detect(system_ctx_t *ctx)
         fault_raise(ctx, FAULT_BAT_UNDERVOLT);
     }
 
-    /* ── Current limits ── */
-    if (m->chg_current > (int16_t)FAULT_OVERCURRENT_CHG_MA) {
-        fault_raise(ctx, FAULT_OVERCURRENT_CHG);
+    /* ── Charge current: non-latching soft chopper ──
+     *
+     * Mirrors the V2.5.5 behaviour of cond_overcur_chg + act_stop_charging
+     * + rec_overcur_chg as a per-tick chopper. Above the threshold, open
+     * the charge MOSFET and tag the charger so cc_regulate freezes its
+     * step (the open MOSFET reads chg_current = 0, which the regulator
+     * would otherwise interpret as under-current). Below the threshold,
+     * release the MOSFET so charging continues. The buck is never
+     * killed, no fault bit is latched, and there is no 10 s recovery
+     * wait — the average current naturally caps at the threshold by
+     * construction.
+     *
+     * Only acts while the charger is in an active sub-state. Energy_mode,
+     * other faults, and CHG_BUCK_SETTLE keep their MOSFET ownership
+     * without interference. */
+    bool charger_active = (ctx->charger.state == CHG_PRECHARGE) ||
+                          (ctx->charger.state == CHG_CC) ||
+                          (ctx->charger.state == CHG_CV);
+
+    if (charger_active) {
+        if (m->chg_current > (int16_t)FAULT_OVERCURRENT_CHG_MA) {
+            disable_charge_switch();
+            ctx->charger.chopper_active = true;
+        } else if (ctx->charger.chopper_active) {
+            /* We were chopping; current has dropped — release the MOSFET. */
+            enable_charge_switch();
+            ctx->charger.chopper_active = false;
+        }
+    } else {
+        /* Charger not in a sub-state where chopping is meaningful. Make
+         * sure the flag is clear so cc_regulate is not frozen on the
+         * next CC entry. */
+        ctx->charger.chopper_active = false;
     }
+
     if (m->dsg_current > FAULT_OVERCURRENT_DSG_MA) {
         fault_raise(ctx, FAULT_OVERCURRENT_DSG);
     }
@@ -225,7 +250,8 @@ static void fault_recover(system_ctx_t *ctx)
     static const uint16_t all_bits[] = {
         FAULT_OVERTEMP,
         FAULT_BAT_OVERVOLT,
-        FAULT_OVERCURRENT_CHG,
+        /* FAULT_OVERCURRENT_CHG is no longer latching — handled by the
+         * per-tick chopper in fault_detect, never appears in fault.code. */
         FAULT_OVERCURRENT_DSG,
         FAULT_BAT_UNDERVOLT,
         FAULT_USB_OVERVOLT,

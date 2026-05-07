@@ -111,7 +111,8 @@ void usb_fault_read(void);
 void read_adc_values(void);
 
 /* Measurement conversion functions — all return engineering units (mV, mA, °C) */
-int16_t  get_charge_current(void);         /* mA, signed */
+int16_t  get_charge_current(void);         /* mA, signed, 64-sample moving average */
+int16_t  get_charge_current_instant(void); /* mA, last raw 10 ms sample — bypasses moving avg and switch guard */
 uint16_t get_charge_voltage(void);         /* mV */
 uint16_t get_input_voltage(void);          /* mV */
 int16_t  get_input_current(void);          /* mA, signed */
@@ -141,6 +142,7 @@ void     pwm_init(void);
 void     set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle);
 void     set_buck_pwm(uint16_t pwm_value);
 uint16_t set_charging_voltage(uint16_t voltage);
+uint16_t pwm_for_charging_voltage(uint16_t voltage);
 void     set_led_voltage(uint16_t voltage);
 void     set_led_current(uint16_t current, LED_OUTPUT led);
 

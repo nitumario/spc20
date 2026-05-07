@@ -133,13 +133,19 @@ typedef enum {
  * Activated/deactivated by energy mode. When inactive, the charger
  * does nothing and the buck is disabled.
  *
- *   CHG_INACTIVE   — charger region not running (deactivated by energy mode)
- *   CHG_PRECHARGE  — V_bat < 3.0V, trickle charge at ≤200 mA
- *   CHG_CC         — constant current, target = allowed_chg from power budget
- *   CHG_CV         — constant voltage at 3.65V, current tapers until bat_full
+ *   CHG_INACTIVE      — charger region not running (deactivated by energy mode)
+ *   CHG_BUCK_SETTLE   — buck has been enabled, charge MOSFET still open. Waits
+ *                       BUCK_SETTLE_MS for the buck soft-start to complete and
+ *                       V_out to settle below V_bat before connecting the
+ *                       battery. Prevents inrush from the buck soft-start
+ *                       overshoot dumping into the battery.
+ *   CHG_PRECHARGE     — V_bat < 3.0V, trickle charge at ≤200 mA
+ *   CHG_CC            — constant current, target = allowed_chg from power budget
+ *   CHG_CV            — constant voltage at 3.65V, current tapers until bat_full
  */
 typedef enum {
     CHG_INACTIVE,
+    CHG_BUCK_SETTLE,
     CHG_PRECHARGE,
     CHG_CC,
     CHG_CV
@@ -252,10 +258,11 @@ typedef struct {
     /* Precharge timing — start timestamp for timeout detection */
     uint32_t precharge_start_ms;
 
-    /* Charger activation timestamp — set when leaving CHG_INACTIVE.
-     * MPPT consults this to enforce CHARGER_MPPT_SETTLE_MS so it does
-     * not steal PWM control before the CC ramp has had a chance to
-     * regulate down from PWM_MIN_DUTY. */
+    /* Charger activation timestamp — set when entering CHG_BUCK_SETTLE
+     * from CHG_INACTIVE. MPPT consults this to enforce
+     * CHARGER_MPPT_SETTLE_MS so it does not steal PWM control before
+     * the CC ramp has had a chance to regulate down from PWM_MIN_DUTY.
+     * It is also reused as the buck-settle deadline reference. */
     uint32_t active_start_ms;
 
     /* Last tick CC issued a pwm DOWN step (more current). Used by
@@ -263,6 +270,28 @@ typedef struct {
      * the regulator does not outrun the chg_current ADC moving
      * average. */
     uint32_t cc_last_downstep_ms;
+
+    /* Timestamp the charge MOSFET was last closed. fast_chop_if_overcurrent
+     * ignores the unfiltered instant-current read for CC_INRUSH_IGNORE_MS
+     * after this point, so cap-rebalance / inductor inrush transients at
+     * MOSFET close cannot re-trigger the chopper. */
+    uint32_t mosfet_close_ms;
+
+    /* Consecutive ticks the unfiltered instant chg_current has read above
+     * FAULT_OVERCURRENT_CHG_MA. Switching-ripple peaks on a stiff source
+     * can momentarily breach the threshold even when the moving average
+     * is well below it; require CC_FAST_CHOP_CONSEC ticks in a row before
+     * tripping the fast-chopper, so a single noisy ADC sample no longer
+     * forces a SETTLE / CC oscillation. Reset to 0 on any in-range sample. */
+    uint8_t  fast_chop_consec;
+
+    /* True for one tick after the soft-chopper (in fault_mgr) opened the
+     * charge MOSFET because averaged chg_current exceeded
+     * FAULT_OVERCURRENT_CHG_MA. cc_regulate consults this and skips its
+     * step so it does not interpret the chopper-induced "0 mA" reading
+     * as under-current and walk PWM in the wrong direction. Cleared on
+     * the next tick when the chopper releases the MOSFET. */
+    bool     chopper_active;
 
     /* CV taper detection:
      * Battery is full when I_charge stays below BAT_CV_TAPER_MA
@@ -557,11 +586,12 @@ static inline const char* em_state_name(energy_mode_state_t s)
 static inline const char* chg_state_name(charger_state_t s)
 {
     switch (s) {
-        case CHG_INACTIVE:  return "OFF";
-        case CHG_PRECHARGE: return "PRE";
-        case CHG_CC:        return "CC";
-        case CHG_CV:        return "CV";
-        default:            return "???";
+        case CHG_INACTIVE:    return "OFF";
+        case CHG_BUCK_SETTLE: return "SETL";
+        case CHG_PRECHARGE:   return "PRE";
+        case CHG_CC:          return "CC";
+        case CHG_CV:          return "CV";
+        default:              return "???";
     }
 }
 

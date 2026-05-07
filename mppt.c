@@ -64,8 +64,10 @@
 
 /* ── PWM bound helpers ──
  *
- * PWM_MAX_DUTY (1) is the SMALLEST pwm value — it corresponds to the
- * HIGHEST duty cycle. PWM_MIN_DUTY (399) is the LARGEST pwm value. The
+ * PWM_MAX_DUTY is the SMALLEST pwm value — corresponds to the HIGHEST
+ * regulated V_buck (most charge current). PWM_MIN_DUTY is the LARGEST
+ * pwm value within the calibrated LUT — corresponds to the LOWEST
+ * regulated V_buck, which is below any healthy V_bat (= "off"). The
  * legal range is therefore [PWM_MAX_DUTY, PWM_MIN_DUTY]. */
 static inline uint16_t pwm_clamp(int32_t p)
 {

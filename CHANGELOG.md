@@ -1,3 +1,103 @@
+# [v0.22] - 06.05.26
+## Revert V_in-aware seed; raise FAULT_OVERCURRENT_CHG_MA above the normal operating envelope
+
+Changed files: `hw_config.h`, `charger.c`, `fault_mgr.c`
+
+### BUG FIX: bench-PSU charging latches `FAULT_OVERCURRENT_CHG` in steady-state CC despite the regulator working correctly
+- The CC regulator targets `BAT_CC_MAX_MA = 2000`. On a stiff 12 V bench PSU (input ~0.78 A; buck step-down ratio ~3.3× yields ~2.1 A on the battery side at ~87 % efficiency) the V2.5.5 reference firmware logs steady-state `chg_current` between 2070 and 2261 mA — averaging ~2150 mA, peaking at 2261 mA. That is the natural operating envelope for a 2000 mA target with `CC_DEADBAND_MA = 25`, the 64-sample / 640 ms moving-average filter, and `CC_DOWNSTEP_INTERVAL_MS = 300` deliberately slowing the regulator below the ADC group delay.
+- Our `FAULT_OVERCURRENT_CHG_MA = 2200` sits **inside** that envelope. A single normal-operation sample of 2230 mA latches the fault, kills the buck, and starts a 10 s `FAULT_RECOVER_WAIT_MS` wait — at the end of which retry produces the same 2.2 A operating point and re-latches. Indefinite 10 s loop.
+- V2.5.5 used the same 2000 mA limit but as a **non-latching soft chopper**: action was just `disable_battery_switch()` (buck kept running), recovery was checked every tick, and `get_charge_current()` returns 0 when the MOSFET is open — so recovery succeeded on the very next tick and the MOSFET re-closed. To the user it looked like uninterrupted CC operation at ~2.1 A. Same threshold, completely different behaviour, and the reason the old code "tolerated" what we kept rejecting.
+- The v0.21 V_in-aware seed was a wild-goose chase based on the wrong root cause. The buck is FB-injected; the LUT captures the actual PWM → V_buck mapping. The real failure was the latching threshold being placed inside the operating envelope.
+
+### FIX 1: revert v0.21 LUT-replacement (`charger.c`, `hw_config.h`)
+- `enter_buck_settle()` once again calls `pwm_for_charging_voltage(ctx->meas.bat_voltage)`. Removed `pwm_seed_from_vin`, `BUCK_SEED_VIN_MIN_MV`, `BUCK_SEED_MARGIN_COUNTS`.
+
+### FIX 2: raise `FAULT_OVERCURRENT_CHG_MA` from 2200 → 3000 (`hw_config.h`)
+- 3000 mA is 50 % above the 2000 mA target — well clear of the natural ±200 mA operating jitter on a stiff source, while still tripping unambiguously on real runaway (e.g. the v0.18 incident's ~3.5 A buck-out-of-regulation event).
+- Comment in `hw_config.h` documents *why* the threshold sits where it does, with reference to the V2.5.5 chopper behaviour, so a future tightening pass doesn't unwittingly re-create the bug.
+- `fast_backoff_if_overcurrent` (v0.20) reuses the same `FAULT_OVERCURRENT_CHG_MA` macro for its instantaneous trip line. The bump moves its trip line up too — fine, because fast-backoff is meant to catch real runaway in 150 ms, and 3000 mA on a single 10 ms sample is plenty fast enough for that.
+
+### Note: no buffer-fill grace window
+- A grace window for the averaged check after MOSFET close was prototyped during the misdiagnosis and discarded once the real cause was identified. The buffer-fill artifact theory didn't survive the math: at 100 ms post-close `chg_current` reads 474 mA which would back-calculate to ~3 A sustained — that "3 A" was an averaging illusion of a real ~2.1 A current passing through a partially-filled buffer.
+
+---
+
+# [v0.21] - 06.05.26
+## Replace LUT-based PWM seed with V_in-aware first-principles math (REVERTED in v0.22)
+
+Changed files: `hw_config.h`, `charger.c`
+
+### BUG FIX: bench-PSU charging latches `FAULT_OVERCURRENT_CHG` ~450 ms after first MOSFET close, despite v0.20 fast-backoff
+- After v0.20 the `CC ↔ SETL` oscillation was gone, but on first activation the charger entered CC at PWM=130 (LUT seed for V_bat=3478 mV) and the 64-sample chg_current moving average crossed `FAULT_OVERCURRENT_CHG_MA = 2200 mA` 450 ms later. The 10 s fault-recovery edge then re-tried with the same seed and re-tripped — same loop, just with `→ OFF` instead of `→ SETL`.
+- The fast-backoff guard was outpaced because `fault_mgr` checks the same averaged current that the regulator sees; by the time the average hits the trip line, the buck has been delivering ~3.5 A of unregulated current for hundreds of ms straight from MOSFET close.
+- Hypothesised root cause was a V_in mismatch on the LUT — that is **wrong**, see v0.22.
+
+### FIX: compute the seed from measured V_panel instead of from the LUT (`hw_config.h`, `charger.c`)
+- New helper `pwm_seed_from_vin(v_bat, v_in)` in `charger.c` returns `400 − (400 × V_bat / V_in) + BUCK_SEED_MARGIN_COUNTS`. Treats the buck as `V_buck ≈ duty × V_in`, solves for the duty that hits V_bat, then nudges PWM up by `BUCK_SEED_MARGIN_COUNTS` (5) so V_buck lands just below V_bat at close. The MOSFET closes onto a sub-V_bat output → zero current → cc_regulate walks PWM down 1 count per tick to reach the target.
+- Falls back to `pwm_for_charging_voltage()` (the LUT) when V_panel < `BUCK_SEED_VIN_MIN_MV` (5 V), so cold-boot ticks where the panel ADC moving average has not yet filled still seed sensibly.
+- `enter_buck_settle()` now calls `pwm_seed_from_vin(ctx->meas.bat_voltage, ctx->meas.panel_voltage)` instead of `pwm_for_charging_voltage(ctx->meas.bat_voltage)`. Same intent, V_in-aware.
+
+---
+
+# [v0.20] - 06.05.26
+## Stiff-source over-current backs PWM off without re-entering BUCK_SETTLE
+
+Changed files: `hw_config.h`, `system_types.h`, `charger.c`
+
+### BUG FIX: bench-PSU charging oscillates `CC ↔ SETL` every ~250–300 ms, never reaches steady state
+- On a 12 V/1.5 A bench PSU, the charger entered CC at PWM ≈ 72 (V_buck ≈ 9.5 V vs V_bat ≈ 3.4 V). Per-tick logs showed `CC → SETL` fire 150 ms after every MOSFET close, then `SETL → CC` 250 ms later, then repeat — average chg_current 1475–1775 mA (well below the 2200 mA fault), but `get_charge_current_instant()` (raw 10 ms ADC sample) was reading > 2200 mA from switching ripple.
+- Two compounding causes:
+  1. `fast_chop_if_overcurrent` tripped on a single noisy ADC sample. Ripple peaks alone could re-open the MOSFET.
+  2. The over-current response re-entered `CHG_BUCK_SETTLE`. SETL exists to bridge the buck IC's soft-start at first activation; here the buck had been running steadily for seconds, so the 250 ms isolation window did nothing useful — the buck commanded the same V_buck on the other side, and the cycle repeated.
+
+### FIX: require N consecutive instant samples and react with a PWM jump, not a state change (`hw_config.h`, `system_types.h`, `charger.c`)
+- Added `CC_FAST_CHOP_CONSEC = 3` and `charger_ctx_t.fast_chop_consec`. The guard now counts consecutive instant samples above `FAULT_OVERCURRENT_CHG_MA`; the streak resets on any in-range sample or while inside `CC_INRUSH_IGNORE_MS`. A lone ripple peak no longer triggers anything.
+- Renamed `fast_chop_if_overcurrent` → `fast_backoff_if_overcurrent`. On confirmed sustained over-current it now calls `pwm_step(ctx, +CC_FAST_BACKOFF_STEP)` (new constant, 10 counts) and returns. The MOSFET stays closed, the charger stays in CC, and the buck's commanded duty drops in a single tick — far enough that `cc_regulate`'s 1-count-per-tick descent will not walk straight back into the danger zone.
+- `CHG_BUCK_SETTLE` is now reserved for its original purpose: covering the buck IC's soft-start ramp on the first transition out of `CHG_INACTIVE`. It is no longer entered as an over-current response.
+
+---
+
+# [v0.19] - 01.05.26
+## Stagger buck-enable from charge-MOSFET-enable to defeat soft-start inrush
+
+Changed files: `hw_config.h`, `system_types.h`, `charger.c`, `energy_mode.c`
+
+### BUG FIX: `FAULT_OVERCURRENT_CHG` still trips on every activation despite `PWM_MIN_DUTY = 344` (12 V PSU bring-up, regression follow-up)
+- After v0.18 capped `PWM_MIN_DUTY` at the calibrated LUT boundary, the first activation still tripped overcurrent ~400 ms after `EM: IDLE → CHG_ONLY`. Subsequent fault-recovery retries (every `FAULT_RECOVER_WAIT_MS = 10 s`) tripped again with much smaller measured `Ipanel` (~195 mA average vs. ~984 mA on first hit) — but still over the 2200 mA charge-current fault threshold once the moving average filled.
+- Stale-samples-in-the-moving-average theory was ruled out: ADC sampling continues while the charger is OFF and the current sense reads its 1260 mV baseline, so the 64-sample / 640 ms window fully refreshes 15× over during the 10 s wait. New inrush current actually flows on each retry.
+- Root cause is buck soft-start sequencing. `activate_charger_region()` called `enable_input_buck()` and `enable_charge_switch()` back-to-back, microseconds apart. The TPS56347 runs its OWN internal soft-start when BUCK_DIS is deasserted — its internal reference ramps from 0 to ~0.6 V over a few ms, during which V_out tracks the ramp and the regulator loop can briefly overshoot the FB-injection setpoint before settling. With the charge MOSFET already CLOSED at that moment, any V_out excursion above V_bat conducts cap-charging current straight into the battery via the body diode and through the closed channel — that's the inrush, and it is independent of the steady-state PWM setpoint.
+- The same handoff happens on every fault-recovery edge: `fault_take_action()` asserted BUCK_DIS when raising the fault, so when `energy_mode`'s "fault_just_cleared" edge re-applies entry actions, the buck soft-starts again and the MOSFET is closed at the same moment — same inrush, same fault, same 10 s loop.
+
+### FIX: New `CHG_BUCK_SETTLE` charger state holds the MOSFET open across soft-start (`system_types.h`, `charger.c`, `energy_mode.c`)
+- Added `CHG_BUCK_SETTLE` between `CHG_INACTIVE` and `CHG_PRECHARGE`/`CHG_CC` in `charger_state_t`. On self-activation from `CHG_INACTIVE`, the charger now enters `CHG_BUCK_SETTLE`, holds `ctx->pwm = PWM_MIN_DUTY`, and explicitly calls `disable_charge_switch()` to keep the battery isolated. The buck output cap settles to the commanded ~2786 mV (well below V_bat) over the next few ms with no current path to the battery.
+- After `BUCK_SETTLE_MS = 250 ms` (new constant in `hw_config.h`), `tick_buck_settle()` calls `enable_charge_switch()`, arms `cc_last_downstep_ms`, and dispatches to `CHG_PRECHARGE` (if V_bat < 3000 mV) or `CHG_CC` — the same V_bat-based dispatch that previously fired directly out of `CHG_INACTIVE`. The settle window is comfortably longer than the TPS56347 soft-start (~2-5 ms) plus FB-filter RC settle, with margin for variation across reset/recovery cycles.
+- `activate_charger_region()` in `energy_mode.c` now enables only the buck (`enable_input_buck()`) and explicitly calls `disable_charge_switch()`. The MOSFET is owned end-to-end by the charger FSM — energy_mode never closes it. This makes both the cold activation and the fault-recovery edge use the same staggered handoff, so the recovery retry path picks up the fix automatically.
+- `tick_buck_settle()` does not fall through to a regulator step on the dispatch tick. The chg_current ADC needs at least one sample after the MOSFET closes before `cc_regulate` is allowed to act on it; falling through would let the regulator step PWM based on stale-baseline current readings.
+- Reused `charger.active_start_ms` as the settle deadline reference. It is set in the new `enter_buck_settle()` entry action, so MPPT's existing `CHARGER_MPPT_SETTLE_MS` gate continues to measure from the same epoch (charger activation) and stays correct without changes to `mppt.c`.
+- `chg_state_name()` renders the new state as `SETL` to keep the per-tick log column width sane.
+
+---
+
+# [v0.18] - 01.05.26
+## Cap PWM_MIN_DUTY at the calibrated LUT boundary (344, not 399)
+
+Changed files: `hw_config.h`, `charger.c`, `main.c`, `mppt.c`
+
+### BUG FIX: 12 V bench PSU triggers FAULT_OVERCURRENT_CHG cycle every 10 s on first activation (critical, bring-up blocker)
+- On stiff-source bring-up (12 V PSU instead of solar panel), `EM: IDLE → CHG_ONLY` immediately raises `FAULT_OVERCURRENT_CHG` (`flt_hist=0x0004`) ~400 ms after entry. The fault auto-recovers after `FAULT_RECOVER_WAIT_MS` (10 s), `energy_mode` re-applies entry actions on the fault-clear edge, and the charger re-self-activates → identical fault → 10-second oscillation. With a solar panel the same code path works because the panel current-limits the buck input as the duty rises; a bench PSU has effectively zero source impedance and the buck draws whatever it commands.
+- Root cause is in `SPCBoardAPI.c:779`: the `output_voltages_buck_mV[]` LUT mapping pwm count to the buck's regulated output is calibrated only for `pwm ∈ [1, 344]` (V_buck spans 3772 mV down to 2786 mV). Setting `pwm > 344` pushes the FB-injection PWM past 86 % duty into a regime where the RC filter saturates near VCC and the TPS56347's regulator loses control — empirically the buck delivers ~3.5 A continuous into the battery (back-calculated from the 64-sample / 640 ms moving average crossing `FAULT_OVERCURRENT_CHG_MA = 2200` after 40 charger-on samples: `40·X/64 = 2200 → X = 3520 mA`; ~22 W in / ~12 W out = ~55 % efficiency, the rest dissipated in the FETs).
+- `PWM_MIN_DUTY` was defined as `399` on the assumption that `(400-pwm)/400 = 0.25 %` PWM duty meant "effectively off". That is true at the *timer* level, but the buck IC sees the resulting near-VCC average at FB and exits the calibrated regulation curve. The v0.15 fix (`set_buck_pwm(PWM_MIN_DUTY)` after `system_init()`) correctly closed the SysConfig-default `CC=400` window, but it wrote a value that is itself outside the calibrated range — necessary but not sufficient.
+- The 300 ms `CC_DOWNSTEP_INTERVAL_MS` throttle (added in a prior commit specifically for stiff-source overshoot) cannot help here either: it only rate-limits the descent *during* CC regulation, but the inrush starts before the first downstep happens, with PWM still parked at `PWM_MIN_DUTY`.
+
+### FIX: `PWM_MIN_DUTY = 344` — the largest pwm count in the calibrated LUT (`hw_config.h`)
+- At pwm=344 the buck regulates to V_buck ≈ 2786 mV. With any healthy V_bat (≥ ~2900 mV through full charge at 3650 mV), V_buck < V_bat so the body diode of the charge MOSFET is reverse-biased and no current flows on activation. The buck stays inside its calibrated regulation curve regardless of input source impedance.
+- On activation, CC self-activates with PWM at the new ceiling and the regulator walks pwm down at one step per `CC_DOWNSTEP_INTERVAL_MS` (300 ms). With V_bat ≈ 3.5 V, the regulation point is around pwm ≈ 80 (V_buck ≈ 3478 mV), so cold-start ramp to target current takes up to ~80 s — slow but predictable, and avoids the fault-loop entirely.
+- Updated comment block in `hw_config.h` to document why the cap is at 344 (LUT boundary, not arbitrary), so a future edit doesn't push it back to 399 thinking it's "more off".
+- Touch-up changes only in `charger.c` (pwm_clamp comment), `mppt.c` (helper comment), `main.c` (apply_pwm clamp comment) — they all reference `PWM_MIN_DUTY` symbolically and pick up the new value automatically.
+- HAL-level clamps in `SPCBoardAPI.c` (`scale_duty_cycle` and `set_charging_voltage`) intentionally still cap at 399 — those represent the hardware register's legal range, not the application's safe operating range. The application policy lives in `hw_config.h`.
+
+---
+
 # [v0.17] - 29.04.26
 ## Bring-up diagnostics: boot banner, transition log, sticky fault history, 1 KB stack
 

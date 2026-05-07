@@ -36,6 +36,13 @@
  *   This matches the charger's "deactivated → INACTIVE" exit action
  *   from charger_states.csv.
  *
+ *   When energy_mode activates the charger, it enables the buck only
+ *   (BUCK_DIS deasserted) and leaves the charge MOSFET open. The
+ *   charger FSM owns the MOSFET — it stays open through CHG_BUCK_SETTLE
+ *   and is closed when handing off to PRECHARGE/CC. This staggering
+ *   prevents the buck soft-start overshoot from injecting inrush into
+ *   the battery on activation.
+ *
  *   MPPT is reset to DISABLED with mppt_limit = BUCK_MAX when charger
  *   is deactivated, so power_budget sees no panel constraint next tick.
  */
@@ -83,6 +90,7 @@ static void deactivate_charger_region(system_ctx_t *ctx)
     ctx->charger.precharge_start_ms = 0;
     ctx->charger.active_start_ms = 0;
     ctx->charger.cc_last_downstep_ms = 0;
+    ctx->charger.mosfet_close_ms = 0;
     ctx->charger.bat_full_timing = false;
     ctx->charger.bat_full_signaled = false;
 
@@ -99,9 +107,14 @@ static void deactivate_charger_region(system_ctx_t *ctx)
 /*
  * activate_charger_region — prepare charger for operation
  *
- * Called when transitioning INTO a charging state. The charger will
- * determine its own initial state (PRECHARGE or CC) based on V_bat
- * on its next tick — we just enable the hardware paths.
+ * Called when transitioning INTO a charging state. We enable the buck
+ * (BUCK_DIS deasserted) but leave the charge MOSFET OPEN. The charger
+ * FSM enters CHG_BUCK_SETTLE on its next tick, holds PWM at
+ * PWM_MIN_DUTY for BUCK_SETTLE_MS so the buck soft-start completes
+ * with V_out below V_bat, and only then closes the MOSFET to connect
+ * the battery. This prevents soft-start overshoot from dumping inrush
+ * current into the battery — historically that tripped
+ * FAULT_OVERCURRENT_CHG on every activation with a stiff input source.
  *
  * Only called if charger is currently INACTIVE (avoids resetting
  * a charger that's already running, e.g., CHARGE_ONLY → CHARGE_AND_LOAD).
@@ -111,12 +124,10 @@ static void activate_charger_region(system_ctx_t *ctx)
     if (ctx->charger.state != CHG_INACTIVE)
         return;  /* already active — don't reset mid-charge */
 
+    /* Charge MOSFET stays open here — charger FSM closes it after the
+     * buck soft-start settle window in CHG_BUCK_SETTLE. */
+    disable_charge_switch();
     enable_input_buck();
-    enable_charge_switch();
-
-    /* Charger will self-determine PRECHARGE vs CC on its next tick
-     * based on ctx->meas.bat_voltage. We leave state as INACTIVE
-     * and let charger_update() handle the activated transition. */
 }
 
 /* ── Per-state entry actions ── */

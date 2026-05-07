@@ -78,19 +78,34 @@
  * 3. BUCK CONVERTER (TPS56347)
  * =========================================================================
  *
- * The buck is controlled via PWM on the FB pin.
- *   Timer period = 400 counts
- *   Compare value written = (400 - pwm)
- *   Duty cycle = (400 - pwm) / 400
+ * The buck is controlled by injecting a PWM signal into its FB pin through
+ * an RC filter. Higher average PWM voltage at FB → buck regulator commands
+ * lower V_out. The application-level pwm count maps to the timer compare
+ * register as `CC = PWM_PERIOD - pwm`, so the convention from the
+ * application's point of view is:
  *
- *   pwm = 1   → duty = 399/400 = 99.75%  (maximum current)
- *   pwm = 399 → duty = 1/400   = 0.25%   (minimum current, effectively off)
+ *   lower pwm value → higher V_buck → more charge current
+ *   higher pwm value → lower V_buck → less charge current
  *
- * IMPORTANT: lower pwm value = higher duty = more current.
+ * The legal range is anchored to the calibrated LUT in SPCBoardAPI.c
+ * (`output_voltages_buck_mV[]`):
+ *
+ *   pwm = 1   → V_buck ≈ 3772 mV  (maximum output, maximum charge current)
+ *   pwm = 344 → V_buck ≈ 2786 mV  (minimum regulated output — below any
+ *                                  healthy V_bat, so the body diode of the
+ *                                  charge MOSFET is reverse-biased and no
+ *                                  current flows: this is "off")
+ *
+ * pwm > 344 is OUTSIDE the calibrated LUT and the buck loses regulation
+ * (FB filter saturates near VCC). With a stiff input source (e.g. a 12 V
+ * bench PSU) the buck then delivers high uncontrolled current straight
+ * into the battery and trips FAULT_OVERCURRENT_CHG. Solar panels mask the
+ * problem because they current-limit, but the bench bring-up case fails.
+ * Cap the application pwm at 344 to stay inside calibrated regulation.
  */
 #define PWM_PERIOD                400
-#define PWM_MAX_DUTY              1       /* lowest pwm value → highest duty cycle                */
-#define PWM_MIN_DUTY              399     /* highest pwm value → lowest duty cycle (off)          */
+#define PWM_MAX_DUTY              1       /* lowest pwm value → highest V_buck (max charge)        */
+#define PWM_MIN_DUTY              344     /* highest pwm value → lowest regulated V_buck (= off)   */
 #define BUCK_MAX_CURRENT_MA       2000    /* hardware current limit of the inductor/FET           */
 
 /* =========================================================================
@@ -130,6 +145,35 @@
  * every tick — over-current reaction must stay fast. */
 #define CC_DOWNSTEP_INTERVAL_MS   300UL
 
+/* fast_chop_if_overcurrent reads the unfiltered ADC sample to detect a
+ * sustained over-current that the 64-sample average would only see hundreds
+ * of ms later. With PWM pre-seeded near V_bat the *only* remaining instant
+ * spikes are cap-rebalance / inductor inrush at MOSFET close — short and
+ * self-correcting. Ignore the chopper for this long after MOSFET close so
+ * those transients can not re-trigger it. Real sustained over-current is
+ * still caught by fault_mgr's averaged FAULT_OVERCURRENT_CHG_MA path. */
+#define CC_INRUSH_IGNORE_MS       150UL
+
+/* Single ADC samples can transiently exceed FAULT_OVERCURRENT_CHG_MA from
+ * switching ripple, especially with a stiff input source where V_buck >>
+ * V_bat at the LUT-seeded duty. Require this many CONSECUTIVE instant
+ * samples above threshold before reacting. At a 50 ms tick this is
+ * N × 50 ms of sustained over-current — long enough to dismiss ripple
+ * peaks, short enough to react well before the 640 ms moving-average
+ * fault path latches. */
+#define CC_FAST_CHOP_CONSEC       3
+
+/* On sustained over-current, increase PWM (decrease duty) by this many
+ * counts in one tick, while keeping the charge MOSFET CLOSED and staying
+ * in CC. cc_regulate's per-tick +CC_PWM_STEP=1 cannot keep up with a
+ * stiff source. Stepping up by several counts at once moves the
+ * operating point clear of FAULT_OVERCURRENT_CHG_MA before the
+ * regulator's slow descent walks back into it. There is no point
+ * re-entering CHG_BUCK_SETTLE on every over-current event — the buck IC
+ * is already running steadily, only its commanded duty needs to change. */
+#define CC_FAST_BACKOFF_STEP      10
+
+
 #define CV_DEADBAND_MV            5       /* regulate between CV_VOLTAGE and CV_VOLTAGE + this    */
 #define CV_PWM_STEP               1
 
@@ -161,6 +205,20 @@
  * any current measurement comes back, especially with a stiff source. */
 #define CHARGER_MPPT_SETTLE_MS    1000UL
 
+/* Buck soft-start settle: when the buck IC is brought out of disable
+ * (BUCK_DIS deasserted), its internal soft-start ramps V_out from 0 up
+ * to the FB-injection setpoint over a few ms. During the ramp the
+ * regulator can briefly overshoot the setpoint before the loop settles,
+ * and any moment where V_out > V_bat dumps inrush into the battery via
+ * the charge MOSFET body diode and cap-charging path.
+ *
+ * To avoid that, the charger keeps the charge MOSFET OPEN for this
+ * long after enabling the buck, so the buck output cap settles to the
+ * commanded ~2.79 V (below V_bat) before the battery is connected.
+ * 250 ms is a comfortable margin over a typical TPS56347 soft-start
+ * (~2-5 ms) plus FB-filter RC settle on a stiff input source. */
+#define BUCK_SETTLE_MS            250UL
+
 /* Stiff-source escape: while in TRACKING at MAX step, count how many
  * consecutive ticks have walked PWM in the same direction with no
  * reversal. If this exceeds the limit, the source is stiff (dV ≈ dI ≈
@@ -179,7 +237,28 @@
  * 7. FAULT THRESHOLDS
  * =========================================================================
  */
-#define FAULT_OVERCURRENT_CHG_MA  2200    /* charge current fault (above BUCK_MAX + margin)       */
+/* Charge current SOFT-CHOPPER threshold (NON-LATCHING).
+ *
+ * Mirrors V2.5.5: when m->chg_current crosses this line, fault_mgr opens
+ * the charge MOSFET; when it drops back below, the MOSFET re-closes on
+ * the very next tick. The buck is never killed, no fault bit is latched,
+ * no recovery wait. The chopper acts as a hard ceiling on average
+ * battery current — by construction the moving-average chg_current
+ * cannot sustainedly exceed this value.
+ *
+ * Set slightly above BAT_CC_MAX_MA (2000) so the cc_regulate ±25 mA
+ * deadband + 64-sample-average ripple do not trigger continuous chops
+ * during normal operation. 2500 mA gives the regulator a 500 mA margin
+ * on top of target before the chopper engages — empirically the bench
+ * PSU operating envelope sits at 2070-2260 mA on V2.5.5, so 2500 lands
+ * just above the natural ceiling.
+ *
+ * Same macro is reused by fast_backoff_if_overcurrent for its instant-
+ * sample over-current trip. Both react to the same threshold; the
+ * chopper acts on the averaged reading (slower, more stable), the
+ * fast-backoff acts on raw 10 ms samples (faster, ripple-tolerant via
+ * CC_FAST_CHOP_CONSEC). They are layered defenses, not redundant. */
+#define FAULT_OVERCURRENT_CHG_MA  2500
 #define FAULT_OVERCURRENT_DSG_MA  5000    /* discharge current fault                              */
 #define FAULT_SYSTEM_CURRENT_MA   6000    /* total system current fault                           */
 #define FAULT_USB_OVERVOLT_MV     6000    /* USB output over-voltage                              */
