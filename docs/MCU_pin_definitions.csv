@@ -14,7 +14,7 @@ HI - Power enable
 LOW - Power Disable",DIGITAL OUTPUT,LOW
 CHARGER_ENABLE,29,PB27,Enables/Disables charger input to battery,DIGITAL OUTPUT,LOW
 OUTPUT_ENABLE,28,PB26,Enables the output switch to turn on output,DIGITAL OUTPUT,LOW
-PWM_VCHG,5,PA12/FCC_IN,Feedback voltage to FB pin of buck converter. Used in MPPT algorithm to control the converter,ANALOG OUTPUT,
+PWM_VCHG,51,PB3,Feedback voltage to FB pin of buck converter. Used in MPPT algorithm to control the converter,ANALOG OUTPUT,
 LEDCTRL1,55,PA9/RTC_OUT/CLK_OUT,Controls current reference voltage for LED1,DIGITAL OUTPUT,
 LEDCTRL2,52,PB4,Controls current reference voltage for LED2,DIGITAL OUTPUT,
 VBATM_EN,21,PB22,Enables/Disables PMOS transistor when taking battery voltage reading.,DIGITAL OUTPUT,LOW
@@ -35,7 +35,7 @@ BATTERY_ENABLE,20,PB21,Enable/disable battery cutput/input,DIGITAL OUTPUT,LOW
 LED_DIS,53,PB5,LED Output current output disable,DIGITAL OUTPUT,
 PWM_FB_TPS61088,3,PB15,PWM output to Feedback pin of TPS61088,DIGITAL OUTPUT,
 LED_EN,1,PB13,Enable/disable for LED output,DIGITAL OUTPUT,LOW
-VCHG_M,11,PA18/A1_3,Analog input for Buck output voltage measurement,ANALOG INPUT,
+VCHG_M,30,PA26/A0_1,Analog input for Buck output voltage measurement,ANALOG INPUT,
 USB_LD1_EN,48,PB1,Enable/Disable USB Load Switch 1,DIGITAL OUTPUT,LOW
 USB_LD2_EN,50,PB2,Enable/Disable USB Load Switch 2,DIGITAL OUTPUT,LOW
 2.5V_VREF,24,PA23/VREF+,Internal VREF,ANALOG OUTPUT,

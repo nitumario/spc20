@@ -55,7 +55,7 @@ volatile uint8_t leds[2] = {0};              // Shared LED state storage
  * Index mapping must match usage in set_pwm_duty_cycle() and set_* functions.
  */
 const PWM_Config _pwm_outputs[4] = {
-    {PWM_VCHG_INST, DL_TIMER_CC_0_INDEX, 0},        // PWM for charging path (buck)
+    {PWM_VCHG_INST, DL_TIMER_CC_1_INDEX, 0},        // PWM for charging path (buck)
     {PWM_LED_OUTPUT_INST, DL_TIMER_CC_0_INDEX, 0},  // PWM for LED boost converter
     {LEDCTRL_1_INST, DL_TIMER_CC_1_INDEX, 0},       // PWM for LED1 current control
     {LEDCTRL_2_INST, DL_TIMER_CC_0_INDEX, 0},       // PWM for LED2 current control
@@ -466,7 +466,7 @@ uint32_t deadband_filter(uint32_t current_input, uint32_t accepted_input, uint8_
 }
 
 #define DEADBAND_THRESHOLD_ADC 1
-#define NUM_VARS     14
+#define NUM_VARS     15
 #define WINDOW_SIZE  64
 
 /*
@@ -504,14 +504,14 @@ uint32_t get_average(uint8_t var_id) {
 /*
  * ADC completion ISRs.
  * Each ADC peripheral signals end-of-sequence on the last MEM index loaded
- * (MEM8 for ADC0, MEM4 for ADC1). When that fires we raise the flag that
+ * (MEM9 for ADC0, MEM4 for ADC1). When that fires we raise the flag that
  * read_adc_values() polls. Without these handlers the NVIC entry would land
  * in startup's Default_Handler (while(1)) and freeze the MCU on the first
  * conversion completion.
  */
 void ADC0_INST_IRQHandler(void){
     switch(DL_ADC12_getPendingInterrupt(ADC0_INST)){
-        case DL_ADC12_IIDX_MEM8_RESULT_LOADED:
+        case DL_ADC12_IIDX_MEM9_RESULT_LOADED:
             gCheckADC1 = true;
             break;
         default:
@@ -572,16 +572,18 @@ void GROUP1_IRQHandler(void){
 
 /*
  * ADC channel mapping in averaging arrays:
- * (0)IDISCHARGE, (1)VOUTM, (2)VBATM, (3)TEMP3, (4)ICHARGE, (5)IPANEL,
- * (6)VDD, (7)VUSB1, (8)VUSB2, (9)VPANEL, (10)VLED1, (11)VLED2,
- * (12)VCHGM, (13)TEMP1
+ * ADC0 (mem0..mem9): (0)IDISCHARGE, (1)VOUTM, (2)VBATM, (3)TEMP3,
+ *                    (4)ICHARGE, (5)IPANEL, (6)VDD, (7)VUSB1, (8)VUSB2,
+ *                    (9)VCHGM (PA26/A0_1)
+ * ADC1 (mem0..mem4): (10)VPANEL, (11)VLED1, (12)VLED2,
+ *                    (13)RSVD (PA18 unused), (14)TEMP1
  */
 void read_adc_values(void){
     if(gCheckADC1 && gCheckADC2){
         num_reads++;
         uint8_t var_id = 0;
 
-        for(uint8_t i = 0; i < 9; i++){
+        for(uint8_t i = 0; i < 10; i++){
             uint16_t raw = DL_ADC12_getMemResult(ADC0_INST, i);
             add_sample(var_id, raw);
             var_id++;
@@ -628,11 +630,12 @@ int16_t get_charge_current(void){
 }
 
 uint16_t get_charge_voltage(void){
-    return (uint16_t)(ADC.VREF*avg_readings[12]/(ADC.max_adc1_value)/VCHGM_DIV_RATIO);
+    /* VCHG_M moved to ADC0 chan_1 (PA26) per R2 schematic — index 9 in the averaging array */
+    return (uint16_t)(ADC.VREF*avg_readings[9]/(ADC.max_adc0_value)/VCHGM_DIV_RATIO);
 }
 
 uint16_t get_input_voltage(void){
-    return (uint16_t)(ADC.VREF*avg_readings[9]/(ADC.max_adc1_value)/VPANEL_DIV_RATIO);
+    return (uint16_t)(ADC.VREF*avg_readings[10]/(ADC.max_adc1_value)/VPANEL_DIV_RATIO);
 }
 
 int16_t get_input_current(void){
