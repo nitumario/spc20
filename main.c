@@ -188,17 +188,16 @@ static void log_measurements(void)
 }
 
 /*
- * TEMP: raw ADC1 dump for VCHG_M bring-up diagnosis.
- * Bypasses the avg_readings[] pipeline + FP scaling. MEM3 is the raw
- * 12-bit code at PA18/A1_3 (VCHG_M); MEM0 is V_PANEL on PA15/A1_0,
- * read through the same ADC1 and used as a sanity reference.
- * Called from the 1 s log tick. Remove once VCHG sense is verified.
+ * TEMP: raw ADC dump for VCHG_M bring-up diagnosis.
+ * Bypasses the avg_readings[] pipeline + FP scaling. ADC0 MEM9 is the raw
+ * 12-bit code at PA26/A0_1 (VCHG_M); ADC1 MEM0 is V_PANEL on PA15/A1_0,
+ * used as a sanity reference. Remove once VCHG sense is verified.
  */
 static void log_vchg_debug(void)
 {
     int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
-        "VCHG_DBG raw_MEM3=%u raw_MEM0=%u Vchg=%u mV em=%s chg=%s pwm=%u\r\n",
-        (unsigned)DL_ADC12_getMemResult(ADC1_INST, 3),
+        "VCHG_DBG raw_MEM9=%u raw_VPANEL=%u Vchg=%u mV em=%s chg=%s pwm=%u\r\n",
+        (unsigned)DL_ADC12_getMemResult(ADC0_INST, 9),
         (unsigned)DL_ADC12_getMemResult(ADC1_INST, 0),
         (unsigned)get_charge_voltage(),
         em_state_name(ctx.energy_mode),
