@@ -1,31 +1,10 @@
 /*
  * fault_mgr.c — Fault Detection, Latching, Recovery (Pipeline Step 4)
- * =========================================================================
  *
- * Execution model
- * ---------------
- * Runs every TICK_MAIN_MS from main(), after flags_update() and before
- * energy_mode_update(). For each fault type:
- *
- *   1. Evaluate the detection condition against the latest measurements.
- *   2. If tripped and not already latched → set the bit + take immediate
- *      protective hardware action.
- *   3. Every FAULT_RECOVER_WAIT_MS, evaluate recovery for all latched
- *      faults and clear any whose recovery condition holds.
- *
- * Protective actions are the minimum necessary to contain the fault.
- * energy_mode_update() re-runs later in the same tick and sees the
- * fault bits; it is responsible for the overall mode selection.
- * Because energy_mode calls its own enable/disable functions based on
- * its target state, a latched fault should be interpreted by it as an
- * override — but today energy_mode does not consult ctx->fault.code
- * directly. We therefore also disable hardware here so a fault can't
- * be silently papered over.
- *
- * Hysteresis — why recovery thresholds differ from trip thresholds:
- *   Example: bat overvolt trips at 3700 mV, recovers at 3400 mV. Without
- *   the 300 mV gap, V_bat would oscillate around 3700 mV as the charger
- *   cycles on/off, latching and clearing the fault repeatedly.
+ * Per tick: detect conditions, latch bits, take immediate protective actions.
+ * Every FAULT_RECOVER_WAIT_MS, evaluate recovery and clear resolved faults.
+ * Does NOT re-enable switches on recovery — energy_mode does that.
+ * Recovery thresholds differ from trip thresholds to prevent oscillation.
  */
 
 #include "fault_mgr.h"
@@ -35,18 +14,17 @@
  * Internal helpers
  * ========================================================================= */
 
-/* Update the derived ctx->fault.active shorthand. */
+/* Update fault.active shorthand. */
 static inline void fault_refresh_active(fault_ctx_t *f)
 {
     f->active = (f->code != FAULT_NONE);
 }
 
-/* Apply immediate protective hardware action for a newly raised fault. */
+/* Immediate protective action for a newly raised fault. */
 static void fault_take_action(uint16_t fault_bit)
 {
     switch (fault_bit) {
         case FAULT_OVERTEMP:
-            /* Thermal event — shut the whole power path down. */
             disable_input_buck();
             disable_charge_switch();
             disable_output_switch();
@@ -56,21 +34,16 @@ static void fault_take_action(uint16_t fault_bit)
         case FAULT_BAT_OVERVOLT:
         case FAULT_PRECHARGE_TIMEOUT:
         case FAULT_TEMP_CHARGE_BLOCK:
-            /* Charge-side faults — stop pushing current into the battery. */
             disable_input_buck();
             disable_charge_switch();
             break;
 
         case FAULT_OVERCURRENT_DSG:
-            /* Discharge-side overcurrent — drop the loads. */
             disable_output_switch();
             disable_usb_boost();
             break;
 
         case FAULT_BAT_UNDERVOLT:
-            /* Battery critically low — shed everything, keep battery
-             * switch decision to energy_mode (it will exit to SAFE_MODE
-             * on bat_low anyway). */
             disable_output_switch();
             disable_usb_boost();
             disable_input_buck();
@@ -78,7 +51,6 @@ static void fault_take_action(uint16_t fault_bit)
             break;
 
         case FAULT_USB_OVERVOLT:
-            /* USB output over-voltage — kill the boost. */
             disable_usb_boost();
             break;
 
@@ -87,16 +59,13 @@ static void fault_take_action(uint16_t fault_bit)
     }
 }
 
-/* Evaluate the recovery condition for a given latched fault.
- * Returns true if the condition is met and the bit can be cleared. */
+/* Returns true when a latched fault's recovery condition is met. */
 static bool fault_recovery_met(const system_ctx_t *ctx, uint16_t fault_bit)
 {
     const measurements_t *m = &ctx->meas;
 
     switch (fault_bit) {
         case FAULT_OVERTEMP:
-            /* Require both sensors to drop BELOW their limits by the
-             * hysteresis margin before allowing recovery. */
             return (m->bat_temp   < (BAT_TEMP_MAX_DISCHARGE_C - TEMP_HYSTERESIS_C)) &&
                    (m->board_temp < (BOARD_TEMP_MAX_C         - TEMP_HYSTERESIS_C));
 
@@ -114,13 +83,9 @@ static bool fault_recovery_met(const system_ctx_t *ctx, uint16_t fault_bit)
                    (m->usb2_voltage < FAULT_USB_OVERVOLT_MV);
 
         case FAULT_PRECHARGE_TIMEOUT:
-            /* Only recovers if someone (user) forces a retry by the
-             * battery visibly climbing above the precharge threshold.
-             * Likely means the cell was replaced. */
             return (m->bat_voltage > BAT_PRECHARGE_MV);
 
         case FAULT_TEMP_CHARGE_BLOCK:
-            /* Mirror temp_charge_ok — hysteresis already applied there. */
             return ctx->temp_charge_ok;
 
         default:
@@ -129,20 +94,15 @@ static bool fault_recovery_met(const system_ctx_t *ctx, uint16_t fault_bit)
 }
 
 /* =========================================================================
- * Public: raise a fault
- * =========================================================================
- * Idempotent — re-raising a latched fault does nothing. */
+ * Public: raise a fault (idempotent)
+ * ========================================================================= */
 void fault_raise(system_ctx_t *ctx, uint16_t fault_bit)
 {
-    /* Sticky history records every fault ever raised this boot, even
-     * if the live bit is later cleared by recovery. Set unconditionally
-     * — including for re-raises — so a fault that flickers in and out
-     * of recovery still leaves a trace. */
+    /* history records every fault ever raised this boot, even after recovery */
     ctx->fault.history |= fault_bit;
 
-    if (ctx->fault.code & fault_bit) {
-        return;  /* already latched live — protective action already taken */
-    }
+    if (ctx->fault.code & fault_bit)
+        return;
 
     ctx->fault.code |= fault_bit;
     fault_refresh_active(&ctx->fault);
@@ -175,20 +135,8 @@ static void fault_detect(system_ctx_t *ctx)
     }
 
     /* ── Charge current: non-latching soft chopper ──
-     *
-     * Mirrors the V2.5.5 behaviour of cond_overcur_chg + act_stop_charging
-     * + rec_overcur_chg as a per-tick chopper. Above the threshold, open
-     * the charge MOSFET and tag the charger so cc_regulate freezes its
-     * step (the open MOSFET reads chg_current = 0, which the regulator
-     * would otherwise interpret as under-current). Below the threshold,
-     * release the MOSFET so charging continues. The buck is never
-     * killed, no fault bit is latched, and there is no 10 s recovery
-     * wait — the average current naturally caps at the threshold by
-     * construction.
-     *
-     * Only acts while the charger is in an active sub-state. Energy_mode,
-     * other faults, and CHG_BUCK_SETTLE keep their MOSFET ownership
-     * without interference. */
+     * Open/close charge MOSFET per-tick to cap average current without
+     * latching a fault. cc_regulate sees chopper_active and freezes its step. */
     bool charger_active = (ctx->charger.state == CHG_PRECHARGE) ||
                           (ctx->charger.state == CHG_CC) ||
                           (ctx->charger.state == CHG_CV);
@@ -197,19 +145,12 @@ static void fault_detect(system_ctx_t *ctx)
         if (m->chg_current > (int16_t)FAULT_OVERCURRENT_CHG_MA) {
             disable_charge_switch();
             ctx->charger.chopper_active = true;
-            /* Timestamp every chop tick so the MPPT entry lockout
-             * window measures from the most recent chop, not the
-             * first one in a burst. */
             ctx->charger.chopper_last_active_ms = time_now();
         } else if (ctx->charger.chopper_active) {
-            /* We were chopping; current has dropped — release the MOSFET. */
             enable_charge_switch();
             ctx->charger.chopper_active = false;
         }
     } else {
-        /* Charger not in a sub-state where chopping is meaningful. Make
-         * sure the flag is clear so cc_regulate is not frozen on the
-         * next CC entry. */
         ctx->charger.chopper_active = false;
     }
 
@@ -223,15 +164,12 @@ static void fault_detect(system_ctx_t *ctx)
         fault_raise(ctx, FAULT_USB_OVERVOLT);
     }
 
-    /* ── Soft: temperature outside charge window ──
-     * temp_charge_ok already applies 10°C hysteresis in flags_update(),
-     * so we can latch directly on its negation. */
+    /* ── Temperature outside charge window (hysteresis applied in flags_update) ── */
     if (!ctx->temp_charge_ok) {
         fault_raise(ctx, FAULT_TEMP_CHARGE_BLOCK);
     }
 
-    /* FAULT_PRECHARGE_TIMEOUT is raised by charger_update() via
-     * fault_raise() — not detected here. */
+    /* FAULT_PRECHARGE_TIMEOUT is raised by charger_update(), not here. */
 }
 
 /* =========================================================================
@@ -239,23 +177,18 @@ static void fault_detect(system_ctx_t *ctx)
  * ========================================================================= */
 static void fault_recover(system_ctx_t *ctx)
 {
-    if (ctx->fault.code == FAULT_NONE) {
-        return;  /* nothing to recover */
-    }
+    if (ctx->fault.code == FAULT_NONE)
+        return;
 
     uint32_t now = time_now();
-    if ((now - ctx->fault.last_recovery_ms) < FAULT_RECOVER_WAIT_MS) {
-        return;  /* wait period not elapsed */
-    }
+    if ((now - ctx->fault.last_recovery_ms) < FAULT_RECOVER_WAIT_MS)
+        return;
     ctx->fault.last_recovery_ms = now;
 
-    /* Walk each possible bit. Tight loop — eight bits, no branches
-     * beyond the switch in fault_recovery_met(). */
     static const uint16_t all_bits[] = {
         FAULT_OVERTEMP,
         FAULT_BAT_OVERVOLT,
-        /* FAULT_OVERCURRENT_CHG is no longer latching — handled by the
-         * per-tick chopper in fault_detect, never appears in fault.code. */
+        /* FAULT_OVERCURRENT_CHG: non-latching chopper in fault_detect */
         FAULT_OVERCURRENT_DSG,
         FAULT_BAT_UNDERVOLT,
         FAULT_USB_OVERVOLT,

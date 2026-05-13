@@ -1,74 +1,20 @@
 /*
  * mppt.c — Incremental Conductance MPPT (Pipeline Step 6)
- * =========================================================================
  *
- * Algorithm
- * ---------
- * Incremental conductance with adaptive step size, implemented in pure
- * integer math.
+ * At MPP: X = dI·V + I·dV = 0.
+ *   X > 0 (dV > 0): left of MPP → raise V → pwm += step.
+ *   X < 0 (dV > 0): right of MPP → lower V → pwm -= step.
+ * Division-free (avoids Cortex-M0+ 32-bit divider).
  *
- * At the maximum power point of a PV panel:
- *   dP/dV = 0   where P = V * I
- *   d(V*I)/dV = I + V·(dI/dV) = 0
- *   →  dI/dV = -I/V
- *
- * Left of MPP (V too low):   dI/dV > -I/V  →  dP/dV > 0  →  increase V
- * Right of MPP (V too high): dI/dV < -I/V  →  dP/dV < 0  →  decrease V
- *
- * To avoid division (and a 32-bit divider on a Cortex-M0+), multiply
- * both sides by V·dV. Since V_panel > 0 always, only sign(dV) matters:
- *
- *   dI/dV  vs  -I/V
- *   dI·V   vs  -I·dV
- *   X = dI·V + I·dV   vs   0
- *
- *   sign(dP/dV) = sign(X)           when dV > 0
- *   sign(dP/dV) = -sign(X)          when dV < 0
- *
- * Overflow: V ≤ 15000 mV, I ≤ 2000 mA → dI·V ≤ 3e7, fits int32_t.
- *
- * PWM ↔ panel voltage
- * -------------------
- * The buck draws current from the panel. Higher duty cycle draws more
- * current, pulling V_panel down along the I-V curve.
- *
- * In this firmware, lower pwm value = higher duty cycle:
- *   pwm -= step  → higher duty → more current drawn → V_panel FALLS
- *   pwm += step  → lower duty  → less current drawn → V_panel RISES
- *
- * So "direction = +1" (want V to rise) means pwm += step_size.
- *
- * Adaptive step
- * -------------
- * On every direction reversal, halve the step size (down to MPPT_MIN_STEP_SIZE).
- * Convergence: step_size == 1 AND reversals ≥ MPPT_CONVERGE_REVERSALS.
- * At that point we are oscillating around MPP with the smallest possible
- * perturbation — enter HOLD for MPPT_HOLD_TIME_MS.
- *
- * TRACKING is also force-exited after MPPT_RUNTIME_MS as a safety net
- * (e.g., rapidly-changing irradiance prevents convergence).
- *
- * HOLD behaviour
- * --------------
- * Entry sets ctx->pwm = max_power_pwm (the best point seen this session)
- * and computes mppt_limit_ma from the best power found:
- *
- *   I_bus_max (mA) = P_max (mW) * 1000 / V_bat (mV)
- *
- * Clamped to [0, BUCK_MAX_CURRENT_MA]. This tells power_budget to cap
- * i_buck_max at what the panel can actually sustain.
+ * Adaptive step: halve on each reversal down to MPPT_MIN_STEP_SIZE.
+ * Converged: step==1 and reversals >= MPPT_CONVERGE_REVERSALS → HOLD.
+ * HOLD parks at max_power_pwm; mppt_limit_ma = P_max / V_bat.
  */
 
 #include "mppt.h"
 #include "SPCBoardAPI.h"
 
-/* ── PWM bound helpers ──
- *
- * PWM_MAX_DUTY is the SMALLEST pwm value — corresponds to the HIGHEST
- * regulated V_buck (most charge current). PWM_MIN_DUTY is the LARGEST
- * pwm value within the calibrated LUT — corresponds to the LOWEST
- * regulated V_buck, which is below any healthy V_bat (= "off"). The
- * legal range is therefore [PWM_MAX_DUTY, PWM_MIN_DUTY]. */
+/* PWM_MAX_DUTY = smallest value = highest V_buck. Legal range: [MAX, MIN]. */
 static inline uint16_t pwm_clamp(int32_t p)
 {
     if (p < PWM_MAX_DUTY) return PWM_MAX_DUTY;
@@ -80,11 +26,7 @@ static inline uint16_t pwm_clamp(int32_t p)
  * STATE ENTRY ACTIONS
  * ========================================================================= */
 
-/*
- * Enter TRACKING — per README "TRACKING Entry Actions":
- *   V_prev = V_panel, I_prev = I_panel, step_size = MAX, reversals = 0,
- *   max_power = 0, force pwm -= step_size, record tracking_start_ms.
- */
+/* Initialize TRACKING state; apply first perturbation so next tick has valid dV/dI. */
 static void enter_tracking(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
@@ -104,13 +46,7 @@ static void enter_tracking(system_ctx_t *ctx)
     ctx->pwm = pwm_clamp((int32_t)ctx->pwm - (int32_t)m->step_size);
 }
 
-/*
- * Enter HOLD — park PWM at the best point and publish mppt_limit_ma.
- *
- * mppt_limit_ma is the max current the buck can deliver to the bus
- * given the panel's MPP power. At buck output:
- *   I_bus ≈ P_panel / V_bus  (lossless approximation; V_bus ≈ V_bat)
- */
+/* Park at max_power_pwm and publish mppt_limit_ma = P_max / V_bat. */
 static void enter_hold(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
@@ -118,18 +54,13 @@ static void enter_hold(system_ctx_t *ctx)
     m->state = MPPT_HOLD;
     m->hold_start_ms = time_now();
 
-    /* Park at best operating point. max_power_pwm is seeded with the
-     * entry pwm in enter_tracking(), so this is also the safe fallback
-     * when nothing was learned (max_power == 0) — e.g. stiff bench PSU
-     * where dV=dI=0 makes tracking march monotonically into a high-duty
-     * zone. Leaving pwm at the last walked-down value would park HOLD at
-     * the most aggressive point tried, which is the worst possible
-     * default. */
+    /* max_power_pwm is seeded with entry pwm, so it's a safe fallback
+     * when nothing was learned (stiff source: dV=dI=0, max_power never updates). */
     ctx->pwm = m->max_power_pwm;
 
     /* Derive I_bus max from P_max / V_bat. Guard against tiny V_bat. */
     uint16_t v_bat = ctx->meas.bat_voltage;
-    if (v_bat < 1000) v_bat = 1000;  /* avoid divide-by-tiny on missing battery */
+    if (v_bat < 1000) v_bat = 1000;  /* guard against missing battery */
 
     int32_t i_bus_ma = (m->max_power * 1000) / (int32_t)v_bat;
     if (i_bus_ma < 0) i_bus_ma = 0;
@@ -138,9 +69,7 @@ static void enter_hold(system_ctx_t *ctx)
     m->mppt_limit_ma = (uint16_t)i_bus_ma;
 }
 
-/*
- * Enter DISABLED — drop panel constraint. CC/CV resumes PWM control.
- */
+/* Drop panel constraint; CC/CV resumes PWM control. */
 static void enter_disabled(system_ctx_t *ctx)
 {
     ctx->mppt.state = MPPT_DISABLED;
@@ -152,13 +81,8 @@ static void enter_disabled(system_ctx_t *ctx)
 }
 
 /* =========================================================================
- * TRACKING STEP — one iteration of incremental conductance.
- * =========================================================================
- *
- * Must be called each tick while in MPPT_TRACKING. Assumes ctx->pwm
- * already reflects the previous perturbation (set either by
- * enter_tracking or by the previous tick's tracking step).
- */
+ * TRACKING STEP — one incremental-conductance iteration.
+ * ========================================================================= */
 static void tracking_step(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
@@ -184,8 +108,7 @@ static void tracking_step(system_ctx_t *ctx)
         else if (dI < 0) direction = -1;   /* I falling at stuck V → want less V */
         else             direction = m->last_direction;  /* no info, keep moving */
     } else {
-        /* X = dI*V + I*dV. Its sign equals sign(dP/dV) when dV > 0,
-         * and is flipped when dV < 0. */
+        /* X = dI·V + I·dV; sign(dP/dV) = sign(X) when dV > 0, else -sign(X). */
         int32_t X = dI * v_now + i_now * dV;
         if (dV < 0) X = -X;
 
@@ -207,22 +130,15 @@ static void tracking_step(system_ctx_t *ctx)
     }
 
     /* ── Stiff-source detector ──
-     * Count consecutive ticks at MAX step with no reversal. With a
-     * current-limited PV panel the buck pulls V_panel down the I-V
-     * curve and dV/dI provide the feedback that drives reversals.
-     * With a stiff source (bench PSU), dV ≈ dI ≈ 0 and direction
-     * stays pinned at last_direction — the loop marches one way at
-     * full step until something trips. Bail to HOLD before that. */
+     * Stiff PSU has dV≈dI≈0, so no reversals occur and direction stays
+     * pinned — the loop marches into the danger zone. Bail to HOLD first. */
     if (m->step_size >= MPPT_MAX_STEP_SIZE && !reversed) {
         if (m->stuck_ticks < 255) m->stuck_ticks++;
     } else {
         m->stuck_ticks = 0;
     }
 
-    /* ── Apply perturbation to PWM ──
-     * direction = +1  → raise V_panel → pwm += step
-     * direction = -1  → lower V_panel → pwm -= step
-     */
+    /* +1 → raise V_panel (pwm += step);  -1 → lower V_panel (pwm -= step) */
     if (direction != 0) {
         int32_t next = (int32_t)ctx->pwm + direction * (int32_t)m->step_size;
         ctx->pwm = pwm_clamp(next);
@@ -235,7 +151,7 @@ static void tracking_step(system_ctx_t *ctx)
 }
 
 /* =========================================================================
- * TRANSITION EVALUATION — per docs/MPPT_transition_table.csv
+ * TRANSITION EVALUATION
  * ========================================================================= */
 
 static bool tracking_converged(const mppt_ctx_t *m)
@@ -256,12 +172,7 @@ static bool hold_expired(const mppt_ctx_t *m)
 
 /* =========================================================================
  * PUBLIC: step 6 entry point
- * =========================================================================
- *
- * Runs after energy_mode. If the charger is inactive, MPPT stays
- * DISABLED (energy_mode already forces this on deactivation, but we
- * guard here too so re-activation is symmetric).
- */
+ * ========================================================================= */
 void mppt_update(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
@@ -271,8 +182,7 @@ void mppt_update(system_ctx_t *ctx)
                                (ctx->energy_mode == EM_CHARGE_ONLY) ||
                                (ctx->energy_mode == EM_CHARGE_AND_LOAD);
 
-    /* If the charger region is not active, MPPT has no role. Ensure
-     * we're DISABLED and the panel constraint is released. */
+    /* No charger → MPPT has no role. */
     if (!charging) {
         if (m->state != MPPT_DISABLED) enter_disabled(ctx);
         return;
@@ -281,34 +191,15 @@ void mppt_update(system_ctx_t *ctx)
     switch (m->state) {
 
     case MPPT_DISABLED:
-        /* P1: panel_limited AND has_sun AND charger past settle window
-         *     AND chg_current below the entry-current gate → TRACKING.
+        /* P1: panel_limited + has_sun + settled + current_below_gate + chopper_quiet → TRACKING.
          *
-         * Settle gate: when the charger has just activated from
-         * CHG_INACTIVE, ctx->pwm starts at PWM_MIN_DUTY (off) and
-         * chg_current=0 trivially makes panel_limited=true. Without
-         * this gate, MPPT would steal PWM control on the very first
-         * charging tick and walk PWM down by MAX_STEP_SIZE before any
-         * current measurement comes back — slamming a stiff source
-         * straight into FAULT_OVERCURRENT_CHG. CC_PWM_STEP=1 needs
-         * ~1 s to descend through the responsive PWM range first.
-         *
-         * Current gate (MPPT_ENTRY_CURRENT_GUARD_MA): mirrors V2.5.5's
-         * `chg_current < 1800` precondition in handle_cc. MPPT is only
-         * useful when the panel is the bottleneck. If chg_current is
-         * already at or above the gate, the panel clearly has headroom
-         * and CC is the right loop — letting MPPT in here would race
-         * CC for PWM and (on a stiff source where inc-conductance has
-         * no signal) walk PWM monotonically into the over-current zone.
-         *
-         * Chopper lockout (MPPT_CHOPPER_LOCKOUT_MS): the current-gate
-         * alone is not enough on a stiff source. When the chopper opens
-         * the MOSFET, chg_current samples drop to 0 and the 64-sample
-         * moving average decays toward 0 over its 640 ms window. During
-         * that decay the gate value can dip below 1500 even though the
-         * loop is overcurrent-saturated. Block entry for a few seconds
-         * after any chop tick so the average has time to re-stabilise
-         * at its true post-recovery value before MPPT can re-evaluate. */
+         * settled: avoids MPPT stealing PWM on the very first tick when
+         *   chg_current=0 trivially triggers panel_limited.
+         * current_below_gate: panel is only the bottleneck when current
+         *   is below capacity; above it CC owns the loop.
+         * chopper_quiet: MPPT_CHOPPER_LOCKOUT_MS after last chop — the
+         *   64-sample avg decays toward 0 during chopping, briefly faking
+         *   a below-gate reading even while overcurrent-saturated. */
         {
             uint32_t since_active = time_now() - ctx->charger.active_start_ms;
             bool settled = (ctx->charger.state != CHG_INACTIVE) &&
@@ -333,8 +224,7 @@ void mppt_update(system_ctx_t *ctx)
             enter_disabled(ctx);
             break;
         }
-        /* Run one perturb/observe iteration. Convergence/timeout are
-         * evaluated after the step so the latest reversals/time count. */
+        /* Convergence/timeout evaluated after the step. */
         tracking_step(ctx);
 
         /* P2: converged → HOLD */
@@ -347,8 +237,7 @@ void mppt_update(system_ctx_t *ctx)
             enter_hold(ctx);
             break;
         }
-        /* P4: stiff source → HOLD (parks PWM at max_power_pwm = entry pwm,
-         *     since stuck means dV=dI=0 and max_power never updated). */
+        /* P4: stiff source → HOLD */
         if (m->stuck_ticks >= MPPT_STUCK_TICK_LIMIT) {
             enter_hold(ctx);
             break;
@@ -362,28 +251,15 @@ void mppt_update(system_ctx_t *ctx)
             enter_disabled(ctx);
             break;
         }
-        /* P1: !panel_limited → DISABLED, EXCEPT when the mppt cap itself
-         *     is what's holding allowed_chg below PANEL_LIMITED_MARGIN_MA.
-         *     In that case panel_limited is structurally forced false by
-         *     the measurements guard (allowed_chg <= margin), and dropping
-         *     to DISABLED would release mppt_limit to BUCK_MAX, re-trigger
-         *     panel_limited, and bounce us straight back into TRACKING.
-         *     Stay parked in HOLD instead — the panel really can't deliver
-         *     more, and the periodic re-entry to TRACKING after
-         *     MPPT_HOLD_TIME_MS will retest. */
+        /* P1: !panel_limited → DISABLED, but skip if mppt_limit itself
+         *     is causing panel_limited=false — releasing it would trigger
+         *     panel_limited again, bouncing immediately back to TRACKING. */
         if (!panel_limited && m->mppt_limit_ma > PANEL_LIMITED_MARGIN_MA) {
             enter_disabled(ctx);
             break;
         }
-        /* P2: hold time expired AND has_sun AND chg_current below the
-         *     entry-current gate AND chopper has been quiet → TRACKING.
-         *     Same gates as the MPPT_DISABLED → TRACKING path: don't
-         *     re-enter tracking when the panel is no longer the
-         *     bottleneck or when the soft-chopper is fighting
-         *     overcurrent. If any gate fails, refresh the hold timer
-         *     so the re-test happens again after another
-         *     MPPT_HOLD_TIME_MS window — PWM stays parked and CC keeps
-         *     owning the loop. */
+        /* P2: hold expired + same gates as DISABLED→TRACKING → re-enter TRACKING.
+         *     Gate failure defers hold timer by MPPT_HOLD_TIME_MS. */
         if (hold_expired(m)) {
             bool current_below_gate =
                 (ctx->meas.chg_current < (int16_t)MPPT_ENTRY_CURRENT_GUARD_MA);
@@ -394,15 +270,15 @@ void mppt_update(system_ctx_t *ctx)
             if (current_below_gate && chopper_quiet) {
                 enter_tracking(ctx);
             } else {
-                m->hold_start_ms = time_now();   /* defer next re-test */
+                m->hold_start_ms = time_now();
             }
             break;
         }
-        /* P4: stay in HOLD (PWM parked, mppt_limit_ma already published) */
+        /* P4: stay in HOLD */
         break;
 
     default:
-        /* Defensive: unknown state → drop to DISABLED. */
+        /* unknown state → DISABLED */
         enter_disabled(ctx);
         break;
     }

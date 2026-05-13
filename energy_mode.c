@@ -1,50 +1,11 @@
 /*
- * energy_mode.c — Energy Mode FSM 
- * ===================================================
+ * energy_mode.c — Energy Mode FSM (Pipeline Step 5)
  *
- * Implements the transition table from docs/transition_table.csv.
+ * Implements docs/transition_table.csv. Evaluates priority-ordered guards,
+ * applies exit/entry actions (hardware enables), and controls charger/MPPT.
  *
- * Execution model:
- *   Called once per TICK_MAIN_MS (50 ms) from the main loop, after
- *   measurements, flags, and power_budget have run.
- *
- *   1. Evaluate transition guards in priority order for the current state
- *   2. If a transition fires, apply exit actions for old state
- *   3. Apply entry actions for new state (set hardware enables)
- *   4. If no transition fires, stay — no action needed
- *
- * Guard inputs (all read-only, set by earlier pipeline steps):
- *   ctx->flag_has_sun.value   — debounced, from flags_update()
- *   ctx->flag_bat_low.value   — debounced, from flags_update()
- *   ctx->has_load              — hysteresis, from flags_update()
- *   ctx->bat_full              — set by charger when CV taper completes
- *   ctx->meas.bat_voltage      — raw mV, used only for SAFE_MODE recovery
- *                                (intentionally not debounced — see CHANGELOG)
- *
- * Hardware outputs:
- *   CHARGER_EN  — enable_charge_switch() / disable_charge_switch()
- *   BATTERY_EN  — enable_battery_switch() / disable_battery_switch()
- *   OUTPUT_EN   — enable_output_switch() / disable_output_switch()
- *   USB_EN      — enable_usb_boost() / disable_usb_boost()
- *   BUCK_DIS    — disable_input_buck() / enable_input_buck()
- *
- * Charger/MPPT region control:
- *   When energy_mode deactivates the charger, it sets:
- *     ctx->charger.state = CHG_INACTIVE
- *     ctx->pwm = PWM_MIN_DUTY
- *     disable_input_buck()   (assert BUCK_DIS)
- *   This matches the charger's "deactivated → INACTIVE" exit action
- *   from charger_states.csv.
- *
- *   When energy_mode activates the charger, it enables the buck only
- *   (BUCK_DIS deasserted) and leaves the charge MOSFET open. The
- *   charger FSM owns the MOSFET — it stays open through CHG_BUCK_SETTLE
- *   and is closed when handing off to PRECHARGE/CC. This staggering
- *   prevents the buck soft-start overshoot from injecting inrush into
- *   the battery on activation.
- *
- *   MPPT is reset to DISABLED with mppt_limit = BUCK_MAX when charger
- *   is deactivated, so power_budget sees no panel constraint next tick.
+ * Guard inputs: flag_has_sun, flag_bat_low, has_load, bat_full, bat_voltage.
+ * Hardware outputs: CHARGER_EN, BATTERY_EN, OUTPUT_EN, USB_EN, BUCK_DIS.
  */
 
 #include "energy_mode.h"
@@ -61,31 +22,18 @@
  * ENTRY / EXIT ACTIONS
  * =========================================================================
  *
- * Each state has a fixed hardware configuration. On entry, we set all
- * enables to the correct state. This is idempotent — calling enter_idle()
- * when already in IDLE is harmless (GPIO writes are unconditional).
- *
- * Deactivating the charger region is an exit action that fires whenever
- * we leave a charging state (CHARGE_ONLY or CHARGE_AND_LOAD) for a
- * non-charging state. It resets the charger and MPPT to safe defaults.
+ * Entry actions set hardware enables for the new state (idempotent).
+ * deactivate_charger_region is the exit action when leaving a charging state.
  */
 
-/*
- * deactivate_charger_region — safe shutdown of charger + MPPT
- *
- * Called when transitioning OUT of a charging state. Matches the
- * "deactivated → INACTIVE" exit action in charger_states.csv:
- *   pwm = PWM_MIN_DUTY, assert BUCK_DIS, reset charger state.
- *
- * Also resets MPPT to DISABLED so it doesn't hold a stale mppt_limit.
- */
+/* Shut down charger + MPPT on exit from a charging state. */
 static void deactivate_charger_region(system_ctx_t *ctx)
 {
-    /* Buck off — stop pushing current immediately */
+    /* Buck off */
     ctx->pwm = PWM_MIN_DUTY;
     disable_input_buck();
 
-    /* Charger → INACTIVE, clear timing state */
+    /* Charger → INACTIVE */
     ctx->charger.state = CHG_INACTIVE;
     ctx->charger.precharge_start_ms = 0;
     ctx->charger.active_start_ms = 0;
@@ -94,38 +42,23 @@ static void deactivate_charger_region(system_ctx_t *ctx)
     ctx->charger.bat_full_timing = false;
     ctx->charger.bat_full_signaled = false;
 
-    /* MPPT → DISABLED, remove panel constraint */
+    /* MPPT → DISABLED */
     ctx->mppt.state = MPPT_DISABLED;
     ctx->mppt.mppt_limit_ma = BUCK_MAX_CURRENT_MA;
 
-    /* bat_full is a system-level flag consumed by energy_mode.
-     * Clear it when charger is deactivated — a new charge cycle
-     * must re-detect taper completion. */
+    /* bat_full cleared — must be re-detected on next charge cycle */
     ctx->bat_full = false;
 }
 
 /*
- * activate_charger_region — prepare charger for operation
- *
- * Called when transitioning INTO a charging state. We enable the buck
- * (BUCK_DIS deasserted) but leave the charge MOSFET OPEN. The charger
- * FSM enters CHG_BUCK_SETTLE on its next tick, holds PWM at
- * PWM_MIN_DUTY for BUCK_SETTLE_MS so the buck soft-start completes
- * with V_out below V_bat, and only then closes the MOSFET to connect
- * the battery. This prevents soft-start overshoot from dumping inrush
- * current into the battery — historically that tripped
- * FAULT_OVERCURRENT_CHG on every activation with a stiff input source.
- *
- * Only called if charger is currently INACTIVE (avoids resetting
- * a charger that's already running, e.g., CHARGE_ONLY → CHARGE_AND_LOAD).
+ * Enable buck on entry to a charging state; leave MOSFET open.
+ * The charger FSM closes the MOSFET after the buck settle window.
+ * No-op if charger is already active (e.g. CHARGE_ONLY → CHARGE_AND_LOAD).
  */
 static void activate_charger_region(system_ctx_t *ctx)
 {
     if (ctx->charger.state != CHG_INACTIVE)
-        return;  /* already active — don't reset mid-charge */
-
-    /* Charge MOSFET stays open here — charger FSM closes it after the
-     * buck soft-start settle window in CHG_BUCK_SETTLE. */
+        return;
     disable_charge_switch();
     enable_input_buck();
 }
@@ -175,24 +108,17 @@ static void enter_safe_mode(system_ctx_t *ctx)
 {
     disable_charge_switch();
     disable_input_buck();
-    enable_battery_switch();   /* battery stays connected (not draining into loads) */
-    disable_output_switch();   /* shed loads */
-    disable_usb_boost();       /* shed USB */
+    enable_battery_switch();
+    disable_output_switch();
+    disable_usb_boost();
 }
 
 /* =========================================================================
  * STATE TRANSITION LOGIC
  * =========================================================================
  *
- * Each function evaluates guards in strict priority order (lower number
- * = higher priority = checked first). Returns the new state.
- *
- * If no guard fires, returns the current state (no transition).
- *
- * The priority ordering is critical for safety:
- *   - SAFE_MODE transitions are always priority 1 where applicable
- *   - More specific guards come before less specific ones
- *   - <default> (stay) is always last
+ * Each function evaluates guards in priority order and returns the new state.
+ * SAFE_MODE guards are P1 where applicable. No-transition returns current state.
  */
 
 static energy_mode_state_t eval_idle(const system_ctx_t *ctx)
@@ -289,12 +215,7 @@ static energy_mode_state_t eval_discharge_only(const system_ctx_t *ctx)
 
 static energy_mode_state_t eval_safe_mode(const system_ctx_t *ctx)
 {
-    /*
-     * SAFE_MODE recovery requires V_bat > BAT_SAFE_RECOVER_MV (3200 mV).
-     * This is a raw voltage comparison, NOT the debounced bat_low flag.
-     * The 400 mV gap (2800 set → 3200 recover) prevents oscillation.
-     * See CHANGELOG v0.01 for why !has_load → IDLE was removed.
-     */
+    /* Raw voltage (not debounced): 400 mV gap prevents oscillation. */
     bool recovered = (V_BAT > BAT_SAFE_RECOVER_MV);
 
     /* P1: recovered + sun + load + not full → charge and load */
@@ -305,8 +226,7 @@ static energy_mode_state_t eval_safe_mode(const system_ctx_t *ctx)
     if (recovered && HAS_SUN && !HAS_LOAD)
         return EM_CHARGE_ONLY;
 
-    /* P3: recovered + no sun + load → discharge
-     * FIXED v0.02: was missing — battery recovered overnight */
+    /* P3: recovered + no sun + load → discharge */
     if (recovered && !HAS_SUN && HAS_LOAD)
         return EM_DISCHARGE_ONLY;
 
@@ -320,26 +240,10 @@ static energy_mode_state_t eval_safe_mode(const system_ctx_t *ctx)
 
 /* =========================================================================
  * MAIN UPDATE FUNCTION
- * =========================================================================
- *
- * Called every TICK_MAIN_MS (50 ms) as pipeline step 5.
- *
- * Flow:
- *   1. Evaluate transition for current state
- *   2. If state changed:
- *      a. Run exit actions (deactivate charger if leaving a charging state)
- *      b. Update ctx->energy_mode
- *      c. Run entry actions (set hardware enables for new state)
- *   3. If state unchanged:
- *      - In IDLE: check sleep timeout
- *      - Otherwise: nothing (hardware stays as-is)
- */
-/*
- * apply_entry_actions — dispatch the entry action for a given state.
- * Idempotent: GPIO writes are unconditional, so calling it on the
- * already-current state is harmless. Used both on real transitions and
- * to re-arm hardware after a fault clears.
- */
+ * ========================================================================= */
+
+/* Dispatch entry action for a state. Idempotent; also used to re-arm
+ * hardware after a fault clears without a state transition. */
 static void apply_entry_actions(system_ctx_t *ctx, energy_mode_state_t s)
 {
     switch (s) {
@@ -358,18 +262,8 @@ void energy_mode_update(system_ctx_t *ctx)
     energy_mode_state_t new_state;
 
     /* ── Fault-clear edge detection ──
-     *
-     * fault_take_action() in fault_mgr can disable hardware (input buck,
-     * charge switch, output switch, USB boost) when a fault is raised.
-     * When the fault later auto-recovers, fault_mgr clears the bit but
-     * does NOT re-enable any GPIOs — that is energy_mode's job, and
-     * energy_mode only writes GPIOs on a state transition. If no
-     * transition fires (e.g. still in CHARGE_ONLY because conditions
-     * never changed), the GPIOs stay disabled silently and the buck
-     * appears "running" (PWM toggling) but actually delivers no current.
-     *
-     * Detect fault.code falling edge (non-zero → zero) and re-apply the
-     * current state's entry actions to restore the correct enables. */
+     * fault_mgr clears fault bits but does NOT re-enable GPIOs.
+     * On falling edge (faults → none), re-apply entry actions to restore enables. */
     bool fault_just_cleared = (ctx->fault.prev_code != FAULT_NONE) &&
                               (ctx->fault.code      == FAULT_NONE);
     ctx->fault.prev_code = ctx->fault.code;
@@ -391,8 +285,6 @@ void energy_mode_update(system_ctx_t *ctx)
             apply_entry_actions(ctx, old_state);
         }
         if (old_state == EM_IDLE) {
-            /* Idle sleep timeout: if nothing happens for IDLE_SLEEP_TIMEOUT_MS,
-             * signal that main loop should enter low-power mode. */
             if (!ctx->idle_sleep_pending &&
                 (time_now() - ctx->idle_start_ms) >= IDLE_SLEEP_TIMEOUT_MS) {
                 ctx->idle_sleep_pending = true;
@@ -402,14 +294,6 @@ void energy_mode_update(system_ctx_t *ctx)
     }
 
     /* ── Exit actions ── */
-
-    /*
-     * Deactivate charger region when leaving a charging state.
-     * This is a no-op if leaving a non-charging state.
-     *
-     * The charger deactivation resets: PWM → min duty, BUCK_DIS asserted,
-     * charger → INACTIVE, MPPT → DISABLED, bat_full → false.
-     */
     bool was_charging = (old_state == EM_CHARGE_ONLY ||
                          old_state == EM_CHARGE_AND_LOAD);
     bool will_charge  = (new_state == EM_CHARGE_ONLY ||

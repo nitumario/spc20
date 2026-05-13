@@ -41,39 +41,21 @@
 /* ── The one context struct ── */
 static system_ctx_t ctx;
 
-/* ── UART transmit buffers ──
- *
- * Two separate buffers so a state-transition log line emitted between
- * ticks cannot clobber an in-flight per-tick telemetry line (and vice
- * versa). printToUART is blocking, but snprintf into a shared buffer
- * still corrupts a partially-formatted line if a second formatter runs
- * after send_string() returns and before the caller is done with it. */
+/* Separate buffers: transition events must not clobber in-flight telemetry. */
 #define UART_BUF_SIZE 512
 static char uart_buf[UART_BUF_SIZE];      /* per-tick telemetry */
 static char uart_evt_buf[128];            /* state-transition events */
 
 /* =========================================================================
- * UART LOGGING
- * =========================================================================
- *
- * Tab-separated output for direct paste into a spreadsheet.
- * Header sent once on startup, data lines every TICK_LOG_MS.
- *
- * Columns cover: uptime, all measurements, all flags, state machines,
- * power budget outputs, PWM, and fault code.
- */
+ * UART LOGGING — space-separated, header on boot, data every TICK_LOG_MS.
+ * ========================================================================= */
 
 static void send_string(const char *str)
 {
     printToUART((char *)str, '\0');
 }
 
-/*
- * Boot banner — emitted once before the column header so a freshly
- * attached terminal can see "the firmware just (re)started" without
- * waiting for the next 1 s log tick. Distinguishes a clean reset from
- * a HardFault post-mortem (which prints "!! HARDFAULT !!").
- */
+/* Emitted once on boot so a freshly attached terminal can see the reset. */
 static void log_boot_banner(void)
 {
     send_string("\r\n"
@@ -95,16 +77,7 @@ static void log_header(void)
     );
 }
 
-/*
- * State-transition logger — emits one line per FSM region (EM / CHG /
- * MPPT) when its state differs from the snapshot taken before the
- * pipeline ran. Snapshot/compare lives here in main.c so the FSM
- * modules don't need to know about UART or each other's state.
- *
- * Output is plain text, distinct from the tab-separated log line, so
- * it's grep-able after the fact:
- *   "EM: IDLE -> CHARGE_ONLY @ 12345 ms"
- */
+/* Emit one line per FSM region that changed this tick. grep-able plain text. */
 static void log_state_transitions(uint32_t now,
                                   energy_mode_state_t em_old,
                                   charger_state_t chg_old,
@@ -133,38 +106,7 @@ static void log_state_transitions(uint32_t now,
     }
 }
 
-/*
- * Values-only telemetry. One line per tick, space-separated, in this order:
- *
- *   1  time_ms
- *   2  bat_voltage         (mV)
- *   3  chg_voltage         (mV)
- *   4  out_voltage         (mV)
- *   5  panel_voltage       (mV)
- *   6  usb1_voltage        (mV)
- *   7  usb2_voltage        (mV)
- *   8  panel_current       (mA)
- *   9  chg_current         (mA, signed)
- *  10  dsg_current         (mA)
- *  11  panel_power         (mW)
- *  12  i_bat_net           (mA, signed)
- *  13  bat_temp            (C)
- *  14  board_temp          (C)
- *  15  flag_bat_low
- *  16  flag_has_sun
- *  17  has_load
- *  18  temp_charge_ok
- *  19  panel_limited
- *  20  bat_full
- *  21  i_buck_max          (mA)
- *  22  allowed_chg         (mA)
- *  23  energy_mode         (name: IDLE/CHG_ONLY/CHG+LOAD/DSG_ONLY/SAFE)
- *  24  charger.state       (name: OFF/PRE/CC/CV)
- *  25  mppt.state          (name: OFF/TRK/HLD)
- *  26  pwm
- *  27  fault.code          (hex)
- *  28  fault.history       (hex)
- */
+/* Per-tick telemetry: uptime, voltages, currents, temps, flags, states, pwm, faults. */
 static void log_measurements(void)
 {
     measurements_t *m = &ctx.meas;
@@ -187,12 +129,7 @@ static void log_measurements(void)
     if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
 }
 
-/*
- * TEMP: raw ADC dump for VCHG_M bring-up diagnosis.
- * Bypasses the avg_readings[] pipeline + FP scaling. ADC0 MEM9 is the raw
- * 12-bit code at PA26/A0_1 (VCHG_M); ADC1 MEM0 is V_PANEL on PA15/A1_0,
- * used as a sanity reference. Remove once VCHG sense is verified.
- */
+/* TEMP: raw VCHG_M bring-up probe. Remove once VCHG sense is verified. */
 static void log_vchg_debug(void)
 {
     int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
@@ -209,16 +146,7 @@ static void log_vchg_debug(void)
 /* =========================================================================
  * PIPELINE STEP 8: apply_pwm
  * =========================================================================
- *
- * The ONLY function that touches the buck timer register.
- * Reads ctx->pwm (written by charger or MPPT in steps 6/7) and commits
- * it to hardware via the HAL.
- *
- * Range enforcement: ctx->pwm should already be in [PWM_MAX_DUTY,
- * PWM_MIN_DUTY] — clamped by mppt and charger. We clamp here as defense-
- * in-depth so a bug upstream can never write a value outside the
- * calibrated buck-regulation range (where the buck loses control and
- * delivers uncontrolled current on a stiff input source).
+ * Sole writer of the buck timer register. Defense-in-depth clamp on ctx->pwm.
  */
 static void apply_pwm(system_ctx_t *c)
 {
@@ -231,25 +159,10 @@ static void apply_pwm(system_ctx_t *c)
 }
 
 /* =========================================================================
- * HardFault_Handler — Cortex-M0+ fault trap with UART post-mortem
- * =========================================================================
- *
- * The SDK startup file declares HardFault_Handler as a weak alias to
- * Default_Handler (an unconditional while(1)). Without this override, any
- * fault — bad PC, unaligned access, executing from unmapped memory, stack
- * overflow into invalid regions — would silently freeze the MCU and look
- * identical to a hung main loop.
- *
- * On entry to the exception, the CPU has already pushed an 8-word frame
- * (R0, R1, R2, R3, R12, LR, PC, xPSR) onto whichever stack was active.
- * Bit 2 of EXC_RETURN (= the LR value at exception entry) selects MSP/PSP.
- * Cortex-M0+ has no CFSR/HFSR/MMFAR/BFAR — the stacked PC and LR are the
- * primary forensics.
- *
- * The naked entry stub picks the right stack pointer and tail-calls the C
- * handler, which prints registers via blocking UART writes (no interrupts,
- * no snprintf — minimal dependencies in case the heap or BSS is corrupt).
- */
+ * HardFault_Handler — overrides the SDK weak Default_Handler (infinite loop).
+ * CPU pushes 8-word frame (R0-R3, R12, LR, PC, xPSR) onto active stack;
+ * naked stub selects MSP/PSP via EXC_RETURN bit 2 and tail-calls the C handler.
+ * ========================================================================= */
 static void hf_putc(char c)
 {
     DL_UART_Main_transmitDataBlocking(UART_0_INST, (uint8_t)c);
@@ -284,6 +197,9 @@ void HardFault_HandlerC(uint32_t *stack, uint32_t exc_return)
     hf_puts("frozen.\r\n");
 
     while (1) {
+        /* wfi (Wait For Interrupt): halts the CPU clock until any interrupt
+         * fires. No interrupt will resume meaningful execution here, so this
+         * keeps the core frozen while burning minimal power. */
         __asm volatile ("wfi");
     }
 }
@@ -292,32 +208,30 @@ __attribute__((naked))
 void HardFault_Handler(void)
 {
     __asm volatile (
-        "movs r0, #4         \n"
-        "mov  r1, lr         \n"
-        "tst  r0, r1         \n"   /* EXC_RETURN bit 2: 0=MSP, 1=PSP */
-        "bne  1f             \n"
-        "mrs  r0, msp        \n"
-        "b    2f             \n"
-        "1:                  \n"
-        "mrs  r0, psp        \n"
-        "2:                  \n"
-        "mov  r1, lr         \n"   /* pass EXC_RETURN as second arg */
-        "ldr  r2, =HardFault_HandlerC\n"
-        "bx   r2             \n"
+        /* Bit 2 of EXC_RETURN (the value LR holds on exception entry) tells
+         * us which stack was active before the fault:
+         *   bit2 == 0 → MSP (main stack, used in handler mode or bare-metal)
+         *   bit2 == 1 → PSP (process stack, used by an RTOS thread)
+         * We need that stack pointer so the C handler can read the 8-word
+         * auto-saved frame (R0-R3, R12, LR, PC, xPSR). */
+        "movs r0, #4         \n"   /* r0 = 0x4, mask to isolate EXC_RETURN bit 2 */
+        "mov  r1, lr         \n"   /* r1 = LR = EXC_RETURN value (0xFFFFFFF9 / ...FD / ...ED) */
+        "tst  r0, r1         \n"   /* TST: AND r0,r1 and set flags; Z=1 if bit2==0 (MSP), Z=0 if bit2==1 (PSP) */
+        "bne  1f             \n"   /* branch if Z==0 (bit2 set) → fault was on PSP */
+        "mrs  r0, msp        \n"   /* MSP path: r0 = Main Stack Pointer → points at the saved frame */
+        "b    2f             \n"   /* skip PSP path */
+        "1:                  \n"   /* PSP path */
+        "mrs  r0, psp        \n"   /* r0 = Process Stack Pointer → points at the saved frame */
+        "2:                  \n"   /* common tail: r0 = stack frame pointer (1st arg to C handler) */
+        "mov  r1, lr         \n"   /* r1 = EXC_RETURN (2nd arg): lets C handler know which stack was used */
+        "ldr  r2, =HardFault_HandlerC\n" /* r2 = address of the C handler (PC-relative literal pool load) */
+        "bx   r2             \n"   /* tail-call C handler; naked means no prologue/epilogue to corrupt the frame */
     );
 }
 
 /* =========================================================================
- * SysTick ISR — fires every 1 ms
- * =========================================================================
- *
- * Responsibilities:
- *   1. Increment the millisecond timestamp (consumed by time_now())
- *   2. Kick ADC conversions every TICK_ADC_MS (10 ms) so the moving-
- *      average filter in SPCBoardAPI.c stays fed
- *
- * No heavy work here — the pipeline runs in the main loop.
- */
+ * SysTick ISR — 1 ms: increment timestamp, kick ADC every TICK_ADC_MS.
+ * ========================================================================= */
 void SysTick_Handler(void)
 {
     update_timestamp();
@@ -326,8 +240,8 @@ void SysTick_Handler(void)
     adc_divider++;
     if (adc_divider >= TICK_ADC_MS) {
         adc_divider = 0;
-        read_adc_values();   /* harvest completed conversions into moving average */
-        adc_read_step();     /* kick off next conversion pair */
+        read_adc_values();
+        adc_read_step();
     }
 }
 
@@ -342,14 +256,7 @@ int main(void)
 
     system_init();     /* SYSCFG, ADC, PWM, UART, RTC, sensing rails */
 
-    /*
-     * SysConfig leaves the buck timer's capture-compare register at whatever
-     * value the .syscfg file specified at reset. Force it to the known-safe
-     * minimum-duty value before any code path can release BUCK_DIS, so the
-     * first transition into a charging state cannot expose the inductor to
-     * a random (potentially near-100%) duty between enable_input_buck() and
-     * the first apply_pwm() at step 8.
-     */
+    /* Force safe PWM before any BUCK_DIS release — SysConfig may leave a random value. */
     set_buck_pwm(PWM_MIN_DUTY);
 
     timer_init();      /* SysTick @ 1 ms */
@@ -357,12 +264,8 @@ int main(void)
 
     ctx_init(&ctx);    /* zero context, safe defaults, SYS_INIT state */
 
-    /*
-     * Enable the battery switch so we can read V_bat from the very first
-     * ADC sample. The battery is a passive element — connecting it doesn't
-     * push current anywhere unless the buck or output switches are also on
-     * (which they aren't at this point).
-     */
+    /* Connect battery so V_bat is available from the first ADC sample.
+     * Battery is passive; no current flows without buck or output switch. */
     enable_battery_switch();
 
     /* ────────────────────────────────────────────────────────────────────
@@ -370,18 +273,11 @@ int main(void)
      * ──────────────────────────────────────────────────────────────────── */
     ctx.system_state = SYS_RUN;
 
-    /*
-     * Anchor the idle-sleep window at SYS_RUN entry. ctx_init() zeroes the
-     * struct so idle_start_ms = 0; enter_idle() would set it but only fires
-     * on a transition, and the FSM starts in EM_IDLE — so booting dark with
-     * no transition leaves the unsigned (time_now() - 0) comparison ticking
-     * from the zero epoch and trips IDLE_SLEEP_TIMEOUT_MS at exactly 2 min,
-     * dropping the MCU into __WFI() and killing any attached JTAG session.
-     */
+    /* Anchor idle timer here; ctx_init() zeros it, causing early WFI if not set
+     * (FSM starts in EM_IDLE with no transition to trigger enter_idle). */
     ctx.idle_start_ms = time_now();
 
-    /* Send boot banner before anything else so a fresh terminal
-     * sees the reset, then the column header for the periodic log. */
+    /* Boot banner then column header. */
     log_boot_banner();
     log_header();
 
@@ -396,24 +292,17 @@ int main(void)
     while (1       ) {
         uint32_t now = time_now();
 
-        /* ── 20 ms tick: button polling ──
-         * Runs at TICK_BUTTON_MS. update_buttons() updates internal
-         * debounce state. UI_MGR (not yet implemented) would read the
-         * results and drive the LED display. */
+        /* ── 20 ms: button polling ── */
         if ((now - last_button) >= TICK_BUTTON_MS) {
             last_button = now;
             update_buttons();
         }
 
-        /* ── 50 ms tick: the deterministic pipeline ──
-         * This is the core of the firmware. Every module runs exactly
-         * once per tick, in strict order, reading fields written by
-         * earlier steps and writing fields read by later steps. */
+        /* ── 50 ms: deterministic pipeline ── */
         if ((now - last_main) >= TICK_MAIN_MS) {
             last_main = now;
 
-            /* Snapshot FSM states so we can log any region that
-             * transitioned during this tick. Cheap (3 enum copies). */
+            /* Snapshot for transition logging. */
             energy_mode_state_t em_old   = ctx.energy_mode;
             charger_state_t     chg_old  = ctx.charger.state;
             mppt_state_t        mppt_old = ctx.mppt.state;
@@ -442,39 +331,26 @@ int main(void)
             /* Step 8: commit ctx->pwm to the buck timer */
             apply_pwm(&ctx);
 
-            /* One-line UART log per region whose state changed. */
             log_state_transitions(now, em_old, chg_old, mppt_old);
         }
 
-        /* ── 1 s tick: UART diagnostic logging ── */
+        /* ── 1 s: UART diagnostic logging ── */
         if ((now - last_log) >= TICK_LOG_MS) {
             last_log = now;
             log_measurements();
             log_vchg_debug();   /* TEMP: raw VCHG_M bring-up probe */
         }
 
-        /* ── Idle sleep ──
-         * energy_mode sets idle_sleep_pending after IDLE_SLEEP_TIMEOUT_MS
-         * (2 min) with no sun and no load. Enter low-power stop mode;
-         * a GPIO interrupt (button press or load connect) or the RTC
-         * will wake the MCU back into this loop.
-         *
-         * After wake-up, clear the pending flag and reset the idle
-         * timer so we get a fresh 2-minute window. The next pipeline
-         * tick will re-evaluate energy_mode which will either stay in
-         * IDLE (starting a new timeout) or transition out if conditions
-         * changed while we slept. */
+        /* ── Idle sleep ── */
         if (ctx.idle_sleep_pending) {
             ctx.idle_sleep_pending = false;
             ctx.idle_start_ms = time_now();
-
-            /* Disable peripherals that draw current in sleep */
             disable_led_bar();
-
-            __WFI();  /* Wait For Interrupt — enter low-power mode */
-
-            /* Woken by interrupt — resume. SysTick_Handler resumes
-             * timestamp counting automatically. */
+            /* __WFI() emits a single "wfi" (Wait For Interrupt) instruction.
+             * The CPU clock gates until the next SysTick (≤1 ms), so the
+             * super-loop resumes on the next tick with no delay and no missed
+             * events — SysTick and all other ISRs remain active during WFI. */
+            __WFI();
         }
     }
 }
