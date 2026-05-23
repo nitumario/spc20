@@ -124,9 +124,16 @@ static void activate_charger_region(system_ctx_t *ctx)
 static void enter_idle(system_ctx_t *ctx)
 {
     disable_charge_switch();
-    disable_battery_switch();
-    disable_output_switch();
-    disable_usb_boost();
+    /* BATTERY_EN + OUTPUT_EN stay on so I_DISCHARGE (across R427, downstream
+     * of Q46) can register a load on 3VOUT and wake us into DISCHARGE_ONLY.
+     * USB boost (MIC2876) + LED boost (TPS61088) are also held on so loads
+     * on either connector type can draw current and trip has_load. LED
+     * outputs are passive (LED string + PNP CC), so the current source must
+     * be running for any current to flow — see set_led_current() in main(). */
+    enable_battery_switch();
+    enable_output_switch();
+    enable_usb_boost();
+    enable_led_boost();
     disable_input_buck();
 
     ctx->idle_start_ms = time_now();
@@ -136,8 +143,12 @@ static void enter_idle(system_ctx_t *ctx)
 static void enter_charge_only(system_ctx_t *ctx)
 {
     enable_battery_switch();
-    disable_output_switch();
-    disable_usb_boost();
+    /* OUTPUT_EN + USB_EN + LED boost on for the same reason as in enter_idle —
+     * otherwise a load appearing mid-charge can never trip has_load and we'd
+     * never advance to CHARGE_AND_LOAD. */
+    enable_output_switch();
+    enable_usb_boost();
+    enable_led_boost();
 
     activate_charger_region(ctx);
 }
@@ -147,6 +158,7 @@ static void enter_charge_and_load(system_ctx_t *ctx)
     enable_battery_switch();
     enable_output_switch();
     enable_usb_boost();
+    enable_led_boost();
 
     activate_charger_region(ctx);
 }
@@ -158,6 +170,7 @@ static void enter_discharge_only(system_ctx_t *ctx)
     enable_battery_switch();
     enable_output_switch();
     enable_usb_boost();
+    enable_led_boost();
 }
 
 static void enter_safe_mode(system_ctx_t *ctx)
@@ -167,6 +180,7 @@ static void enter_safe_mode(system_ctx_t *ctx)
     enable_battery_switch();   /* battery stays connected (not draining into loads) */
     disable_output_switch();   /* shed loads */
     disable_usb_boost();       /* shed USB */
+    disable_led_boost();       /* shed LED boost */
 }
 
 /* =========================================================================

@@ -93,6 +93,14 @@
 #define PWM_MIN_DUTY              399     /* highest pwm value → lowest duty cycle (off)          */
 #define BUCK_MAX_CURRENT_MA       2000    /* hardware current limit of the inductor/FET           */
 
+/* LED boost (TPS61088) rail target. Needs enough headroom for the LED string
+ * Vf plus Vce_sat of the PNP current source; below ~10 V the per-channel CC
+ * loop falls out of regulation and the lamps only weakly glow at <<150 mA.
+ * Matches V2.5.5: set_led_voltage()'s linear formula saturates this request
+ * to duty=1 (rail clamps to its top of ~11.3 V), which is the validated
+ * operating point. */
+#define LED_BOOST_TARGET_MV       11500
+
 /* =========================================================================
  * 4. LOAD DETECTION
  * =========================================================================

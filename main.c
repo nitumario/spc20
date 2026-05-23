@@ -344,6 +344,37 @@ int main(void)
      */
     enable_battery_switch();
 
+    /* OUTPUT_EN + USB boost + LED boost on at boot so I_DISCHARGE can sense
+     * a load (USB-connector loads need the MIC2876 producing 5V; LED-output
+     * lamps need the TPS61088 producing the ~11.3V rail AND a non-zero
+     * LEDCTRL PWM reference so the per-channel current sources are armed)
+     * and let eval_idle leave EM_IDLE. enter_idle() is never called at
+     * startup (FSM boots in EM_IDLE with no transition), so its enables
+     * must be mirrored here.
+     *
+     * Bench bringup: 150 mA per LED channel (lands on the 145 mA / 155 mA
+     * LUT bins). Far below the 350 mA per-channel hardware max called out
+     * in the schematic. */
+    enable_output_switch();
+    enable_usb_boost();
+    enable_led_boost();
+
+    /* ADC warm-up before any voltage-targeting PWM op. set_led_voltage() →
+     * set_pwm_duty_cycle() → scale_duty_cycle() → get_vdd(), which reads
+     * ADC.Adc0Result[6]; that field is 0 until the first conversion lands.
+     * Without this loop scale_duty_cycle ends up with 3300/0 and clamps to
+     * an out-of-period CC value — PB15 parks at its init-low state and the
+     * TPS61088 only regulates off its passive feedback divider, well below
+     * the LED-string dropout. Mirrors the 1000-iter warm-up in V2.5.5/main.c. */
+    for (int i = 0; i < 1000; i++) {
+        read_adc_values();
+        delay_cycles(400);
+    }
+
+    set_led_voltage(LED_BOOST_TARGET_MV);
+    set_led_current(150, LED1);
+    set_led_current(150, LED2);
+
     /* ────────────────────────────────────────────────────────────────────
      * SYS_INIT → SYS_RUN
      * ──────────────────────────────────────────────────────────────────── */
