@@ -199,39 +199,68 @@ target = allowed_chg
 
 ## MPPT algorithm
 
-Incremental conductance with adaptive step size. Runs parallel to the charger state.
+Two implementations, selected by `CHARGER_INPUT_VREG` (hw_config.h). Runs parallel to the charger state.
 
-### States
+### Setpoint-P&O (`CHARGER_INPUT_VREG=1`, current)
 
-| state    | functionality                                                 | PWM_control                                                          | mppt_limit_output              |
-|----------|---------------------------------------------------------------|----------------------------------------------------------------------|--------------------------------|
-| DISABLED | nothing                                                       | CC controls pwm                                                      | BUCK_MAX(no panel constraint)  |
-| TRACKING | perturbs PWM measures V/I and applies incremental conductance | MPPT controls PWM. CC skips regulation but still runs safety checks. | previous value                 |
-| HOLD     | Waits MPPT_HOLD_TIME before re-tracking                       | CC controls PWM (inherits MPPT's position)                           | Computed from best power found |
+Perturb & observe on the **input-vreg setpoint** (`ctx->mppt.vreg_setpoint_mv`), never on the PWM.
+The charger's inner voltage loop (`cc_regulate`) owns the PWM exclusively and realises each setpoint;
+all its protections (pacing, panel backoff, reverse escape, `allowed_chg` clamp) stay active while
+MPPT probes. Fitness = charge current averaged over a dwell (settle `MPPT_SP_SETTLE_MS`, then
+measure `MPPT_SP_MEASURE_MS`); max delivered current ⇔ max delivered power since V_bat is constant
+over a 3 s dwell.
 
+Key mechanisms (all in mppt.c, constants in hw_config.h section 6):
 
+- **FOCV seed**: on activation, learn Voc (running max of the filtered panel voltage — the
+  activation-tick reading races the 640 ms ADC window) and seed
+  `sp = MPPT_SP_FRACTION_PCT%·Voc − deadband`, deferred to the end of the first settled dwell.
+- **Adaptive step**: `MPPT_SP_STEP_MV` halves per reversal down to `MPPT_SP_STEP_MIN_MV`
+  (brackets the knee below one PWM count); accepted probes re-double it. Re-probe sessions
+  start fine.
+- **Noise gate**: a dwell within ±`MPPT_SP_MIN_DELTA_MA` of the baseline counts as a reversal —
+  converges instead of random-walking on a flat power top or when the budget clamp binds.
+- **Collapse / dip handling**: V_panel below `PANEL_SAFETY_MV` (collapse) or below the band's low
+  edge (band-hop whipsaw — no parkable point at this setpoint) pushes the setpoint up one step and
+  raises the **session floor** so the cliff is tested at most once per session. Pushes don't count
+  toward convergence.
+- **Convergence**: `MPPT_SP_CONVERGE_REVERSALS` reversals (or the `MPPT_SP_RUNTIME_MS` cap) → HOLD;
+  re-probe after `MPPT_SP_HOLD_TIME_MS` while `panel_limited` and the charger is in bulk. A collapse
+  while parked (knee rose above the held band) exits HOLD immediately.
 
+In this mode MPPT never writes `ctx->pwm` and never updates `mppt_limit_ma` (stays at BUCK_MAX —
+the voltage loop protects the panel, not the current budget).
 
+| state    | functionality                                                  | PWM_control                       | vreg_setpoint output            |
+|----------|----------------------------------------------------------------|-----------------------------------|---------------------------------|
+| DISABLED | nothing (charger region inactive)                              | CC/CV controls pwm                | preserved (EM-bounce continuity) |
+| TRACKING | dwells: settle, average Ichg, P&O step the setpoint            | CC controls pwm (realises probes) | hill-climbed per dwell          |
+| HOLD     | setpoint frozen; re-probe on expiry / collapse escape          | CC/CV controls pwm                | converged value                 |
 
+| PRIORITY | FROM     | GUARD                                              | TO       | NOTES                                            |
+|----------|----------|----------------------------------------------------|----------|--------------------------------------------------|
+| 1        | DISABLED | charging AND has_sun                               | TRACKING | activation: learn Voc, seed FOCV, climb          |
+| 2        | DISABLED | <default>                                          | DISABLED | stay                                             |
+| 1        | TRACKING | !has_sun                                           | DISABLED | safety first                                     |
+| 2        | TRACKING | charger in CV                                      | HOLD     | cv_regulate ignores the setpoint — freeze        |
+| 3        | TRACKING | reversals ≥ MPPT_SP_CONVERGE_REVERSALS             | HOLD     | converged                                        |
+| 4        | TRACKING | MPPT_SP_RUNTIME_MS expired                         | HOLD     | session cap                                      |
+| 5        | TRACKING | <default>                                          | TRACKING | continue dwells                                  |
+| 1        | HOLD     | !has_sun                                           | DISABLED | sun lost                                         |
+| 2        | HOLD     | V_panel < PANEL_SAFETY_MV (paced, step must move)  | TRACKING | knee rose above held band — escape up            |
+| 3        | HOLD     | hold expired AND panel_limited AND charger in bulk | TRACKING | periodic re-probe (upward recovery path)         |
+| 4        | HOLD     | <default>                                          | HOLD     | wait                                             |
 
-[MPPT_states](docs/MPPT_states.csv)
+### Legacy PWM inc-conductance (`CHARGER_INPUT_VREG=0`)
 
+Incremental conductance with adaptive step size, perturbing the PWM directly; MPPT owns the PWM
+during TRACKING and publishes `mppt_limit_ma` from HOLD. Retained for stiff-source bring-up only —
+unworkable on soft panels (one PWM count ≈ 20 % of a small panel's MPP current; ~320 ms ADC lag
+corrupts dV/dI attribution).
 
-### TRACKING Entry Actions
-
-- V_prev = V_panel (fresh)
-- I_prev = I_panel (fresh)
-- step_size = MPPT_MAX_STEP_SIZE
-- max_reversals = 0
-- max_panel_power = 0
-- Force first perturbation: pwm -= step_size
-- Record tracking_start_ms
-
-
-### MPPT transition table
 | PRIORITY | FROM     | GUARD                                           | TO       | NOTES                                                                                                     |
 |----------|----------|-------------------------------------------------|----------|-----------------------------------------------------------------------------------------------------------|
-| 1        | DISABLED | panel_limited AND has_sun                       | TRACKING | panel is limiting — start optimization                                                                    |
+| 1        | DISABLED | panel_limited AND has_sun AND settled           | TRACKING | panel is limiting — start optimization                                                                    |
 | 2        | DISABLED | <default>                                       | DISABLED | stay                                                                                                      |
 | 1        | TRACKING | !has_sun                                        | DISABLED | safety first — sun lost kills tracking immediately                                                        |
 | 2        | TRACKING | converged (step_size == 1 AND reversals > 6)    | HOLD     | algorithm converged                                                                                       |
@@ -243,7 +272,7 @@ Incremental conductance with adaptive step size. Runs parallel to the charger st
 | 4        | HOLD     | <default>                                       | HOLD     | wait                                                                                                      |
 
 
-[MPPT_transition_table](docs/MPPT_transition_table.csv)
+[MPPT_states](docs/MPPT_states.csv) · [MPPT_transition_table](docs/MPPT_transition_table.csv)
 
 
 ## File Structure

@@ -2,37 +2,37 @@
  * mppt.h — Maximum Power Point Tracker (Pipeline Step 6)
  * =========================================================================
  *
- * Incremental-conductance MPPT with adaptive step size, running as the
- * third orthogonal region inside ENERGY_MGMT.
+ * Third orthogonal region inside ENERGY_MGMT. Two implementations,
+ * selected by CHARGER_INPUT_VREG (see mppt.c header for the full story):
+ *
+ *   =1 (current): SETPOINT-P&O. Hill-climbs the input-vreg setpoint
+ *      (ctx->mppt.vreg_setpoint_mv, consumed by charger.c cc_regulate)
+ *      to maximise averaged delivered charge current. NEVER writes
+ *      ctx->pwm and never updates mppt_limit_ma. Seeds the setpoint
+ *      from the captured open-circuit voltage on each activation.
+ *   =0 (legacy): PWM-perturbing incremental conductance. Owns ctx->pwm
+ *      during TRACKING (charger skips regulation) and publishes
+ *      mppt_limit_ma to the power budget from HOLD.
  *
  * Pipeline position:
  *   Runs after energy_mode (step 5) and BEFORE charger (step 7), so the
- *   charger can see whether MPPT currently owns the PWM.
+ *   charger sees this tick's setpoint (or, legacy, whether MPPT owns
+ *   the PWM).
  *
- * States (see docs/MPPT_transition_table.csv):
- *   MPPT_DISABLED  — panel is not the bottleneck. mppt_limit_ma =
- *                    BUCK_MAX_CURRENT_MA (no constraint on power budget).
- *                    CC/CV owns the PWM.
- *   MPPT_TRACKING  — actively perturbing PWM to find MPP. MPPT owns PWM;
- *                    the charger's CC loop must skip regulation.
- *   MPPT_HOLD      — converged (or timed out). Parks PWM at the best
- *                    point found. mppt_limit_ma reflects what the panel
- *                    can deliver through the buck at that point.
- *                    After MPPT_HOLD_TIME_MS, re-enters TRACKING.
+ * States (same names in both modes, semantics differ):
+ *   MPPT_DISABLED  — charger region inactive. Setpoint/limit preserved.
+ *   MPPT_TRACKING  — probing. Setpoint mode: 3 s settle+measure dwells,
+ *                    one MPPT_SP_STEP_MV per dwell. Legacy: paced PWM
+ *                    perturbations.
+ *   MPPT_HOLD      — converged (or capped). Setpoint mode: setpoint
+ *                    frozen, re-probes after MPPT_HOLD_TIME_MS while
+ *                    panel_limited. Legacy: PWM parked at best point,
+ *                    mppt_limit_ma published.
  *
  * Activation policy:
  *   MPPT only runs while energy_mode has activated the charger region
- *   (EM_CHARGE_ONLY or EM_CHARGE_AND_LOAD). When energy_mode deactivates
- *   the charger region it resets MPPT to DISABLED directly.
- *
- * Interaction with charger:
- *   The charger reads ctx->mppt.state. While MPPT_TRACKING, the charger
- *   must skip its CC regulation step — MPPT is writing ctx->pwm.
- *   Otherwise the charger writes ctx->pwm from its CC/CV loop.
- *
- * Output to power_budget:
- *   ctx->mppt.mppt_limit_ma is consumed by power_budget_update() on the
- *   following tick to cap i_buck_max.
+ *   (EM_CHARGE_ONLY or EM_CHARGE_AND_LOAD); it drops to DISABLED on its
+ *   next tick after deactivation.
  */
 
 #ifndef MPPT_H

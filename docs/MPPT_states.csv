@@ -1,4 +1,5 @@
-state,functionality,PWM_control,mppt_limit_output
-DISABLED,nothing,CC controls pwm, BUCK_MAX(no panel constraint)
-TRACKING,perturbs PWM measures V/I and applies incremental conductance, MPPT controls PWM. CC skips regulation but still runs safety checks., previous value
-HOLD, Waits MPPT_HOLD_TIME before re-tracking,CC controls PWM (inherits MPPT's position),Computed from best power found
+state,functionality,PWM_control,vreg_setpoint_output
+DISABLED,nothing (charger region inactive),CC/CV controls pwm,preserved across EM bounces
+TRACKING,"dwells: settle MPPT_SP_SETTLE_MS, average chg_current over MPPT_SP_MEASURE_MS, P&O step the setpoint (adaptive step, noise gate, collapse/dip push-up with session floor)",CC controls pwm (inner vreg loop realises each probe; MPPT never writes pwm),hill-climbed one step per dwell
+HOLD,setpoint frozen; exits on hold-expiry re-probe or collapse escape,CC/CV controls pwm,converged value
+"NOTE: this table describes the setpoint-P&O tracker (CHARGER_INPUT_VREG=1). With CHARGER_INPUT_VREG=0 the legacy PWM-perturbing inc-conductance tracker applies: TRACKING owns the PWM (CC skips regulation) and HOLD publishes mppt_limit_ma from the best power found. See README.md, MPPT algorithm.",,,

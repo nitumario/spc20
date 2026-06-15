@@ -231,8 +231,15 @@ typedef struct {
  */
 typedef struct {
     bool     value;             /* current debounced flag state                 */
-    uint8_t  count;             /* consecutive readings past set threshold      */
-    uint8_t  count_threshold;   /* how many to trigger (configured at init)     */
+    uint8_t  count;             /* consecutive readings past the ACTIVE edge    */
+                                /* (set edge while clear, clear edge while set) */
+    uint8_t  count_threshold;   /* consecutive set-readings to latch true       */
+    uint8_t  clear_threshold;   /* consecutive clear-readings to latch false.   */
+                                /* 1 = clears immediately (original behaviour).  */
+                                /* >1 rides out transient dips so a brief        */
+                                /* load-induced V_panel sag during MPPT engage   */
+                                /* doesn't read as "sun gone" and tear down the  */
+                                /* charger before MPPT can grab control.         */
 } debounce_flag_t;
 
 /* =========================================================================
@@ -317,16 +324,77 @@ typedef struct {
     /* Timing */
     uint32_t tracking_start_ms; /* timestamp when TRACKING was entered         */
     uint32_t hold_start_ms;     /* timestamp when HOLD was entered             */
+    uint32_t last_step_ms;      /* timestamp of last perturb/observe iteration.
+                                 * Perturbations are paced to MPPT_STEP_INTERVAL_MS
+                                 * (≥ ADC moving-average group delay) so each step's
+                                 * effect is observed before the next — otherwise
+                                 * MPPT tracks transient noise and parks at a garbage
+                                 * operating point. */
 
     /* Output to power budget:
      * The maximum current the panel can deliver through the buck
      * at the current operating point. Computed when entering HOLD
      * from the best power point found during TRACKING.
      *
-     * When MPPT is DISABLED, this is set to BUCK_MAX_CURRENT_MA
-     * (no panel constraint — the panel can deliver more than the buck max).
+     * Preserved across charger deactivate/reactivate cycles so a brief
+     * EM bounce (e.g. CHG_ONLY → IDLE → CHG_ONLY) does not lose the
+     * learned panel capability and re-overload the panel on the next
+     * activation. Initialised to MPPT_LIMIT_DEFAULT_MA on cold boot.
      */
     uint16_t mppt_limit_ma;
+
+    /* ── Setpoint-P&O outer loop (CHARGER_INPUT_VREG=1) ──
+     *
+     * The fields above belong to the legacy PWM-perturbing tracker.
+     * Under CHARGER_INPUT_VREG the tracker instead owns vreg_setpoint_mv,
+     * which charger.c cc_regulate consumes as its panel-voltage target.
+     * The tracker never writes ctx->pwm in this mode.
+     */
+    uint16_t vreg_setpoint_mv;  /* LIVE input-vreg target consumed by
+                                 * cc_regulate. Seeded by ctx_init to
+                                 * PANEL_VREG_SETPOINT_MV, re-seeded from
+                                 * 0.76·Voc at each charger activation,
+                                 * then hill-climbed. PRESERVED across
+                                 * EM bounces (like mppt_limit_ma) so a
+                                 * brief teardown doesn't forget the MPP. */
+    uint16_t prev_sp_mv;        /* setpoint of the previous (accepted)
+                                 * dwell — revert target when a probe
+                                 * measures worse                          */
+    uint16_t panel_voc_mv;      /* unloaded panel voltage captured on the
+                                 * activation tick (panel idles open-
+                                 * circuit in IDLE); clamps the setpoint
+                                 * ceiling and seeds the FOCV estimate    */
+    int16_t  prev_avg_ichg;     /* previous dwell's averaged chg_current
+                                 * (mA) — the fitness baseline            */
+    bool     prev_avg_valid;    /* false until a baseline dwell completes
+                                 * (entry, re-probe, post-collapse)       */
+    bool     voc_pending;       /* fresh activation: capture Voc + seed at
+                                 * the end of the first settled dwell —
+                                 * NOT at entry, where the 640 ms panel-ADC
+                                 * window is still half-full of pre-plug
+                                 * samples (has_sun debounces in 150 ms)  */
+    bool     dwell_dipped;      /* V_panel dipped below the regulation
+                                 * band during this dwell's measure window
+                                 * → the setpoint cannot park (band-hop
+                                 * whipsaw); classified as "too low"
+                                 * regardless of the measured average     */
+    uint16_t sp_session_floor_mv; /* raised to the post-push setpoint on
+                                 * every collapse/dip correction: a level
+                                 * that failed to park is not re-probed
+                                 * within the same TRACKING session (the
+                                 * cliff is tested at most once per
+                                 * session). Reset on session entry.      */
+    uint16_t sp_step_mv;        /* current probe step: MPPT_SP_STEP_MV at
+                                 * session entry, halved on each reversal
+                                 * down to MPPT_SP_STEP_MIN_MV (brackets
+                                 * the knee below one PWM count)          */
+    uint8_t  dwell_phase;       /* 0 = settling, 1 = measuring            */
+    int8_t   sp_direction;      /* +1 = probing toward Voc, -1 = away     */
+    int32_t  ichg_acc;          /* chg_current accumulator over the
+                                 * measure window                         */
+    uint16_t ichg_acc_cnt;      /* samples accumulated                    */
+    uint32_t dwell_start_ms;    /* current dwell start (settle+measure
+                                 * phases both time from here)            */
 
 } mppt_ctx_t;
 
@@ -494,10 +562,18 @@ static inline void ctx_init(system_ctx_t *ctx)
     /* Charger starts inactive */
     ctx->charger.state = CHG_INACTIVE;
 
-    /* MPPT starts disabled — no panel constraint assumed */
+    /* MPPT starts disabled with a conservative panel-current cap so the
+     * first charger activation doesn't demand BUCK_MAX from an unknown
+     * panel and collapse it. See MPPT_LIMIT_DEFAULT_MA in hw_config.h. */
     ctx->mppt.state = MPPT_DISABLED;
-    ctx->mppt.mppt_limit_ma = BUCK_MAX_CURRENT_MA;
+    ctx->mppt.mppt_limit_ma = MPPT_LIMIT_DEFAULT_MA;
     ctx->mppt.step_size = MPPT_MAX_STEP_SIZE;
+
+    /* Setpoint-P&O: fall back to the static array setpoint until the
+     * first activation captures Voc and seeds the real per-panel value. */
+    ctx->mppt.vreg_setpoint_mv = PANEL_VREG_SETPOINT_MV;
+    ctx->mppt.prev_sp_mv       = PANEL_VREG_SETPOINT_MV;
+    ctx->mppt.sp_direction     = +1;
 
     /* No faults */
     ctx->fault.code = FAULT_NONE;
@@ -505,15 +581,22 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->fault.history = FAULT_NONE;
     ctx->fault.active = false;
 
-    /* bat_low debounce configuration */
+    /* bat_low debounce configuration. clear_threshold = 1 keeps the
+     * original immediate-clear behaviour (recovery above the hysteresis
+     * band should un-latch bat_low without delay). */
     ctx->flag_bat_low.value = false;
     ctx->flag_bat_low.count = 0;
     ctx->flag_bat_low.count_threshold = BAT_LOW_DEBOUNCE_COUNT;
+    ctx->flag_bat_low.clear_threshold = 1;
 
-    /* has_sun debounce configuration */
+    /* has_sun debounce configuration. clear_threshold > 1 so a transient
+     * V_panel sag (MPPT perturbation, activation inrush, or CC briefly
+     * over-driving the panel before MPPT grabs control) does not clear
+     * has_sun and bounce EM back to IDLE. See HAS_SUN_CLEAR_COUNT. */
     ctx->flag_has_sun.value = false;
     ctx->flag_has_sun.count = 0;
     ctx->flag_has_sun.count_threshold = HAS_SUN_DEBOUNCE_COUNT;
+    ctx->flag_has_sun.clear_threshold = HAS_SUN_CLEAR_COUNT;
 
     /* Assume temperature OK until first measurement */
     ctx->temp_charge_ok = true;

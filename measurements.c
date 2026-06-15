@@ -32,10 +32,20 @@ static void debounce_update(debounce_flag_t *f,
                             bool clear_condition)
 {
     if (f->value) {
-        /* Flag is currently set — can only clear */
+        /* Flag is currently set — count consecutive clear-readings.
+         * Requires clear_threshold in a row (default 1 = immediate). A
+         * single non-clear reading resets the counter, so only a
+         * SUSTAINED clear condition latches false — a brief V_panel sag
+         * (e.g. an MPPT perturbation or the activation transient) is
+         * ridden out and won't tear the charger down. */
         if (clear_condition) {
-            f->value = false;
-            f->count = 0;
+            f->count++;
+            if (f->count >= f->clear_threshold) {
+                f->value = false;
+                f->count = 0;
+            }
+        } else {
+            f->count = 0;  /* reset — need consecutive readings */
         }
     } else {
         /* Flag is currently clear — count toward setting */
@@ -43,6 +53,7 @@ static void debounce_update(debounce_flag_t *f,
             f->count++;
             if (f->count >= f->count_threshold) {
                 f->value = true;
+                f->count = 0;
             }
         } else {
             f->count = 0;  /* reset — need consecutive readings */

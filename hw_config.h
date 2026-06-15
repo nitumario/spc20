@@ -69,10 +69,111 @@
  */
 // #define PANEL_OVP_CLAMP_MV        15000   /* approximate OVP clamp voltage (from zener + MOSFET)  */
 
-#define PANEL_MIN_MV              9000    /* has_sun flag sets above this                         */
-#define PANEL_MIN_CLEAR_MV        8000    /* has_sun clears below this (1 V hysteresis)           */
+/* Retuned for the 4x-parallel (1s) panel array under real sun: OC ≈ 14 V,
+ * MPP measured at/below 7.3 V (panel power still climbing as V drops to
+ * 7.3 V — see bench log). The previous 8-10 V band sat ABOVE the MPP, so
+ * has_sun cleared (panel < 8 V) within ~400 ms of charge start — faster
+ * than CHARGER_MPPT_SETTLE_MS (1 s) — and MPPT never engaged to bring
+ * allowed_chg down to the panel's real capability. Charger bounced
+ * IDLE<->CHG_ONLY forever. These thresholds now sit below the MPP so the
+ * charger stays active long enough for MPPT to TRACK and park at the MPP. */
+#define PANEL_MIN_MV              6000    /* has_sun flag sets above this (unloaded panel ≈ OC in IDLE) */
+/* has_sun CLEAR threshold. Must sit BELOW the charging V_panel floor chain:
+ *   vreg band low (5300) > PANEL_SAFETY_MV (4800) > this (4200) >
+ *   collapsed-panel reading ≈ 3.6 V (buck in dropout: V_panel ≈ V_bat + drop).
+ * A collapsed panel reads ~3.6 V, NOT 0 V, so only the clear COUNT below
+ * separates "transient collapse during regulation" from "sunset". */
+#define PANEL_MIN_CLEAR_MV        4200
 #define HAS_SUN_DEBOUNCE_COUNT    3       /* consecutive readings before flag sets (×50 ms)       */
-#define PANEL_SAFETY_MV           10000   /* CC backs off below this to avoid collapsing panel    */
+/* Consecutive sub-PANEL_MIN_CLEAR_MV readings before has_sun clears (×50 ms).
+ * Must outlast the worst-case activation transient: the pre-position
+ * over-demand can collapse the panel for ~2 paced backoff intervals plus
+ * ~320 ms of ADC filter lag on each edge ≈ 1.2 s of sub-threshold readings.
+ * 30 ticks = 1.5 s rides that out; a real sunset still tears the charger
+ * down within ~1.5 s, which is plenty fast. */
+#define HAS_SUN_CLEAR_COUNT       30
+/* Emergency floor: regulation backs off hard below this. Must be BELOW the
+ * vreg band low edge (setpoint − deadband = 5300 mV) so it never fires while
+ * the loop holds the panel on its power plateau, and ABOVE the has_sun clear
+ * threshold so backoff acts before the FSM gives up on the sun. */
+#define PANEL_SAFETY_MV           4800
+
+/* =========================================================================
+ * INPUT-VOLTAGE REGULATION ("constant-voltage MPPT")
+ * =========================================================================
+ *
+ * Master switch for the charger's bulk-charge control law. When 1, the
+ * bulk regulator (charger.c cc_regulate, used in PRECHARGE and CC) holds
+ * V_panel at PANEL_VREG_SETPOINT_MV instead of chasing a fixed charge-
+ * current target, and the perturb/observe MPPT region (mppt.c) is kept
+ * DISABLED so it does not grab PWM and fight the voltage loop.
+ *
+ * Why: fixed-current CC is open-loop UNSTABLE on a soft PV source — any
+ * target above the panel's MPP current drags V_panel past the I-V knee
+ * and collapses it, which (a) clears has_sun and tears the charger down,
+ * and (b) cannot be rescued by perturb-MPPT because arming it (via the
+ * panel_limited margin) requires commanding well past the MPP in the
+ * first place. Regulating the INPUT voltage instead is negative feedback
+ * on a monotonic plant (more current → lower V_panel), so it converges
+ * to the MPP from either side and cannot walk off the cliff. It also
+ * degrades gracefully: on a stiff source V_panel never reaches the
+ * setpoint, so the battery-current clamp takes over and it behaves like
+ * classic CC. See the bench-log saga in git history for the full path
+ * that led here.
+ *
+ * MPPT under this mode: mppt.c runs as an OUTER loop that owns the
+ * SETPOINT (ctx->mppt.vreg_setpoint_mv) and hill-climbs it to maximise
+ * delivered charge current — it never touches ctx->pwm. The legacy
+ * PWM-perturbing inc-conductance tracker is compiled only when this
+ * switch is 0. See section 6 (MPPT TUNING). */
+#define CHARGER_INPUT_VREG        1
+
+/* MPP voltage setpoint COLD-BOOT FALLBACK (mV). The LIVE setpoint is
+ * ctx->mppt.vreg_setpoint_mv: seeded at charger activation from the
+ * captured open-circuit voltage (MPPT_SP_FRACTION_PCT of Voc) and then
+ * hill-climbed by the outer MPPT loop (mppt.c). This constant only
+ * matters until the first activation, or if the Voc capture is invalid.
+ *
+ * Why no fixed setpoint: 6500 mV was the measured MPP of the 4x-parallel
+ * array (flat top, ≥97 % of peak from ~5.0–7.8 V). On a 13 V OC panel
+ * (bench log 1206_sp.log, 2026-06-12) the same value put the regulation
+ * band top (7.7 V) BELOW that panel's I-V knee (~10.9 V), so the loop
+ * had no reachable operating point, walked the panel over the knee,
+ * collapsed it to 3.4 V, and sawtoothed collapse/recover every ~9 s.
+ * The setpoint is a per-panel quantity and must follow the panel. */
+#define PANEL_VREG_SETPOINT_MV    6500U
+
+/* Half-width of the regulation deadband around the setpoint (mV). The
+ * panel's power top is FLAT (≥97 % of peak from ~5.0–7.8 V), so the band
+ * is deliberately wide: 6500 ± 1200 → hold anywhere in 5.3–7.7 V.
+ *
+ * Why this wide: PWM is COARSE on this plant. One count moves the buck
+ * rail ~2.9 mV (LUT span 3772→2786 mV over 343 counts), which across the
+ * ~65 mΩ charge path is ~45 mA of battery current ≈ ~25 mA of panel
+ * current at 6.5 V (measured, May bench log: pwm 143→140 moved Ichg
+ * −180→−38 mA). The band must span MORE panel current than one step
+ * quantum, or there may be NO reachable operating point inside it — the
+ * loop then hops across the band every interval and whipsaws the panel
+ * over its I-V knee (the residual bounce seen after the pacing fix).
+ * 5.3–7.7 V on the flat top spans ~47 mA panel-side ≈ 2 PWM counts, so a
+ * landing point always exists, and any in-band point is ≥97 % of MPP. */
+#define PANEL_VREG_DEADBAND_MV    1200U
+
+/* PWM counts per regulation step. ONE count (~45 mA charge-side, ~25 mA
+ * panel-side — see deadband note) is already ~20 % of this array's MPP
+ * current. The previous 2-count step out-jumped the entire usable
+ * current window of the old ±400 mV band and could leap from "barely
+ * loaded" straight past the knee. Finer is not available; coarser
+ * cannot park. */
+#define PANEL_VREG_STEP           1
+
+/* Minimum spacing between regulation steps (ms). MUST be ≥ the panel-ADC
+ * moving-average group delay (~320 ms) or the loop accumulates dead-time
+ * overshoot and oscillates the panel across its I-V knee (the bench-log
+ * bounce — happens in EITHER sign direction). At 400 ms each step settles
+ * through the filter before the next observation. Convergence from V_oc
+ * to the setpoint is a handful of steps (≈1-2 s), then it holds. */
+#define PANEL_VREG_INTERVAL_MS    400UL
 
 /* =========================================================================
  * 3. BUCK CONVERTER (TPS56347)
@@ -126,6 +227,27 @@
 #define CC_DEADBAND_MA            25      /* ±25 mA around target before adjusting                */
 #define CC_PWM_STEP               1       /* PWM adjustment per regulation cycle                  */
 
+/* Charger activation headroom (mV added to V_bat when pre-positioning PWM
+ * on entry from CHG_INACTIVE). The buck-output LUT
+ * (output_voltages_buck_mV[]) targets the buck rail node, NOT the VCHG
+ * pin at the battery side of Q49 (CHG-switch P-FET, ~50 mΩ Rds_on).
+ * Pre-positioning to exactly V_bat leaves zero forward bias: the
+ * TPS564247 sees FB above its 0.6 V ref, drops duty, and its sync FETs
+ * reverse-pump inductor current into V_panel.
+ *
+ * But the headroom is also an instant CURRENT command: the charge path
+ * is only ~65 mΩ end-to-end, and the LUT-vs-reality zero-current offset
+ * measured +24 mV (May bench log: Ichg crossed 0 with the LUT target
+ * 24 mV above V_bat; slope ~45 mA per 2.9 mV count). The previous
+ * 200 mV pre-positioned a ~2.7 A demand — a guaranteed instant collapse
+ * of a 0.8 W panel at EVERY charge activation, which is what kept the
+ * IDLE↔CHG_ONLY bounce alive even after the vreg loop was paced. 50 mV
+ * clears the measured offset with ~2× margin (forward bias guaranteed)
+ * while commanding only ~400 mA: one paced panel-safety backoff step
+ * recovers that on a small panel, and on a stiff source it is simply a
+ * gentle starting current for the loop to ramp from. */
+#define CHG_ACTIVATION_HEADROOM_MV 50U
+
 /* CC down-step rate limit. The chg_current ADC uses a 64-sample moving
  * average at 10 ms tick → ~320 ms group delay. If CC steps pwm DOWN
  * (more current) every 50 ms tick, it will walk 6+ counts past the
@@ -142,32 +264,168 @@
 #define CV_PWM_STEP               1
 
 /* Panel safety: if V_panel drops below PANEL_SAFETY_MV during charging,
- * increase PWM (decrease duty) by this many steps to back off quickly. */
+ * increase PWM (decrease duty) by this many steps to back off quickly.
+ * Under CHARGER_INPUT_VREG this fires at most once per
+ * PANEL_VREG_INTERVAL_MS (see panel_safety_backoff in charger.c);
+ * 5 counts ≈ −215 mA of demand per step on the ~65 mΩ charge path. */
 #define PANEL_BACKOFF_STEP        5
 
+/* Reverse-current escape threshold (mA). chg_current more negative than
+ * −this means the buck rail is parked below V_bat and the sync FETs are
+ * pumping battery charge into the panel; cc_regulate then walks pwm DOWN
+ * by PANEL_BACKOFF_STEP per paced interval to lift the rail back above
+ * V_bat quickly instead of waiting on the 1-count V_panel loop. */
+#define CHG_REVERSE_CURRENT_MA    100
+
 /* =========================================================================
- * 6. MPPT TUNING (Incremental Conductance)
+ * 6. MPPT TUNING
  * =========================================================================
  *
- * MPPT perturbs the PWM to find the panel's maximum power point.
- * It uses adaptive step size: starts large, halves on direction reversals.
+ * Two trackers exist; CHARGER_INPUT_VREG selects which one is compiled:
  *
- * Convergence = step_size has reached 1 AND we've seen enough reversals.
- * At that point, we're oscillating around MPP with minimum perturbation.
+ *   =1 (current): SETPOINT-P&O. mppt.c perturbs the input-vreg setpoint
+ *      (ctx->mppt.vreg_setpoint_mv) and observes averaged delivered
+ *      charge current. The inner voltage loop (charger.c cc_regulate)
+ *      keeps exclusive PWM ownership and realises each setpoint — all
+ *      of its protections (pacing, panel backoff, reverse escape,
+ *      allowed_chg clamp) stay active while MPPT probes. Constants:
+ *      the MPPT_SP_* block below.
+ *
+ *   =0 (legacy): PWM-perturbing incremental conductance with adaptive
+ *      step. Kept for stiff-source bring-up / regression comparison.
+ *      Constants: MPPT_MAX_STEP_SIZE .. MPPT_STUCK_TICK_LIMIT below.
+ *      Known-unworkable on soft panels: one PWM count is ~20 % of a
+ *      small panel's MPP current, and the ~320 ms ADC lag makes dV/dI
+ *      attribution unreliable (see CHANGELOG / git history).
  */
+
+/* ── Setpoint-P&O (CHARGER_INPUT_VREG=1) ────────────────────────────────── */
+
+/* FOCV seed: Vmpp ≈ this % of Voc for crystalline silicon (textbook
+ * fractional-open-circuit-voltage constant, k ≈ 0.71–0.82; the 13 V
+ * bench panel measured ~0.82 at its knee). The seed only needs to be
+ * in the basin — the hill-climb refines it. Voc is captured from the
+ * unloaded panel reading on the activation tick (the panel idles
+ * unloaded at pwm=399 in IDLE, so that reading IS open-circuit). */
+#define MPPT_SP_FRACTION_PCT      76
+
+/* INITIAL setpoint perturbation per dwell (mV). Must move the parked
+ * operating point by clearly more than one PWM count so each probe
+ * produces a measurable current change: near the 13 V panel's knee one
+ * count moves V_panel ~400 mV (log: pwm 135→132 moved 12.22→10.91 V),
+ * and on the 4x array's flat top one count is ~1.2 V. 1000 mV ≈ 1–2.5
+ * counts of operating-point movement on both known plants.
+ *
+ * The step HALVES on each direction reversal down to MPPT_SP_STEP_MIN_MV
+ * (adaptive step, like the legacy tracker): coarse steps find the
+ * parkable region fast, fine steps then bracket the knee at sub-PWM-count
+ * resolution — a fixed 1 V step can over-jump the single best parkable
+ * count near a steep knee (simulation: cost ~10 % of MPP). */
+#define MPPT_SP_STEP_MV           1000U
+#define MPPT_SP_STEP_MIN_MV       250U
+
+/* Dwell timing. After moving the setpoint, the inner loop needs up to
+ * ~3 steps × PANEL_VREG_INTERVAL_MS (400 ms) to walk there, plus the
+ * 640 ms ADC moving-average window to settle — so 2 s of settle before
+ * the observation window opens. Then average chg_current over 1 s
+ * (20 ticks of the 64-sample MA) for the fitness comparison. Total
+ * cost: 3 s per probe, ~6–8 probes per tracking session. */
+#define MPPT_SP_SETTLE_MS         2000UL
+#define MPPT_SP_MEASURE_MS        1000UL
+
+/* Improvement threshold (mA) between dwell averages. Below this the two
+ * setpoints are considered equal-power: the tracker reverses instead of
+ * walking on noise — this is what makes it converge (not random-walk)
+ * on a flat power top, and freeze when the allowed_chg clamp (not the
+ * panel) is what bounds the current. ~1/3 of one PWM count's worth of
+ * battery-side current (45 mA/count). */
+#define MPPT_SP_MIN_DELTA_MA      15
+
+/* Direction reversals before declaring convergence → HOLD. Each flat or
+ * worse dwell counts one; with 3-s dwells, convergence from a good seed
+ * is ~3–5 dwells (~10–15 s). */
+#define MPPT_SP_CONVERGE_REVERSALS 3
+
+/* Hard runtime cap on one TRACKING session → HOLD with whatever we
+ * have. Generous: seed + full walk across the clamped setpoint range
+ * (≈5 steps) + reversals at 3 s each fits comfortably. */
+#define MPPT_SP_RUNTIME_MS        45000UL
+
+/* Setpoint floor (mV): keeps the regulation band's LOW edge
+ * (setpoint − PANEL_VREG_DEADBAND_MV) at least 500 mV above the
+ * PANEL_SAFETY_MV emergency backoff floor, preserving the original
+ * vreg-band ordering (band low 5300 > safety 4800). Evaluates to 6500. */
+#define MPPT_SP_MIN_MV            (PANEL_SAFETY_MV + PANEL_VREG_DEADBAND_MV + 500U)
+
+/* Setpoint ceiling guard (mV below captured Voc): the band TOP
+ * (setpoint + deadband) must stay meaningfully below Voc, or the inner
+ * loop can "park" at open circuit drawing zero current. Ceiling =
+ * Voc − this. 300 mV of real load below OC plus the band half-width. */
+#define MPPT_SP_VOC_GUARD_MV      (PANEL_VREG_DEADBAND_MV + 300U)
+
+/* Collapse blanking (ms) from dwell start. A probe below the panel's
+ * knee collapses V_panel (< PANEL_SAFETY_MV); the tracker must react
+ * (step the setpoint back up) but only ONCE per event — the collapsed
+ * reading persists through the 64-sample MA and the inner loop's paced
+ * backoff for ~1 s after the cause is removed, and re-acting on that
+ * stale tail would ratchet the setpoint up several bogus steps. 1200 ms
+ * ≈ 3 backoff intervals + filter delay. */
+#define MPPT_SP_COLLAPSE_BLANK_MS 1200UL
+
+/* HOLD duration before a periodic re-probe (longer than the legacy
+ * MPPT_HOLD_TIME_MS): under input-vreg an irradiance change mostly
+ * changes the CURRENT drawn at the held voltage, which the inner loop
+ * absorbs with no MPPT involvement — only slow Vmpp drift (temperature)
+ * and panel swaps need re-tracking. Each re-probe costs ~15 s at
+ * slightly suboptimal points and typically one bounded knee-test dip,
+ * so don't pay that every 30 s. Fast irradiance RISES are handled out
+ * of band: a collapse while parked (knee rose above the held band)
+ * exits HOLD immediately — see the HOLD collapse escape in mppt.c. */
+#define MPPT_SP_HOLD_TIME_MS      60000UL
+
+/* ── Legacy PWM-perturbing inc-conductance (CHARGER_INPUT_VREG=0) ──────── */
+
 #define MPPT_MAX_STEP_SIZE        8       /* initial PWM step per perturbation                    */
 #define MPPT_MIN_STEP_SIZE        1       /* smallest step (convergence threshold)                */
 #define MPPT_CONVERGE_REVERSALS   6       /* reversals at min step → declare converged            */
-#define MPPT_RUNTIME_MS           300     /* max time in TRACKING before forced exit to HOLD      */
-#define MPPT_HOLD_TIME_MS         30000UL /* wait time in HOLD before re-entering TRACKING        */
+
+/* Perturb/observe pacing. The panel ADCs (V, I) are 64-sample moving
+ * averages at the 10 ms ADC tick → ~640 ms window, ~320 ms group delay.
+ * If MPPT perturbs every 50 ms state-machine tick (as it did originally),
+ * it steps PWM ~6 times before the filter reflects even the first step —
+ * dV/dI are pure transient noise, and tracking parks at a garbage point
+ * (observed: mppt_limit collapsed to 47 mA against a ~126 mA MPP panel).
+ * Hold each perturbation at least one filter-settle window before the
+ * next observation. 400 ms > 320 ms group delay, with margin. */
+#define MPPT_STEP_INTERVAL_MS     400UL
+
+/* Max time in TRACKING before forced exit to HOLD. Must allow enough
+ * PACED steps to converge: descend MAX_STEP_SIZE→MIN (3 halvings) plus
+ * MPPT_CONVERGE_REVERSALS reversals ≈ 10-15 steps × MPPT_STEP_INTERVAL_MS.
+ * Was 300 ms (fine when perturbing every tick, far too short once paced). */
+#define MPPT_RUNTIME_MS           6000UL  /* ~15 paced steps                                     */
+#define MPPT_HOLD_TIME_MS         30000UL /* wait time in HOLD before re-entering TRACKING       */
 
 /* Charger settle window: after the charger activates from CHG_INACTIVE,
- * MPPT is blocked from entering TRACKING for this long. Lets the slow
- * CC regulator (CC_PWM_STEP=1) walk PWM down gradually from PWM_MIN_DUTY
- * before MPPT takes over with MAX_STEP_SIZE=8 — otherwise the first
- * MPPT step from "off" can slam the buck into a high-duty zone before
- * any current measurement comes back, especially with a stiff source. */
-#define CHARGER_MPPT_SETTLE_MS    1000UL
+ * MPPT is blocked from entering TRACKING for this long.
+ *
+ * Was 1000 ms: the old rationale was to let CC (CC_PWM_STEP=1) walk PWM
+ * down gradually from PWM_MIN_DUTY (399, off) before MPPT took over,
+ * since starting MPPT from "off" could slam the buck high-duty before a
+ * current reading returned. That rationale is now obsolete:
+ * activate_charger_region() PRE-POSITIONS pwm to a conducting value
+ * (V_bat + CHG_ACTIVATION_HEADROOM_MV), so the buck is already in the
+ * responsive range on tick 1 — MPPT does not have to wait for CC to
+ * descend.
+ *
+ * Lowered to 250 ms because on a soft (PV) source the long wait was
+ * fatal: CC chasing allowed_chg walks the panel past its MPP knee in
+ * ~2 down-steps (2 × CC_DOWNSTEP_INTERVAL_MS = 600 ms) and collapses
+ * V_panel before MPPT's settle window ever expires, so MPPT never
+ * engaged. 250 ms (5 ticks) lets MPPT grab PWM control BEFORE CC's
+ * first rate-limited down-step (at 300 ms) drags the panel down.
+ * HAS_SUN_CLEAR_COUNT covers any residual sag during this window. */
+#define CHARGER_MPPT_SETTLE_MS    250UL
 
 /* Stiff-source escape: while in TRACKING at MAX step, count how many
  * consecutive ticks have walked PWM in the same direction with no
@@ -182,6 +440,20 @@
  * If I_charge < allowed_chg - this margin, and has_sun,
  * the panel can't deliver what the budget allows → MPPT needed. */
 #define PANEL_LIMITED_MARGIN_MA   100
+
+/* MPPT limit cold-boot default. mppt_limit_ma constrains allowed_chg
+ * (see power_budget.c).
+ *
+ * With CHARGER_INPUT_VREG=1 the perturb/observe MPPT region is disabled,
+ * so this value is never updated by a TRACKING session — it is simply the
+ * static panel-side ceiling on allowed_chg. Set it to the buck hardware
+ * limit (BUCK_MAX_CURRENT_MA) so the *battery* intake limits in
+ * power_budget (precharge 200 mA, CV taper 200 mA, CC-zone 2 A) are what
+ * actually bound the current. The input-voltage loop in cc_regulate keeps
+ * the real drawn current at the panel's MPP, well under this ceiling on a
+ * soft source; on a stiff source the ceiling (via the battery limit) is
+ * what the current clamp enforces. */
+#define MPPT_LIMIT_DEFAULT_MA     BUCK_MAX_CURRENT_MA
 
 /* =========================================================================
  * 7. FAULT THRESHOLDS

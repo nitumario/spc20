@@ -1,3 +1,32 @@
+# [v0.18] - 12.06.26
+## Setpoint-P&O MPPT: per-panel MPP tracking on top of the input-vreg loop
+
+Changed files: `mppt.c`, `mppt.h`, `charger.c`, `energy_mode.c`, `measurements.c`, `system_types.h`, `hw_config.h`, `main.c`, `README.md`, `docs/MPPT_states.csv`, `docs/MPPT_transition_table.csv`
+
+### Why
+Bench log `1206_sp.log` (12.06.26, 13 V OC panel): the fixed `PANEL_VREG_SETPOINT_MV` (6500, measured MPP of the 4x array) put the regulation band top (7.7 V) below that panel's I-V knee (~10.9 V). The inner loop had no reachable operating point, walked the panel over the knee every ~8 s, collapsed it to 3.4 V, backed off, and repeated — a permanent collapse/recover sawtooth charging in bursts. The setpoint is a per-panel quantity; it now follows the panel.
+
+### NEW: outer P&O loop on the vreg setpoint (`mppt.c`, full rewrite for `CHARGER_INPUT_VREG=1`)
+- MPPT region repurposed: perturbs `ctx->mppt.vreg_setpoint_mv` (consumed by `cc_regulate` instead of the constant) and observes charge current averaged over paced dwells (2 s settle ≥ inner-loop walk + 640 ms ADC window, then 1 s average). It NEVER writes `ctx->pwm` — the inner voltage loop keeps exclusive PWM ownership, so pacing/backoff/reverse-escape/budget clamp stay active during probing. `mppt_owns_pwm()` is hard false in this mode.
+- FOCV seeding: Voc learned as a running max of the filtered panel voltage (the activation-tick reading races the 640 ms MA — capturing it raw seeded 8.5 V on a 13.3 V panel in simulation); seed `= 76 %·Voc − deadband`, deferred to the first settled dwell.
+- Adaptive probe step 1000→250 mV (halve per reversal, re-double per accept, re-probes start fine): a fixed 1 V step over-jumps the single best parkable PWM count near a steep knee (~10 % of MPP in simulation).
+- Collapse branch + dip classifier: V_panel below `PANEL_SAFETY_MV`, or below the band low edge during a measure window (band-hop whipsaw — dwell averages there are phase noise that random-walks P&O), pushes the setpoint up one step and raises a per-session floor so the cliff is tested at most once per session. Pushes don't count toward convergence (counting them could HOLD inside a whipsaw).
+- Convergence: ±15 mA noise gate turns flat dwells into reversals (no random walk on flat tops; freezes when `allowed_chg`, not the panel, binds); 3 reversals or the 45 s session cap → HOLD (60 s). Re-probe only while `panel_limited` and charger in PRECHARGE/CC — this is the upward re-probe path that was missing since the stage-2 mppt_limit fix. Collapse while parked (knee rose above the held band) escapes HOLD immediately, paced and only if the step can move.
+- Verified in a host-side closed-loop simulation (real `mppt.c` + `charger.c` against a modeled panel/buck/ADC plant): 13 V panel parks at the quantization-limited optimum (89 % of ideal incl. startup, collapse events 127→10 per 6 min vs the naive tracker), stiff source regulates at the budget clamp with no fault, cloud step re-converges.
+
+### CHANGED: preserve learned panel capability + debounced `has_sun` clear (`energy_mode.c`, `measurements.c`, `system_types.h`, `hw_config.h`)
+- `deactivate_charger_region()` no longer resets `mppt.state` or `mppt_limit_ma` — the learned panel limit (and now `vreg_setpoint_mv`) survives a brief EM teardown. Previously a momentary bounce released `allowed_chg` to `BUCK_MAX`, the buck overloaded the panel, `V_panel` collapsed below `PANEL_MIN_CLEAR_MV`, `has_sun` cleared, EM dropped to IDLE, and the system oscillated. State transitions are now left to `mppt_update()` on its next tick; `ctx_init()` seeds `mppt_limit_ma = MPPT_LIMIT_DEFAULT_MA`.
+- `activate_charger_region()` pre-positions `ctx->pwm` to `set_charging_voltage(V_bat + CHG_ACTIVATION_HEADROOM_MV)` (50 mV) so the buck enters conduction with positive forward bias on tick 1 — avoids the TPS564247 sync-FET reverse-pump and the CC slow-walk that stranded MPPT on a non-conducting buck.
+- `debounce_update()` gains a `clear_threshold`: a set flag now needs `clear_threshold` consecutive clear readings to un-latch (and the set path resets `count` on latch). `has_sun` uses `>1` so a transient `V_panel` sag (MPPT perturbation, activation inrush, CC briefly over-driving the panel) no longer tears the charger down; `bat_low` keeps `1` for immediate recovery un-latch.
+
+### CHANGED
+- `cc_regulate` targets `ctx->mppt.vreg_setpoint_mv`; `PANEL_VREG_SETPOINT_MV` is now only the cold-boot fallback.
+- Telemetry: new `sp` column (live vreg setpoint, mV) between `pwm` and `fault` — log lines are now 29 columns.
+- Legacy PWM-perturbing inc-conductance retained verbatim under `CHARGER_INPUT_VREG=0` (both configurations compile).
+- NOTE: with this build, `MPPT: OFF -> TRK` lines under `CHARGER_INPUT_VREG=1` are EXPECTED — the previous "stale-build tell" is inverted.
+
+---
+
 # [v0.17] - 29.04.26
 ## Bring-up diagnostics: boot banner, transition log, sticky fault history, 1 KB stack
 

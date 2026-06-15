@@ -1,11 +1,13 @@
 PRIORITY,FROM,GUARD,TO,NOTES
-1,DISABLED,panel_limited AND has_sun,TRACKING,panel is limiting — start optimization
+1,DISABLED,charging AND has_sun,TRACKING,"activation: learn Voc (running max), seed FOCV at first settled dwell, climb"
 2,DISABLED,<default>,DISABLED,stay
 1,TRACKING,!has_sun,DISABLED,safety first — sun lost kills tracking immediately
-2,TRACKING,converged (step_size == 1 AND reversals > 6),HOLD,algorithm converged
-3,TRACKING,timeout (MPPT_RUNTIME expired),HOLD,time limit reached
-4,TRACKING,<default>,TRACKING,continue tracking
-1,HOLD,!panel_limited,DISABLED,"FIXED: was '!panel_limited AND panel_limited' (contradiction). Panel no longer limiting — MPPT not needed"
-2,HOLD,hold_time expired AND panel_limited AND has_sun,TRACKING,time to re-track — added has_sun guard for safety
-3,HOLD,!has_sun,DISABLED,sun lost — disable
+2,TRACKING,charger in CV,HOLD,cv_regulate ignores the setpoint — freeze it for a later CC return
+3,TRACKING,reversals >= MPPT_SP_CONVERGE_REVERSALS,HOLD,converged (noise-gated flats and boundary flips count; collapse/dip pushes do not)
+4,TRACKING,MPPT_SP_RUNTIME_MS expired,HOLD,session cap
+5,TRACKING,<default>,TRACKING,continue dwells
+1,HOLD,!has_sun,DISABLED,sun lost — disable
+2,HOLD,"V_panel < PANEL_SAFETY_MV (blanked MPPT_SP_COLLAPSE_BLANK_MS, only if the +step actually moves)",TRACKING,collapse escape: knee rose above the held band (sun got brighter) — step up and re-converge
+3,HOLD,hold expired AND panel_limited AND charger in PRECHARGE/CC,TRACKING,periodic re-probe — the upward path that recovers capability after clouds pass
 4,HOLD,<default>,HOLD,wait
+"NOTE: setpoint-P&O tracker (CHARGER_INPUT_VREG=1). The legacy PWM-perturbing table (CHARGER_INPUT_VREG=0) is preserved in README.md, MPPT algorithm, legacy section.",,,,

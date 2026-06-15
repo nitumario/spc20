@@ -78,7 +78,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.17\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.18\r\n"
                 "==============================================\r\n");
 }
 
@@ -91,7 +91,7 @@ static void log_header(void)
         "Tbat Tboard "
         "bat_low has_sun has_load temp_ok p_limited bat_full "
         "i_buck_max allowed_chg "
-        "EM CHG MPPT pwm fault flt_hist\r\n"
+        "EM CHG MPPT pwm sp fault flt_hist\r\n"
     );
 }
 
@@ -162,14 +162,15 @@ static void log_state_transitions(uint32_t now,
  *  24  charger.state       (name: OFF/PRE/CC/CV)
  *  25  mppt.state          (name: OFF/TRK/HLD)
  *  26  pwm
- *  27  fault.code          (hex)
- *  28  fault.history       (hex)
+ *  27  mppt.vreg_setpoint_mv (mV — live input-vreg target, owned by MPPT)
+ *  28  fault.code          (hex)
+ *  29  fault.history       (hex)
  */
 static void log_measurements(void)
 {
     measurements_t *m = &ctx.meas;
     int len = snprintf(uart_buf, UART_BUF_SIZE,
-        "%lu %u %u %u %u %u %u %u %d %u %ld %ld %d %d %u %u %u %u %u %u %u %u %s %s %s %u %04X %04X\r\n",
+        "%lu %u %u %u %u %u %u %u %d %u %ld %ld %d %d %u %u %u %u %u %u %u %u %s %s %s %u %u %04X %04X\r\n",
         (unsigned long)time_now(),
         m->bat_voltage, m->chg_voltage, m->out_voltage,
         m->panel_voltage, m->usb1_voltage, m->usb2_voltage,
@@ -183,7 +184,7 @@ static void log_measurements(void)
         em_state_name(ctx.energy_mode),
         chg_state_name(ctx.charger.state),
         mppt_state_name(ctx.mppt.state),
-        ctx.pwm, ctx.fault.code, ctx.fault.history);
+        ctx.pwm, ctx.mppt.vreg_setpoint_mv, ctx.fault.code, ctx.fault.history);
     if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
 }
 /* =========================================================================
@@ -330,6 +331,19 @@ int main(void)
      * the first apply_pwm() at step 8.
      */
     set_buck_pwm(PWM_MIN_DUTY);
+
+    /*
+     * BUCK_DIS has no initialValue in SPC_20.syscfg, so SysConfig leaves the
+     * pin CLEARED at reset — which is the *enabled* polarity for the buck
+     * controller. The FSM boots in EM_IDLE without a transition, so
+     * enter_idle() (which would call disable_input_buck()) never runs at
+     * startup. Without this explicit assert, the buck IC is awake and
+     * switching at PWM_MIN_DUTY from the moment system_init() returns; even
+     * at ~0.25% on-time the minimum-on-time pulses pull enough average
+     * current through the inductor to collapse a connected solar panel
+     * (observed: 10 V OC → 4.2 V under buck loading, MCU stuck in EM_IDLE).
+     */
+    disable_input_buck();
 
     timer_init();      /* SysTick @ 1 ms */
     buttons_init();

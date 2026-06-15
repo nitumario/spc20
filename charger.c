@@ -12,12 +12,19 @@
  *   3. Evaluate in-state transition guards (V_bat thresholds, taper
  *      completion, precharge timeout).
  *   4. Regulate ctx->pwm:
- *        - Panel-safety first: if V_panel < 10 V, back off by
- *          PANEL_BACKOFF_STEP and skip the rest of regulation.
- *        - If MPPT is TRACKING, skip regulation (MPPT owns PWM).
- *        - Otherwise step pwm by CC_PWM_STEP / CV_PWM_STEP toward the
- *          target, using CC_DEADBAND_MA / CV_DEADBAND_MV as a stability
- *          band.
+ *        - Panel-safety first: if V_panel < PANEL_SAFETY_MV, back off by
+ *          PANEL_BACKOFF_STEP and skip the rest of regulation (a hard
+ *          emergency floor below the regulation band).
+ *        - If MPPT is TRACKING, skip regulation (MPPT owns PWM). With
+ *          CHARGER_INPUT_VREG=1 this NEVER fires: the setpoint-P&O MPPT
+ *          owns only the vreg setpoint, and this inner loop keeps PWM
+ *          ownership at all times (it is the muscle that realises each
+ *          MPPT probe).
+ *        - Bulk (PRECHARGE/CC): cc_regulate. Under CHARGER_INPUT_VREG it
+ *          holds V_panel at ctx->mppt.vreg_setpoint_mv (clamped by
+ *          allowed_chg); otherwise it's the legacy fixed-current CC loop.
+ *        - CV: cv_regulate steps pwm by CV_PWM_STEP toward BAT_CV_VOLTAGE_MV
+ *          using CV_DEADBAND_MV as a stability band.
  *
  * PWM continuity
  * --------------
@@ -31,8 +38,15 @@
  * ---------------
  * - Lower pwm value  = higher duty cycle = more buck output current.
  * - Higher pwm value = lower duty cycle  = less current (pwm=399 → off).
- * - To INCREASE charge current: pwm -= step.
- * - To DECREASE charge current: pwm += step.
+ * - To INCREASE charge current (pull V_panel DOWN): pwm -= step.
+ * - To DECREASE charge current (let V_panel RISE):  pwm += step.
+ *
+ * This is dispositive (do NOT be misled by pwm↔current correlations read
+ * off a bouncing/limit-cycling log — those are sampling artifacts and can
+ * appear with either slope): PWM_MIN_DUTY = 399 is the OFF state (boot and
+ * deactivate park pwm there; at IDLE pwm=399, Ichg=0), so turning the buck
+ * ON necessarily moves pwm DOWN. Confirmed by the clean IDLE→CHG step
+ * (pwm 399→46, Ichg 0→144) and the descending output_voltages_buck_mV LUT.
  *
  * Units
  * -----
@@ -112,36 +126,173 @@ static void enter_cv(system_ctx_t *ctx)
 
 /*
  * panel_safety_backoff — if V_panel has collapsed below PANEL_SAFETY_MV
- * we are drawing too much current from the panel. Quickly reduce duty
- * (pwm += several) and skip regulation. Returns true if backoff fired.
+ * we are drawing too much current from the panel. Quickly reduce current
+ * (pwm += several, toward the PWM_MIN_DUTY=399 off state) and skip
+ * regulation. Returns true if backoff fired.
  *
- * This runs BEFORE the MPPT check so we protect the panel even during
- * MPPT TRACKING perturbations that might have pushed it over the edge.
+ * This is a one-sided EMERGENCY floor *below* the cc_regulate setpoint
+ * band (PANEL_SAFETY_MV 4800 < band low edge 5300), so with the loop
+ * parked on the panel's power plateau it never fires.
+ *
+ * Under CHARGER_INPUT_VREG it is PACED to PANEL_VREG_INTERVAL_MS via the
+ * shared regulation timer. V_panel lags ~320 ms through the ADC moving
+ * average, so the original fire-every-tick version kept stepping ~6 ticks
+ * past the true recovery point (+30 counts ≈ 1.3 A of demand removed on
+ * the ~65 mΩ path) — parking the buck rail far BELOW V_bat, i.e. deep in
+ * the reverse-pump zone. The May bench log shows the result: Ichg
+ * −1010 mA with V_panel pushed to 14.1 V, ABOVE open-circuit, climbing
+ * toward the TPS564247's ~17 V input ceiling. One +5 step per settle
+ * window (~215 mA of demand cut) is still the strongest actor in the
+ * loop and clears a collapse in 1–2 intervals without the overshoot.
+ * While a collapse reading persists between paced steps we still return
+ * true, suppressing the regulator (never step toward MORE current on a
+ * collapsed-panel reading).
+ *
+ * Runs BEFORE the MPPT check so the panel is protected even during MPPT
+ * TRACKING perturbations (when CHARGER_INPUT_VREG=0, where it keeps the
+ * legacy every-tick behaviour).
  */
 static bool panel_safety_backoff(system_ctx_t *ctx)
 {
-    if (ctx->meas.panel_voltage < PANEL_SAFETY_MV) {
-        pwm_step(ctx, PANEL_BACKOFF_STEP);  /* reduce current aggressively */
-        return true;
-    }
-    return false;
+    if (ctx->meas.panel_voltage >= PANEL_SAFETY_MV)
+        return false;
+
+#if CHARGER_INPUT_VREG
+    uint32_t now = time_now();
+    if ((now - ctx->charger.cc_last_downstep_ms) < PANEL_VREG_INTERVAL_MS)
+        return true;   /* collapse reading: hold PWM, wait out the filter */
+    ctx->charger.cc_last_downstep_ms = now;
+#endif
+
+    pwm_step(ctx, +PANEL_BACKOFF_STEP);  /* reduce current → V_panel recovers */
+    return true;
 }
 
 /*
  * mppt_owns_pwm — the charger yields PWM control while MPPT is actively
  * perturbing. Transition checks above still run; only the regulator
  * step is skipped.
+ *
+ * Under CHARGER_INPUT_VREG this is ALWAYS false: the setpoint-P&O MPPT
+ * perturbs ctx->mppt.vreg_setpoint_mv and relies on cc_regulate to
+ * realise each probe — yielding here during TRACKING would freeze the
+ * plant at whatever pwm the dwell started with and the tracker would
+ * observe nothing. Only the legacy PWM-perturbing tracker takes PWM.
  */
 static inline bool mppt_owns_pwm(const system_ctx_t *ctx)
 {
+#if CHARGER_INPUT_VREG
+    (void)ctx;
+    return false;
+#else
     return (ctx->mppt.state == MPPT_TRACKING);
+#endif
 }
 
 /*
- * cc_regulate — bang-bang regulator with deadband on ctx->meas.chg_current
- * toward ctx->allowed_chg. Called from both PRECHARGE and CC states
- * because their regulation is identical — the "precharge" nature is
- * enforced by power_budget clamping allowed_chg to ≤200 mA below 3 V.
+ * cc_regulate — bulk-charge regulator. Called from both PRECHARGE and CC
+ * states (their regulation is identical; the "precharge" nature is
+ * enforced by power_budget clamping allowed_chg to ≤200 mA below 3 V).
+ *
+ * Two implementations, selected by CHARGER_INPUT_VREG (hw_config.h):
+ */
+#if CHARGER_INPUT_VREG
+/*
+ * INPUT-VOLTAGE-REGULATED bulk charging ("constant-voltage MPPT").
+ *
+ * Hold V_panel at ctx->mppt.vreg_setpoint_mv (the panel's MPP voltage,
+ * owned and hill-climbed by the outer MPPT loop in mppt.c). The current
+ * drawn is then whatever the panel delivers at that voltage, which IS
+ * the MPP current — no fixed current target to chase, so the loop
+ * cannot command more than the panel can give and walk it off the
+ * I-V knee.
+ *
+ * Priority:
+ *   1. Battery-intake clamp (hard): if chg_current exceeds allowed_chg,
+ *      reduce current regardless of V_panel. allowed_chg already encodes
+ *      the precharge trickle / CC-zone / CV-taper limits (power_budget).
+ *   2. Panel-voltage loop: otherwise steer V_panel toward the setpoint.
+ *
+ * PWM sign (the structural truth, NOT the limit-cycle correlation that
+ * misled an earlier attempt): pwm = PWM_MIN_DUTY (399) is the off/idle
+ * state, so turning the buck ON and drawing current means pwm goes DOWN.
+ *   - To DRAW MORE current / pull V_panel DOWN: pwm -= step.
+ *   - To DRAW LESS current / let V_panel RISE:  pwm += step.
+ * (Confirmed by the clean IDLE→CHG transition pwm 399→46 / Ichg 0→144,
+ *  and the descending output_voltages_buck_mV calibration LUT.)
+ *
+ * LOOP PACING — critical. The panel ADCs are 64-sample moving averages
+ * (~320 ms group delay). Stepping every 50 ms tick gives the loop ~6
+ * ticks of dead time, so it overshoots the setpoint by ~6 steps before
+ * the feedback arrives — and on the steep panel I-V curve that overshoot
+ * swings V_panel from ~8 V clear down past the knee to ~3.4 V and back,
+ * a violent limit cycle that (in EITHER sign) collapses the panel and
+ * clears has_sun. So we take at most ONE step per PANEL_VREG_INTERVAL_MS
+ * (≥ the ADC settle time): each step's effect is observed before the
+ * next, and the loop converges monotonically to the setpoint with no
+ * overshoot. Negative feedback on a monotonic plant (more current →
+ * lower V_panel), stable from either side of the MPP.
+ *
+ * On a stiff source V_panel never falls to the setpoint, so the loop just
+ * keeps drawing more until clamp 1 (allowed_chg) catches it — i.e. it
+ * degrades to classic current-limited CC with no special-casing.
+ */
+static void cc_regulate(system_ctx_t *ctx)
+{
+    /* Pace to the ADC settle time — see the dead-time note above. The
+     * timer (cc_last_downstep_ms) is armed on charger activation, so the
+     * first step lands one interval after bring-up, by which point the
+     * lagged V_panel reading reflects the pre-positioned operating point
+     * rather than the stale open-circuit voltage from the IDLE phase. */
+    uint32_t now = time_now();
+    if ((now - ctx->charger.cc_last_downstep_ms) < PANEL_VREG_INTERVAL_MS)
+        return;
+    ctx->charger.cc_last_downstep_ms = now;
+
+    int32_t i_chg    = (int32_t)ctx->meas.chg_current;
+    int32_t i_limit  = (int32_t)ctx->allowed_chg;
+    int32_t v_panel  = (int32_t)ctx->meas.panel_voltage;
+
+    /* Clamp 0: reverse-current escape. Negative chg_current means the
+     * buck rail is parked BELOW V_bat and the sync FETs are pumping
+     * battery charge into the panel — which can push V_panel above
+     * open-circuit toward the TPS564247 input ceiling. The V_panel loop
+     * below does walk out of this state on its own (panel reads high →
+     * pwm DOWN), but only at PANEL_VREG_STEP per interval — seconds of
+     * sustained reverse current after a backoff overshoot. Escape at the
+     * backoff rate instead. Same direction the V loop would pick, so the
+     * two can never fight. */
+    if (i_chg < -(int32_t)CHG_REVERSE_CURRENT_MA) {
+        pwm_step(ctx, -PANEL_BACKOFF_STEP);
+        return;
+    }
+
+    /* Clamp 1: never exceed the battery's allowed intake. Over-current
+     * always wins → reduce current → pwm UP (toward off). */
+    if (i_chg > i_limit + CC_DEADBAND_MA) {
+        pwm_step(ctx, +PANEL_VREG_STEP);
+        return;
+    }
+
+    /* Clamp 2: regulate the panel to the MPP setpoint. The target is the
+     * LIVE per-panel value owned by the outer MPPT loop (seeded from
+     * 0.76·Voc at activation, then hill-climbed — see mppt.c), NOT the
+     * static PANEL_VREG_SETPOINT_MV, which is only its cold-boot seed. */
+    int32_t v_sp = (int32_t)ctx->mppt.vreg_setpoint_mv;
+    if (v_panel < v_sp - (int32_t)PANEL_VREG_DEADBAND_MV) {
+        /* Sagging below MPP → drawing too much → DRAW LESS (pwm UP) → V recovers. */
+        pwm_step(ctx, +PANEL_VREG_STEP);
+    } else if (v_panel > v_sp + (int32_t)PANEL_VREG_DEADBAND_MV) {
+        /* Above MPP with current-headroom (clamp 1 didn't fire) → DRAW MORE (pwm DOWN) → V falls. */
+        pwm_step(ctx, -PANEL_VREG_STEP);
+    }
+    /* Within the deadband around the MPP → stable, hold PWM. */
+}
+#else
+/*
+ * Legacy fixed-current CC: bang-bang on chg_current toward allowed_chg.
+ * Open-loop unstable on a soft PV source (see CHARGER_INPUT_VREG notes);
+ * retained for stiff-source bring-up / regression comparison.
  */
 static void cc_regulate(system_ctx_t *ctx)
 {
@@ -173,10 +324,13 @@ static void cc_regulate(system_ctx_t *ctx)
     }
     /* Within deadband: stable, no change. */
 }
+#endif /* CHARGER_INPUT_VREG */
 
 /*
  * cv_regulate — regulate on V_bat around [BAT_CV_VOLTAGE_MV,
- * BAT_CV_VOLTAGE_MV + CV_DEADBAND_MV] (3650 … 3655 mV).
+ * BAT_CV_VOLTAGE_MV + CV_DEADBAND_MV] (3650 … 3655 mV). Sign is correct
+ * per the file-header convention (lower pwm = more current): V_bat below
+ * target → pwm -= step (more current pulls it up); above → pwm += step.
  */
 static void cv_regulate(system_ctx_t *ctx)
 {

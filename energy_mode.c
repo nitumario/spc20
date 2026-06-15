@@ -86,9 +86,13 @@ static void deactivate_charger_region(system_ctx_t *ctx)
     ctx->charger.bat_full_timing = false;
     ctx->charger.bat_full_signaled = false;
 
-    /* MPPT → DISABLED, remove panel constraint */
-    ctx->mppt.state = MPPT_DISABLED;
-    ctx->mppt.mppt_limit_ma = BUCK_MAX_CURRENT_MA;
+    /* MPPT: state transitions are handled by mppt_update() seeing
+     * !charging on its next tick. We DO NOT reset mppt_limit_ma here.
+     * The learned panel capability must survive across brief EM
+     * bounces — otherwise the next reactivation releases allowed_chg
+     * to BUCK_MAX, the buck overloads the panel, V_panel collapses
+     * below PANEL_MIN_CLEAR_MV, has_sun clears, EM goes back to IDLE,
+     * and we oscillate. See mppt_limit_ma comment in system_types.h. */
 
     /* bat_full is a system-level flag consumed by energy_mode.
      * Clear it when charger is deactivated — a new charge cycle
@@ -110,6 +114,30 @@ static void activate_charger_region(system_ctx_t *ctx)
 {
     if (ctx->charger.state != CHG_INACTIVE)
         return;  /* already active — don't reset mid-charge */
+
+    /*
+     * Pre-position PWM to the LUT entry that produces ≈ V_bat +
+     * CHG_ACTIVATION_HEADROOM_MV at the buck rail, so the converter
+     * enters conduction with positive forward bias across Q49 on the
+     * very first tick. Without the headroom the buck would target
+     * VCHG = V_bat exactly, the TPS564247 sync FETs would reverse-pump
+     * inductor current into V_panel, and CC_DOWNSTEP_INTERVAL_MS would
+     * prevent CC from escaping before reverse current accumulates.
+     * See CHG_ACTIVATION_HEADROOM_MV in hw_config.h for the full
+     * physics rationale.
+     *
+     * Without any pre-position at all, ctx->pwm is held at PWM_MIN_DUTY
+     * (399, ~0.25% duty) by deactivate_charger_region(), CC walks it
+     * down one count per CC_DOWNSTEP_INTERVAL_MS (≈40 s from 399 to a
+     * conducting duty), the MPPT settle gate expires mid-walk, and
+     * MPPT engages on a non-conducting buck — parking mppt_limit_ma
+     * at a phantom ~12 mA that zeros allowed_chg and deadlocks CC.
+     *
+     * set_charging_voltage() also writes the timer register as a
+     * side-effect, but that's harmless: apply_pwm() at step 8 will
+     * re-commit ctx->pwm this tick anyway.
+     */
+    ctx->pwm = set_charging_voltage(ctx->meas.bat_voltage + CHG_ACTIVATION_HEADROOM_MV);
 
     enable_input_buck();
     enable_charge_switch();
