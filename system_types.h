@@ -494,6 +494,9 @@ typedef struct {
      */
     debounce_flag_t flag_bat_low;    /* V_bat < BAT_LOW_MV                  */
     debounce_flag_t flag_has_sun;    /* V_panel > PANEL_MIN_MV (debounced)  */
+    uint32_t has_sun_relock_ms;      /* suppress has_sun re-set until time_now() reaches this;
+                                      * armed when a panel-power clear fires (flags_update) so a
+                                      * dead-but-floating panel can't re-arm the charger instantly */
     bool has_load;                   /* I_dsg > LOAD_DETECT_MA (hysteresis) */
     bool bat_full;                   /* charger signaled taper complete     */
     bool panel_limited;              /* I_chg < allowed_chg - margin AND sun */
@@ -532,7 +535,18 @@ typedef struct {
      *   - button state (short press, long press)
      *   - LED bar display mode
      *   - battery percentage display state
+     *
+     * Lamp switches — user intent for the two MCU-controllable LED-output
+     * lamps, toggled by main()'s lamp_buttons_update():
+     *   lamp_on[0] = lamp 1 (LEDCTRL1 / LED1, driven by BTN1)
+     *   lamp_on[1] = lamp 2 (LEDCTRL2 / LED2, driven by BTN2)
+     * Only LEDCTRL1/2 reach the MCU; the other LED channels (LEDCTRL3/4) are
+     * not routed to it and stay at their hardwired reference. energy_mode
+     * still owns the shared LED boost + output switch, so a lamp physically
+     * lights only when its intent is true AND the rail is up (e.g. not shed
+     * in SAFE_MODE).
      */
+    bool lamp_on[2];
 
 } system_ctx_t;
 
@@ -597,9 +611,15 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->flag_has_sun.count = 0;
     ctx->flag_has_sun.count_threshold = HAS_SUN_DEBOUNCE_COUNT;
     ctx->flag_has_sun.clear_threshold = HAS_SUN_CLEAR_COUNT;
+    ctx->has_sun_relock_ms = 0;      /* no lockout at boot — probe the panel immediately */
 
     /* Assume temperature OK until first measurement */
     ctx->temp_charge_ok = true;
+
+    /* Both lamp groups default ON, mirroring the boot LED-current arming in
+     * main(). The two front-panel buttons toggle these at runtime. */
+    ctx->lamp_on[0] = true;
+    ctx->lamp_on[1] = true;
 }
 
 /* =========================================================================

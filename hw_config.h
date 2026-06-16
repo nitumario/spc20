@@ -92,6 +92,23 @@
  * 30 ticks = 1.5 s rides that out; a real sunset still tears the charger
  * down within ~1.5 s, which is plenty fast. */
 #define HAS_SUN_CLEAR_COUNT       30
+/* "Usable sun" power floor. While the charger is actively loading the panel
+ * (energy mode CHARGE_ONLY / CHARGE_AND_LOAD), if panel output power stays
+ * below this for HAS_SUN_CLEAR_COUNT ticks, has_sun clears even though
+ * V_panel may still float near Voc. Catches the dead-but-floating panel at
+ * dusk: the charger backs all the way off (PWM rails at PWM_MIN_DUTY), the
+ * unloaded panel sits at ~Voc (> PANEL_MIN_MV) so the voltage-only clear
+ * never fires, yet P_panel ≈ 0 and the battery bleeds out through the
+ * housekeeping boosts. Must be well below any real charging power (a few
+ * hundred mW even during CV taper / precharge trickle) so it never
+ * false-trips a healthy charge — the 1.5 s clear COUNT rides out transients. */
+#define PANEL_USABLE_MIN_MW       200
+/* After a panel-power clear of has_sun, suppress the V_panel-based re-set for
+ * this long so we re-probe the panel roughly once a minute instead of
+ * hammering the charger on/off every ~1.6 s — the unloaded panel floats back
+ * above PANEL_MIN_MV the instant we stop loading it, which would otherwise
+ * re-set has_sun immediately and re-activate the buck. Mirrors MPPT HOLD. */
+#define HAS_SUN_RELOCK_MS         60000UL
 /* Emergency floor: regulation backs off hard below this. Must be BELOW the
  * vreg band low edge (setpoint − deadband = 5300 mV) so it never fires while
  * the loop holds the panel on its power plateau, and ABOVE the has_sun clear
@@ -201,6 +218,14 @@
  * to duty=1 (rail clamps to its top of ~11.3 V), which is the validated
  * operating point. */
 #define LED_BOOST_TARGET_MV       11500
+
+/* Drive current when a button-controlled lamp (LEDCTRL1/LEDCTRL2) is switched
+ * ON. Lands on the 145/155 mA LUT bins (output_currents_led_mA), well under
+ * the 350 mA per-channel hardware max. Switching a lamp OFF commands 0 mA,
+ * which set_led_current() drives to a true 0 % LEDCTRL duty (compare=period
+ * on the inverted-polarity channel, zero reference, zero current — the LUT
+ * path can't reach off, see that fn). */
+#define LAMP_ON_CURRENT_MA        150
 
 /* =========================================================================
  * 4. LOAD DETECTION

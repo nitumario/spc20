@@ -1005,18 +1005,38 @@ void set_led_voltage(uint16_t voltage){
  * Sets LED output current for the selected LED channel using a current LUT.
  */
 void set_led_current(uint16_t current, LED_OUTPUT led){
-    uint16_t duty_cycle_index = binary_search_closest_ascending(current, output_currents_led_mA, MAX_DUTY_CYCLES_LED);
+    const PWM_Config *ch = (led == LED1) ? &_pwm_outputs[2]
+                         : (led == LED2) ? &_pwm_outputs[3]
+                         : (const PWM_Config *)0;
+    if (ch == (const PWM_Config *)0) return;
 
-    switch (led){
-        case LED1:
-            set_pwm_duty_cycle(&_pwm_outputs[2], duty_cycles_led[duty_cycle_index]);
-            break;
-        case LED2:
-            set_pwm_duty_cycle(&_pwm_outputs[3], duty_cycles_led[duty_cycle_index]);
-            break;
-        default:
-            break;
+    /*
+     * current == 0 means "lamp off". These LEDCTRL channels (TIMA0/TIMA1,
+     * edge-align, period = 100) drive a filtered current reference whose LED
+     * current falls as the PWM high-fraction rises — empirically:
+     *   compare ~1  -> ~0% high  -> MAX current (runaway/brightest)
+     *   compare 85  -> 85% high  -> ~150 mA
+     *   compare 99  -> 99% high  -> ~15 mA (LUT floor, faint glow)
+     *   compare 100 -> 100% high -> 0 mA (truly off)
+     * The normal LUT path can't reach off: scale_duty_cycle() floors duty at
+     * 1, so the smallest compare it writes is (100 - 99) = 1 and the dimmest
+     * is (100 - 1) = 99 (~15 mA). True off needs compare = period (100),
+     * which is also how SysConfig initialises the buck channel's idle state
+     * (PWM_VCHG compare = its period 400, see ti_msp_dl_config.c).
+     *
+     * The old code wrote compare 0 here, thinking that held the pin low. It
+     * does the opposite: compare 0 = ~0% high = MAX reference = full
+     * brightness, which is why "off" used to run away bright.
+     */
+    if (current == 0) {
+        DL_TimerG_stopCounter(ch->TIMER);
+        DL_TimerG_setCaptureCompareValue(ch->TIMER, 100, ch->CC_INDEX);
+        DL_TimerG_startCounter(ch->TIMER);
+        return;
     }
+
+    uint16_t duty_cycle_index = binary_search_closest_ascending(current, output_currents_led_mA, MAX_DUTY_CYCLES_LED);
+    set_pwm_duty_cycle(ch, duty_cycles_led[duty_cycle_index]);
 }
 
 /* ============================================================================

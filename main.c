@@ -78,21 +78,8 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.18\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.19\r\n"
                 "==============================================\r\n");
-}
-
-static void log_header(void)
-{
-    send_string(
-        "ms "
-        "Vbat Vchg Vout Vpanel Vusb1 Vusb2 "
-        "Ipanel Ichg Idsg Ppanel Ibat_net "
-        "Tbat Tboard "
-        "bat_low has_sun has_load temp_ok p_limited bat_full "
-        "i_buck_max allowed_chg "
-        "EM CHG MPPT pwm sp fault flt_hist\r\n"
-    );
 }
 
 /*
@@ -134,7 +121,9 @@ static void log_state_transitions(uint32_t now,
 }
 
 /*
- * Values-only telemetry. One line per tick, space-separated, in this order:
+ * Per-tick telemetry. One line per tick, space-separated, with each
+ * value prefixed by a "label:" tag so the line is self-describing
+ * (e.g. "ms:34270 Vbat:3200 ..."). Fields, in order:
  *
  *   1  time_ms
  *   2  bat_voltage         (mV)
@@ -170,7 +159,12 @@ static void log_measurements(void)
 {
     measurements_t *m = &ctx.meas;
     int len = snprintf(uart_buf, UART_BUF_SIZE,
-        "%lu %u %u %u %u %u %u %u %d %u %ld %ld %d %d %u %u %u %u %u %u %u %u %s %s %s %u %u %04X %04X\r\n",
+        "ms:%lu Vbat:%u Vchg:%u Vout:%u Vpanel:%u Vusb1:%u Vusb2:%u "
+        "Ipanel:%u Ichg:%d Idsg:%u Ppanel:%ld Ibat_net:%ld "
+        "Tbat:%d Tboard:%d "
+        "bat_low:%u has_sun:%u has_load:%u temp_ok:%u p_limited:%u bat_full:%u "
+        "i_buck_max:%u allowed_chg:%u "
+        "EM:%s CHG:%s MPPT:%s pwm:%u sp:%u fault:%04X flt_hist:%04X\r\n",
         (unsigned long)time_now(),
         m->bat_voltage, m->chg_voltage, m->out_voltage,
         m->panel_voltage, m->usb1_voltage, m->usb2_voltage,
@@ -208,6 +202,44 @@ static void apply_pwm(system_ctx_t *c)
     if (pwm > PWM_MIN_DUTY) pwm = PWM_MIN_DUTY;   /* ceil  at 399 */
 
     set_buck_pwm(pwm);
+}
+
+/* =========================================================================
+ * LAMP BUTTON HANDLER
+ * =========================================================================
+ *
+ * The two front-panel buttons each toggle one LED-output lamp:
+ *
+ *   BTN1 (BUTTONS[0]) -> LEDCTRL1 (LED1) -> lamp 1
+ *   BTN2 (BUTTONS[1]) -> LEDCTRL2 (LED2) -> lamp 2
+ *
+ * These are the only two of the four LED current-source channels wired to
+ * the MCU (see MCU_pin_definitions.csv / SPC_20.syscfg). LEDCTRL3/LEDCTRL4
+ * are not routed to the MCU, so the remaining lamps cannot be switched in
+ * firmware — they sit at their hardwired reference (always on).
+ *
+ * Toggle-on-press: each press flips that lamp's on/off intent, stored in
+ * ctx->lamp_on[] and applied immediately to its LED current source
+ * (LAMP_ON_CURRENT_MA when on, 0 mA = true off — compare=period on the
+ * inverted-polarity LEDCTRL channel, see set_led_current).
+ * The shared LED boost / output switch are owned by energy_mode(), so a lamp
+ * only physically lights when its intent is true AND the rail is up.
+ *
+ * Must run right after update_buttons() so the one-shot wasPressed edge
+ * (cleared on the next poll) is still set.
+ */
+static void lamp_buttons_update(system_ctx_t *c)
+{
+    if (is_button_pressed(&BUTTONS[0])) {
+        c->lamp_on[0] = !c->lamp_on[0];
+        set_led_current(c->lamp_on[0] ? LAMP_ON_CURRENT_MA : 0, LED1);
+        send_string(c->lamp_on[0] ? "LAMP1: ON\r\n" : "LAMP1: OFF\r\n");
+    }
+    if (is_button_pressed(&BUTTONS[1])) {
+        c->lamp_on[1] = !c->lamp_on[1];
+        set_led_current(c->lamp_on[1] ? LAMP_ON_CURRENT_MA : 0, LED2);
+        send_string(c->lamp_on[1] ? "LAMP2: ON\r\n" : "LAMP2: OFF\r\n");
+    }
 }
 
 /* =========================================================================
@@ -386,8 +418,10 @@ int main(void)
     }
 
     set_led_voltage(LED_BOOST_TARGET_MV);
-    set_led_current(150, LED1);
-    set_led_current(150, LED2);
+    /* Arm each controllable lamp to its boot intent (both ON by default — see
+     * ctx_init). The buttons toggle these at runtime via lamp_buttons_update(). */
+    set_led_current(ctx.lamp_on[0] ? LAMP_ON_CURRENT_MA : 0, LED1);
+    set_led_current(ctx.lamp_on[1] ? LAMP_ON_CURRENT_MA : 0, LED2);
 
     /* ────────────────────────────────────────────────────────────────────
      * SYS_INIT → SYS_RUN
@@ -405,9 +439,9 @@ int main(void)
     ctx.idle_start_ms = time_now();
 
     /* Send boot banner before anything else so a fresh terminal
-     * sees the reset, then the column header for the periodic log. */
+     * sees the reset. The periodic log is now self-describing
+     * (each value is prefixed with its label), so no column header. */
     log_boot_banner();
-    log_header();
 
     /* Timing baselines */
     uint32_t last_main   = time_now();
@@ -427,6 +461,7 @@ int main(void)
         if ((now - last_button) >= TICK_BUTTON_MS) {
             last_button = now;
             update_buttons();
+            lamp_buttons_update(&ctx);   /* toggle lamps 1/2 on button presses */
         }
 
         /* ── 50 ms tick: the deterministic pipeline ──

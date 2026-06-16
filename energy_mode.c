@@ -240,8 +240,13 @@ static energy_mode_state_t eval_idle(const system_ctx_t *ctx)
     if (!HAS_SUN && HAS_LOAD && !BAT_LOW)
         return EM_DISCHARGE_ONLY;
 
-    /* P4: no sun + load + battery low → safe mode */
-    if (!HAS_SUN && HAS_LOAD && BAT_LOW)
+    /* P4: no sun + battery low → safe mode.
+     * No HAS_LOAD requirement: IDLE holds the USB + LED boosts on for load
+     * detection, and those idle-draw from the battery. With no usable sun to
+     * replenish it, a low battery must shed them or it bleeds to death (the
+     * original guard required a load and so never fired in the no-load case,
+     * letting the cell run down to the 2.0 V undervolt fault). */
+    if (!HAS_SUN && BAT_LOW)
         return EM_SAFE_MODE;
 
     /* P5: default — stay idle */
@@ -250,19 +255,29 @@ static energy_mode_state_t eval_idle(const system_ctx_t *ctx)
 
 static energy_mode_state_t eval_charge_only(const system_ctx_t *ctx)
 {
-    /* P1: load appeared → charge and load */
+    /* P1: no usable sun + battery low → safe mode (safety first).
+     * Higher priority than the load/idle guards: if the panel can't charge
+     * (has_sun now reflects usable power, not just Voc) and the battery has
+     * fallen to bat_low, shed the housekeeping boosts instead of dropping to
+     * IDLE, which would leave them on and keep bleeding the cell. When the
+     * sun IS usable we keep charging even at bat_low — that's how a depleted
+     * battery recovers, so this guard is gated on !HAS_SUN. */
+    if (!HAS_SUN && BAT_LOW)
+        return EM_SAFE_MODE;
+
+    /* P2: load appeared → charge and load */
     if (HAS_LOAD)
         return EM_CHARGE_AND_LOAD;
 
-    /* P2: sun lost → idle */
+    /* P3: sun lost → idle */
     if (!HAS_SUN)
         return EM_IDLE;
 
-    /* P3: battery full → idle */
+    /* P4: battery full → idle */
     if (BAT_FULL)
         return EM_IDLE;
 
-    /* P4: stay */
+    /* P5: stay */
     return EM_CHARGE_ONLY;
 }
 

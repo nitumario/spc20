@@ -171,20 +171,45 @@ void flags_update(system_ctx_t *ctx)
                     m->bat_voltage < BAT_LOW_MV,         /* set condition   */
                     m->bat_voltage > BAT_LOW_CLEAR_MV);  /* clear condition */
 
-    /* ── has_sun: debounced with hysteresis ──
+    /* ── has_sun: debounced, with a power-aware clear ──
      *
-     * Set when V_panel exceeds 9000 mV for 3 consecutive ticks (150 ms).
-     * Clear when V_panel drops below 8000 mV.
+     * SET: V_panel > PANEL_MIN_MV for HAS_SUN_DEBOUNCE_COUNT ticks. The
+     * panel is unloaded in IDLE, so open-circuit voltage is the only thing
+     * we can measure to decide whether a panel worth loading is present —
+     * current is 0 until the buck starts pulling. Voltage bootstraps charging.
      *
-     * Why debounce: clouds cause rapid V_panel swings. Without debounce,
-     * partial shading toggles has_sun every few hundred ms, causing
-     * ENERGY_MODE to bounce between CHARGE_* and DISCHARGE/IDLE.
+     * CLEAR (either path, sustained HAS_SUN_CLEAR_COUNT ticks):
+     *   1. V_panel collapses below PANEL_MIN_CLEAR_MV — the panel is loaded
+     *      and sagging into the I-V knee (or genuine sunset). Original path.
+     *   2. We are actively charging (so the buck IS loading the panel) yet
+     *      panel power stays below PANEL_USABLE_MIN_MW. This catches the
+     *      dead-but-floating panel at dusk: the charger backs all the way
+     *      off, the unloaded panel relaxes to ~Voc (so path 1 never fires),
+     *      but no usable power is coming out and the battery is only being
+     *      drained by the housekeeping boosts. Without this, has_sun stays
+     *      stuck true and EM never leaves CHARGE_ONLY.
      *
-     * Note: set_condition checks ABOVE threshold (not below like bat_low).
+     * Voltage-only SET would re-assert has_sun the instant we stop loading
+     * the floating panel, so after a power-path clear we lock out re-set for
+     * HAS_SUN_RELOCK_MS — re-probe ~once a minute rather than oscillate.
      */
-    debounce_update(&ctx->flag_has_sun,
-                    m->panel_voltage > PANEL_MIN_MV,         /* set condition   */
-                    m->panel_voltage < PANEL_MIN_CLEAR_MV);  /* clear condition */
+    uint32_t now = time_now();
+    bool charging = (ctx->energy_mode == EM_CHARGE_ONLY ||
+                     ctx->energy_mode == EM_CHARGE_AND_LOAD);
+    bool panel_unusable = charging && (m->panel_power < PANEL_USABLE_MIN_MW);
+
+    bool sun_set   = (m->panel_voltage > PANEL_MIN_MV) &&
+                     (now >= ctx->has_sun_relock_ms);
+    bool sun_clear = (m->panel_voltage < PANEL_MIN_CLEAR_MV) || panel_unusable;
+
+    bool was_sun = ctx->flag_has_sun.value;
+    debounce_update(&ctx->flag_has_sun, sun_set, sun_clear);
+
+    /* If this tick is the one that cleared has_sun and the panel-power path
+     * was the reason, arm the re-set lockout so the floating Voc can't
+     * immediately re-arm the charger. */
+    if (was_sun && !ctx->flag_has_sun.value && panel_unusable)
+        ctx->has_sun_relock_ms = now + HAS_SUN_RELOCK_MS;
 
     /* ── has_load: hysteresis only ──
      *
