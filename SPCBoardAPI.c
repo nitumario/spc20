@@ -116,14 +116,28 @@ struct {
  * GPIO CONTROL - ENABLE/DISABLE FUNCTIONS
  * ============================================================================ */
 
+/* All five shared segment cathode lines (GPIOA). Active-LOW: driving a line
+ * HIGH turns its segment OFF, LOW turns it ON. */
+#define DISP_SEG_ALL_PINS  (DISP_CTRL_DISP_LED1_PIN | \
+                            DISP_CTRL_DISP_LED2_PIN | \
+                            DISP_CTRL_DISP_LED3_PIN | \
+                            DISP_CTRL_DISP_LED4_PIN | \
+                            DISP_CTRL_DISP_LED5_PIN)
+
 void enable_led_bar(){
-     DL_GPIO_clearPins(GPIOA, DISP_CTRL_DIG1_PIN);
-     DL_GPIO_clearPins(GPIOB, DISP_CTRL_DIG2_PIN);
+     /* The per-bar common anodes (DIG1/DIG2) are owned by the multiplexer in
+      * update_led_display(); here we only clear any stale segment drive so the
+      * bars don't ghost a leftover pattern before the first mux refresh. */
+     DL_GPIO_setPins(GPIOA, DISP_SEG_ALL_PINS);
 }
 
 void disable_led_bar(){
-    DL_GPIO_setPins(GPIOA, DISP_CTRL_DIG1_PIN);
-    DL_GPIO_setPins(GPIOB, DISP_CTRL_DIG2_PIN);
+    /* Fully blank for sleep: drop both common anodes (active-HIGH, so LOW = off)
+     * and park every segment line HIGH (active-LOW, so HIGH = off). With the
+     * anodes down the bars draw nothing regardless of segment state. */
+    DL_GPIO_clearPins(GPIOA, DISP_CTRL_DIG1_PIN);
+    DL_GPIO_clearPins(GPIOB, DISP_CTRL_DIG2_PIN);
+    DL_GPIO_setPins(GPIOA, DISP_SEG_ALL_PINS);
 }
 
 void enable_led_boost(void){
@@ -1172,10 +1186,48 @@ void get_time(DL_RTC_Common_Calendar* time_struct){
 
 
 
+/* Segment cathode pins indexed by bit position in a bar mask:
+ * bit i (0..4) ↔ DISP_LED(i+1). All five share GPIOA. */
+static const uint32_t DISP_SEG_PINS[5] = {
+    DISP_CTRL_DISP_LED1_PIN,
+    DISP_CTRL_DISP_LED2_PIN,
+    DISP_CTRL_DISP_LED3_PIN,
+    DISP_CTRL_DISP_LED4_PIN,
+    DISP_CTRL_DISP_LED5_PIN,
+};
+
 /*
- * Multiplex display update — drives DIG1/DIG2 switching at 4ms intervals.
- * Content (LED states) must be set by UI_MGR via update_led_bar() before
- * calling this function, or directly via GPIO before each DIG enable.
+ * Set the segment content of one bar. data is a 5-bit mask: bit i lights
+ * DISP_LED(i+1). It is stored into the shared leds[] buffer and rendered by
+ * update_led_display() on the next mux cycle. This is a raw primitive — what
+ * each bar *means* (battery / panel power / blink) is policy owned by the
+ * application UI layer.
+ */
+void update_led_bar(uint8_t data, LED_BAR_ID led_bar_id) {
+    if (led_bar_id == LED_BAR_1 || led_bar_id == LED_BAR_2) {
+        leds[led_bar_id] = (uint8_t)(data & 0x1F);
+    }
+}
+
+/* Drive the five shared segment lines from a bar mask. Active-LOW: a set bit
+ * pulls its cathode LOW to light the segment; a clear bit parks it HIGH. */
+static void drive_segments(uint8_t mask) {
+    uint32_t on_pins = 0, off_pins = 0;
+    for (uint8_t i = 0; i < 5; i++) {
+        if (mask & (1u << i)) on_pins  |= DISP_SEG_PINS[i];
+        else                  off_pins |= DISP_SEG_PINS[i];
+    }
+    DL_GPIO_clearPins(GPIOA, on_pins);   /* LOW  → segment lit */
+    DL_GPIO_setPins(GPIOA, off_pins);    /* HIGH → segment off */
+}
+
+/*
+ * Multiplex the two bar graphs. Rate-limited to one bar per 4 ms: each call
+ * blanks the off-bar's common anode, drives the active bar's segment content
+ * from leds[], then raises the active bar's anode. Alternating across calls
+ * refreshes each bar at ~125 Hz — flicker-free. Call from a steady periodic
+ * context (the 1 ms SysTick ISR), not the foreground loop, so blocking work
+ * (UART telemetry) can't stall the refresh. Content is set via update_led_bar().
  */
 void update_led_display(void) {
     static uint8_t com_on = 0;
@@ -1187,28 +1239,16 @@ void update_led_display(void) {
     last_change_time = time_now();
 
     switch (com_on) {
-        case 0:
-            DL_GPIO_setPins(GPIOA, DISP_CTRL_DIG1_PIN);
-            DL_GPIO_setPins(GPIOA,
-                            DISP_CTRL_DISP_LED1_PIN |
-                            DISP_CTRL_DISP_LED2_PIN |
-                            DISP_CTRL_DISP_LED3_PIN |
-                            DISP_CTRL_DISP_LED4_PIN |
-                            DISP_CTRL_DISP_LED5_PIN);
-            DL_GPIO_clearPins(GPIOB, DISP_CTRL_DIG2_PIN);
-            /* UI_MGR sets content here via update_led_bar() */
+        case 0:  /* LED_BAR_1 — common anode DIG1 (GPIOA) */
+            DL_GPIO_clearPins(GPIOB, DISP_CTRL_DIG2_PIN);   /* bar 2 anode off  */
+            drive_segments(leds[LED_BAR_1]);
+            DL_GPIO_setPins(GPIOA, DISP_CTRL_DIG1_PIN);     /* bar 1 anode on   */
             break;
 
-        case 1:
-            DL_GPIO_setPins(GPIOB, DISP_CTRL_DIG2_PIN);
-            DL_GPIO_setPins(GPIOA,
-                            DISP_CTRL_DISP_LED1_PIN |
-                            DISP_CTRL_DISP_LED2_PIN |
-                            DISP_CTRL_DISP_LED3_PIN |
-                            DISP_CTRL_DISP_LED4_PIN |
-                            DISP_CTRL_DISP_LED5_PIN);
-            DL_GPIO_clearPins(GPIOA, DISP_CTRL_DIG1_PIN);
-            /* UI_MGR sets content here via update_led_bar() */
+        case 1:  /* LED_BAR_2 — common anode DIG2 (GPIOB) */
+            DL_GPIO_clearPins(GPIOA, DISP_CTRL_DIG1_PIN);   /* bar 1 anode off  */
+            drive_segments(leds[LED_BAR_2]);
+            DL_GPIO_setPins(GPIOB, DISP_CTRL_DIG2_PIN);     /* bar 2 anode on   */
             break;
 
         default:
@@ -1415,7 +1455,11 @@ volatile bool check_buttons = false;
 
 void buttons_init(void) { }
 
-void led_display_init(void) { }
+void led_display_init(void) {
+    leds[LED_BAR_1] = 0;
+    leds[LED_BAR_2] = 0;
+    disable_led_bar();   /* anodes down, all segments off */
+}
 
 bool get_button_state(const Button *btn) { (void)btn; return false; }
 
