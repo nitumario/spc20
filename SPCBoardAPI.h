@@ -93,6 +93,10 @@ void disable_charge_switch(void);
 void enable_battery_switch(void);
 void disable_battery_switch(void);
 
+/* Re-pulse VBATM_EN so the battery-voltage sense divider re-locks to a
+ * cell hot-plugged/removed after boot. Call periodically on a slow tick. */
+void refresh_vbatm_sense(void);
+
 /* ============================================================================
  * ADC MODULE
  * ============================================================================ */

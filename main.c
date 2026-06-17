@@ -447,6 +447,7 @@ int main(void)
     uint32_t last_main   = time_now();
     uint32_t last_log    = time_now();
     uint32_t last_button = time_now();
+    uint32_t last_vbatm  = time_now();
 
     /* ────────────────────────────────────────────────────────────────────
      * MAIN LOOP — runs forever inside SYS_RUN
@@ -509,6 +510,20 @@ int main(void)
         if ((now - last_log) >= TICK_LOG_MS) {
             last_log = now;
             log_measurements();
+        }
+
+        /* ── Slow tick: re-assert the battery-sense enable ──
+         * VBATM_EN gates the V_bat sense divider and is otherwise asserted
+         * only once, at boot, before a cell may be present. A battery
+         * hot-plugged (or re-plugged) afterwards never gets a fresh enable
+         * edge, so the sense path stays latched in its boot-time
+         * (no-battery) state: the cell never "shows up", and a removed cell
+         * never clears. Re-pulsing the enable re-locks the divider to
+         * whatever is present now. Only the sense divider is touched (not
+         * the battery↔bus FET), so the power path is undisturbed. */
+        if ((now - last_vbatm) >= VBATM_REFRESH_MS) {
+            last_vbatm = now;
+            refresh_vbatm_sense();
         }
 
         /* ── Idle sleep ──

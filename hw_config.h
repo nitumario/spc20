@@ -517,6 +517,7 @@
 #define TICK_BUTTON_MS            20      /* button debounce/polling rate                         */
 #define TICK_MAIN_MS              50      /* state machine + regulation tick                      */
 #define TICK_LOG_MS               1000    /* UART logging interval                                */
+#define VBATM_REFRESH_MS          1000    /* re-pulse VBATM_EN so a hot-plugged cell shows up     */
 
 #define IDLE_SLEEP_TIMEOUT_MS     120000UL /* 2 min in IDLE with no activity → enter sleep        */
 

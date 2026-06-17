@@ -196,6 +196,30 @@ void disable_battery_switch(void){
     System_Status.battery_switch = false;
 }
 
+/*
+ * Re-pulse the V_bat sense-divider enable (VBATM_EN).
+ *
+ * VBATM_EN gates the resistor divider that lets the ADC read battery
+ * voltage. system_init() asserts it exactly once, at boot — before a cell
+ * may be present. The sense switch latches its state at that single enable
+ * transition, so a battery hot-plugged (or re-plugged) afterwards never
+ * gets a fresh enable and the divider stays latched in its boot-time
+ * (no-battery) condition: the cell never "shows up", and a removed cell
+ * never clears. Driving the pin low then high regenerates a clean enable
+ * edge (and re-asserts the level), re-locking the sense path to whatever
+ * is actually on the battery terminal now.
+ *
+ * Only the sense divider is touched — NOT the battery<->bus FET
+ * (BATTERY_ENABLE) — so the power path is undisturbed. The low window is a
+ * few microseconds; the ADC is a 64-sample moving average harvested every
+ * 10 ms, so at worst one sample of one harvest is affected. Harmless.
+ */
+void refresh_vbatm_sense(void){
+    DL_GPIO_clearPins(EN_VBATM_EN_PORT, EN_VBATM_EN_PIN);
+    delay_cycles(400);   /* brief low window to force a real falling+rising edge */
+    DL_GPIO_setPins(EN_VBATM_EN_PORT, EN_VBATM_EN_PIN);
+}
+
 
 /* ============================================================================
  * ADC MODULE - CONFIGURATION, FILTERING, AND CONVERSION
