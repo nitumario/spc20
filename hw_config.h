@@ -543,4 +543,47 @@
 #define BAT_NOMINAL_CAPACITY_MAH  20000
 #define BAT_CHARGE_EFFICIENCY_PCT 94
 
+/* =========================================================================
+ * 11. USER INTERFACE — LED BAR DISPLAY
+ * =========================================================================
+ *
+ * Two 5-segment bar graphs on the front panel (multiplexed in SPCBoardAPI.c):
+ *   - LED_BAR_1 → battery state-of-charge fuel gauge
+ *   - LED_BAR_2 → solar panel output power
+ * Each bar fills 0..5 segments by the thresholds below; a bar flashes all
+ * five segments when its source is absent (no cell / no usable sun). Policy
+ * lives in main.c (ui_display_update / led_boot_animation).
+ */
+
+/* "Battery present" floor (mV). A disconnected cell floats near 0 mV; below
+ * this the battery bar blinks instead of showing a level. Mirrors the
+ * BAT_UNDERVOLT 500 mV sense guard. */
+#define UI_BAT_PRESENT_MV         500
+
+/* Battery fuel-gauge segment thresholds (mV, LiFePO4 discharge curve). V_bat
+ * at or above level N lights N segments; below SEG1 → 0 segments (present but
+ * empty). Bench-derived working band 3.0–3.65 V. */
+#define UI_BAT_SEG1_MV            3020
+#define UI_BAT_SEG2_MV            3120
+#define UI_BAT_SEG3_MV            3240
+#define UI_BAT_SEG4_MV            3360
+#define UI_BAT_SEG5_MV            3480
+
+/* Panel-power segment thresholds (mW). panel_power at or above level N lights
+ * N segments. Display-only — tune to the deployed panel's wattage. The bar
+ * blinks (no usable sun) when has_sun is clear, independent of these. */
+#define UI_PANEL_SEG1_MW          200
+#define UI_PANEL_SEG2_MW          750
+#define UI_PANEL_SEG3_MW          1500
+#define UI_PANEL_SEG4_MW          3000
+#define UI_PANEL_SEG5_MW          5000
+
+/* Blink half-period (ms): a "no source" bar shows all 5 segments for this long,
+ * then dark for this long (≈1.25 Hz flash). */
+#define UI_BLINK_PERIOD_MS        400UL
+
+/* Power-on sweep: light one more segment on each bar every this many ms until
+ * all five are on (~0.6 s end to end). Cosmetic "firmware alive" cue. */
+#define UI_BOOT_ANIM_STEP_MS      120UL
+
 #endif /* HW_CONFIG_H */
