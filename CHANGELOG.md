@@ -1,3 +1,25 @@
+# [v0.19] - 17.06.26
+## Front-panel LED bar graphs: battery + panel-power gauges with boot sweep
+
+Changed files: `SPCBoardAPI.c`, `main.c`, `hw_config.h`
+
+### Why
+The two 5-segment LED bar graphs were dead: `update_led_display()` was a skeleton that lit every segment on both bars and never read any content, the segment/anode primitives (`update_led_bar`, `led_display_init`) were unimplemented, and nothing in the main loop pumped the multiplexer. The bars are now live gauges.
+
+### NEW: content-driven bar-graph multiplexer (`SPCBoardAPI.c`)
+- `update_led_bar(data, id)` stores a raw 5-bit segment mask into the shared `leds[]` buffer (bit i ↔ DISP_LED(i+1)); `update_led_display()` renders it. The mux blanks the off-bar's common anode, drives the active bar's segments from `leds[]`, then raises its anode — alternating per 4 ms call (~125 Hz/bar, no ghosting). Polarity recovered from the pre-refactor HAL (commit `6d8fe0c`): segment cathodes (GPIOA DISP_LED1..5) are **active-LOW** (clear = lit), per-bar common anodes (DIG1/DIG2) are **active-HIGH** (set = bar selected).
+- `led_display_init()` now blanks the bars; `disable_led_bar()` fixed to actually go dark (both anodes LOW + all segments HIGH) — the old version drove both anodes HIGH (lit) right before `__WFI()`, leaving the display drawing current in sleep.
+
+### NEW: UI policy layer (`main.c`)
+- `ui_display_update()` (run on the 50 ms pipeline tick) maps `meas.bat_voltage` → LED_BAR_1 (battery SoC, fills DISP_LED1→5) and `meas.panel_power` → LED_BAR_2 (panel power, fills DISP_LED5→1; the two bars are mirror-imaged on the PCB). A bar flashes all 5 segments when its source is absent: battery when `V_bat < UI_BAT_PRESENT_MV` (no cell), panel when `flag_has_sun` is clear (no usable sun — reuses the debounced dusk power-gate). Present-but-empty / sunny-but-idle shows 0 solid segments, not a blink.
+- `led_boot_animation()` — blocking power-on sweep run during bring-up: each bar lights one more segment every `UI_BOOT_ANIM_STEP_MS` (the SysTick-driven mux refreshes each frame).
+- `update_led_display()` is serviced from the **1 ms SysTick ISR** (self-rate-limited to 4 ms/bar, ~125 Hz). It was first wired into the foreground loop, which flickered badly: the ~1 s blocking UART telemetry write (and other blocking work) starved the mux for tens of ms, freezing one bar lit and the other dark. Driving it from the ISR makes refresh immune to foreground stalls. `leds[]` is still produced in the foreground; single-byte reads in the ISR are atomic on Cortex-M0+.
+
+### CHANGED
+- `hw_config.h` §11: new UI constants — `UI_BAT_PRESENT_MV`, the `UI_BAT_SEG1..5_MV` / `UI_PANEL_SEG1..5_MW` thresholds, `UI_BLINK_PERIOD_MS`, `UI_BOOT_ANIM_STEP_MS`. Panel-power thresholds are display-only and tunable to the deployed panel.
+
+---
+
 # [v0.18] - 12.06.26
 ## Setpoint-P&O MPPT: per-panel MPP tracking on top of the input-vreg loop
 
