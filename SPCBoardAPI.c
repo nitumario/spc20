@@ -1037,24 +1037,33 @@ void set_led_current(uint16_t current, LED_OUTPUT led){
     /*
      * current == 0 means "lamp off". These LEDCTRL channels (TIMA0/TIMA1,
      * edge-align, period = 100) drive a filtered current reference whose LED
-     * current falls as the PWM high-fraction rises — empirically:
-     *   compare ~1  -> ~0% high  -> MAX current (runaway/brightest)
+     * current FALLS as the PWM high-fraction (the compare value) rises:
+     *   compare 1   ->  1% high  -> MAX current (runaway/brightest)
      *   compare 85  -> 85% high  -> ~150 mA
-     *   compare 99  -> 99% high  -> ~15 mA (LUT floor, faint glow)
-     *   compare 100 -> 100% high -> 0 mA (truly off)
-     * The normal LUT path can't reach off: scale_duty_cycle() floors duty at
-     * 1, so the smallest compare it writes is (100 - 99) = 1 and the dimmest
-     * is (100 - 1) = 99 (~15 mA). True off needs compare = period (100),
-     * which is also how SysConfig initialises the buck channel's idle state
-     * (PWM_VCHG compare = its period 400, see ti_msp_dl_config.c).
+     *   compare 99  -> 99% high  -> ~15 mA  (dimmest reliable => "off")
      *
-     * The old code wrote compare 0 here, thinking that held the pin low. It
-     * does the opposite: compare 0 = ~0% high = MAX reference = full
-     * brightness, which is why "off" used to run away bright.
+     * Valid compare range is [1, 99], exactly mirroring the buck's [1, 399]:
+     * the two period-boundary values (0 and period=100) are FORBIDDEN. The
+     * timer aliases compare == period back to the 0%-high / pin-low state,
+     * i.e. the SAME runaway as compare 0 — NOT a clean 100%-high 0 mA.
+     *
+     * History of this one line:
+     *   - Original code wrote compare 0   -> pin low -> runaway bright.
+     *   - v0.19 "fix" wrote compare 100 (= period) on the THEORY that 100%
+     *     high == 0 mA. Bench 2026-06-16 DISPROVED it: compare == period is
+     *     the forbidden endpoint and ran away exactly like compare 0 (OFF drew
+     *     ~3.9 A while ON drew ~150 mA — the reported inversion).
+     *   - Correct: compare 99, the dimmest in-range value (~15 mA faint).
+     * A truly-dark off cannot come from this PWM endpoint; it needs the pin
+     * forced high via GPIO, or gating the shared LED boost. 15 mA is the floor
+     * the current source holds without losing regulation.
+     *
+     * Written directly (not via set_pwm_duty_cycle) so scale_duty_cycle()'s
+     * buck-sized [1,399] clamp can't push this period-100 channel past 99.
      */
     if (current == 0) {
         DL_TimerG_stopCounter(ch->TIMER);
-        DL_TimerG_setCaptureCompareValue(ch->TIMER, 100, ch->CC_INDEX);
+        DL_TimerG_setCaptureCompareValue(ch->TIMER, 99, ch->CC_INDEX);
         DL_TimerG_startCounter(ch->TIMER);
         return;
     }

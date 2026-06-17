@@ -536,17 +536,23 @@ typedef struct {
      *   - LED bar display mode
      *   - battery percentage display state
      *
-     * Lamp switches — user intent for the two MCU-controllable LED-output
-     * lamps, toggled by main()'s lamp_buttons_update():
-     *   lamp_on[0] = lamp 1 (LEDCTRL1 / LED1, driven by BTN1)
-     *   lamp_on[1] = lamp 2 (LEDCTRL2 / LED2, driven by BTN2)
+     * Lamp brightness — per-lamp state for the two MCU-controllable LED-output
+     * lamps, driven by main()'s lamp_buttons_update():
+     *   lamp_level[0] = lamp 1 (LEDCTRL1 / LED1, driven by BTN1)
+     *   lamp_level[1] = lamp 2 (LEDCTRL2 / LED2, driven by BTN2)
+     * lamp_level is a brightness step: 0 = off, LAMP_DIM_LEVELS = full (mapped
+     * to an LED current by lamp_level_ma[] in main.c). A short tap toggles
+     * full/off; press-and-hold dims one level per LAMP_DIM_STEP_MS down to off.
+     * lamp_hold_steps counts the dim steps already applied in the current hold
+     * so the cadence is paced off the button's pressStartTime.
      * Only LEDCTRL1/2 reach the MCU; the other LED channels (LEDCTRL3/4) are
      * not routed to it and stay at their hardwired reference. energy_mode
      * still owns the shared LED boost + output switch, so a lamp physically
-     * lights only when its intent is true AND the rail is up (e.g. not shed
+     * lights only when its level is non-zero AND the rail is up (e.g. not shed
      * in SAFE_MODE).
      */
-    bool lamp_on[2];
+    uint8_t lamp_level[2];
+    uint8_t lamp_hold_steps[2];
 
 } system_ctx_t;
 
@@ -616,10 +622,12 @@ static inline void ctx_init(system_ctx_t *ctx)
     /* Assume temperature OK until first measurement */
     ctx->temp_charge_ok = true;
 
-    /* Both lamp groups default ON, mirroring the boot LED-current arming in
-     * main(). The two front-panel buttons toggle these at runtime. */
-    ctx->lamp_on[0] = true;
-    ctx->lamp_on[1] = true;
+    /* Both lamps default to full brightness, mirroring the boot LED-current
+     * arming in main(). A tap toggles full/off; press-and-hold dims to off. */
+    ctx->lamp_level[0] = LAMP_DIM_LEVELS;
+    ctx->lamp_level[1] = LAMP_DIM_LEVELS;
+    ctx->lamp_hold_steps[0] = 0;
+    ctx->lamp_hold_steps[1] = 0;
 }
 
 /* =========================================================================

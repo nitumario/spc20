@@ -222,10 +222,25 @@
 /* Drive current when a button-controlled lamp (LEDCTRL1/LEDCTRL2) is switched
  * ON. Lands on the 145/155 mA LUT bins (output_currents_led_mA), well under
  * the 350 mA per-channel hardware max. Switching a lamp OFF commands 0 mA,
- * which set_led_current() drives to a true 0 % LEDCTRL duty (compare=period
- * on the inverted-polarity channel, zero reference, zero current — the LUT
- * path can't reach off, see that fn). */
+ * which set_led_current() drives to compare 99 (~15 mA, the dimmest in-range
+ * value on the inverted-polarity channel). compare==period is forbidden and
+ * runs away, so "off" is a faint floor, not fully dark — see that fn. */
 #define LAMP_ON_CURRENT_MA        150
+
+/* Lamp press/hold brightness UI (lamp_buttons_update() in main.c). A short tap
+ * toggles the lamp full-on / off; press-and-hold dims one level every
+ * LAMP_DIM_STEP_MS until it reaches off. There are LAMP_DIM_LEVELS steps
+ * between full and off, so a continuous hold from full goes dark in
+ * LAMP_DIM_LEVELS * LAMP_DIM_STEP_MS (= 5 s). Per-level LED currents live in
+ * lamp_level_ma[] in main.c (index LAMP_DIM_LEVELS = full = LAMP_ON_CURRENT_MA,
+ * index 0 = off). The dim cadence is paced off the button's pressStartTime via
+ * time_now() with a catch-up loop, so LAMP_DIM_STEP_MS need not be an exact
+ * multiple of TICK_BUTTON_MS (steps just land on the nearest button poll).
+ * Note: the LED current LUT (output_currents_led_mA) has only ~15 usable bins
+ * between the off-floor and LAMP_ON_CURRENT_MA, so a few adjacent levels share
+ * a current — the hold still dims smoothly over the full 5 s. */
+#define LAMP_DIM_LEVELS           20
+#define LAMP_DIM_STEP_MS          250
 
 /* =========================================================================
  * 4. LOAD DETECTION

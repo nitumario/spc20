@@ -218,27 +218,94 @@ static void apply_pwm(system_ctx_t *c)
  * are not routed to the MCU, so the remaining lamps cannot be switched in
  * firmware — they sit at their hardwired reference (always on).
  *
- * Toggle-on-press: each press flips that lamp's on/off intent, stored in
- * ctx->lamp_on[] and applied immediately to its LED current source
- * (LAMP_ON_CURRENT_MA when on, 0 mA = true off — compare=period on the
- * inverted-polarity LEDCTRL channel, see set_led_current).
- * The shared LED boost / output switch are owned by energy_mode(), so a lamp
- * only physically lights when its intent is true AND the rail is up.
+ * Two gestures per button (the HAL gives us press/release edges, a 500 ms
+ * hold threshold in BUTTONS[].holdThreshold, and pressStartTime):
  *
- * Must run right after update_buttons() so the one-shot wasPressed edge
- * (cleared on the next poll) is still set.
+ *   - SHORT TAP (released before the 500 ms hold threshold): toggle. Off ->
+ *     full brightness; any on-level -> off.
+ *   - PRESS & HOLD (held past 500 ms): dim. While the button stays down, drop
+ *     one brightness level every LAMP_DIM_STEP_MS, walking full -> ... -> off
+ *     (LAMP_DIM_LEVELS steps, ~5 s end to end). Release at any point keeps the
+ *     level reached. Holding from off does nothing — tap to turn on first.
+ *
+ * Brightness lives in c->lamp_level[] (0 = off, LAMP_DIM_LEVELS = full),
+ * mapped to an LED current by lamp_level_ma[]. c->lamp_hold_steps[] counts the
+ * dim steps already applied in the current hold, so the cadence is paced off
+ * pressStartTime and is independent of how often this runs.
+ *
+ * The shared LED boost / output switch are owned by energy_mode(), so a lamp
+ * only physically lights when its level is non-zero AND the rail is up.
+ *
+ * Must run right after update_buttons() so the one-shot release edge (cleared
+ * on the next poll) is still set.
  */
+
+/* Brightness ladder, indexed by lamp_level: 0 = off (LED current 0 -> the
+ * ~15 mA compare-99 floor), LAMP_DIM_LEVELS = full. Intermediate currents are
+ * chosen to land on output_currents_led_mA LUT bins and rise monotonically to
+ * LAMP_ON_CURRENT_MA. The LUT has only ~15 distinct bins between the floor and
+ * full, so with LAMP_DIM_LEVELS (20) steps a handful of adjacent levels repeat
+ * a current (set_led_current snaps to the nearest bin anyway); the dups are
+ * spread out so a held dim still walks down smoothly. Must have
+ * LAMP_DIM_LEVELS + 1 entries with index LAMP_DIM_LEVELS == LAMP_ON_CURRENT_MA. */
+static const uint16_t lamp_level_ma[LAMP_DIM_LEVELS + 1] = {
+    0,
+     25,  35,  40,  50,  50,
+     60,  70,  80,  80,  90,
+    100, 105, 105, 115, 125,
+    135, 135, 145, 145, LAMP_ON_CURRENT_MA,
+};
+
+static const LED_OUTPUT lamp_led[2] = { LED1, LED2 };
+
+/* Drive a lamp's current level to its LED channel and log the change. */
+static void lamp_apply(system_ctx_t *c, uint8_t i)
+{
+    uint16_t ma = lamp_level_ma[c->lamp_level[i]];
+    set_led_current(ma, lamp_led[i]);
+
+    char buf[40];
+    int n;
+    if (c->lamp_level[i] == 0)
+        n = snprintf(buf, sizeof buf, "LAMP%u: OFF\r\n", (unsigned)(i + 1));
+    else
+        n = snprintf(buf, sizeof buf, "LAMP%u: L%u %umA\r\n",
+                     (unsigned)(i + 1), (unsigned)c->lamp_level[i], (unsigned)ma);
+    if (n > 0 && n < (int)sizeof buf) send_string(buf);
+}
+
 static void lamp_buttons_update(system_ctx_t *c)
 {
-    if (is_button_pressed(&BUTTONS[0])) {
-        c->lamp_on[0] = !c->lamp_on[0];
-        set_led_current(c->lamp_on[0] ? LAMP_ON_CURRENT_MA : 0, LED1);
-        send_string(c->lamp_on[0] ? "LAMP1: ON\r\n" : "LAMP1: OFF\r\n");
-    }
-    if (is_button_pressed(&BUTTONS[1])) {
-        c->lamp_on[1] = !c->lamp_on[1];
-        set_led_current(c->lamp_on[1] ? LAMP_ON_CURRENT_MA : 0, LED2);
-        send_string(c->lamp_on[1] ? "LAMP2: ON\r\n" : "LAMP2: OFF\r\n");
+    for (uint8_t i = 0; i < 2; i++) {
+        Button *btn = &BUTTONS[i];
+
+        /* New press: start a fresh hold-step count. */
+        if (is_button_pressed(btn))
+            c->lamp_hold_steps[i] = 0;
+
+        /* Hold = dim. While the button is physically down (state 0 = pressed),
+         * apply one level drop per LAMP_DIM_STEP_MS elapsed since press. The
+         * while-loop catches up if this runs late, keeping a steady cadence. */
+        if (btn->state == 0) {
+            uint32_t held = time_now() - btn->pressStartTime;
+            uint8_t due = (uint8_t)(held / LAMP_DIM_STEP_MS);
+            if (due > LAMP_DIM_LEVELS) due = LAMP_DIM_LEVELS;
+            while (c->lamp_hold_steps[i] < due) {
+                c->lamp_hold_steps[i]++;
+                if (c->lamp_level[i] > 0) {
+                    c->lamp_level[i]--;
+                    lamp_apply(c, i);
+                }
+            }
+        }
+
+        /* Tap = toggle. A release that never crossed the hold threshold
+         * (isHeld still false) is a short tap; a hold-release is ignored here
+         * because the dimming above already handled it. */
+        if (is_button_released(btn) && !is_button_held(btn)) {
+            c->lamp_level[i] = (c->lamp_level[i] > 0) ? 0 : LAMP_DIM_LEVELS;
+            lamp_apply(c, i);
+        }
     }
 }
 
@@ -418,10 +485,11 @@ int main(void)
     }
 
     set_led_voltage(LED_BOOST_TARGET_MV);
-    /* Arm each controllable lamp to its boot intent (both ON by default — see
-     * ctx_init). The buttons toggle these at runtime via lamp_buttons_update(). */
-    set_led_current(ctx.lamp_on[0] ? LAMP_ON_CURRENT_MA : 0, LED1);
-    set_led_current(ctx.lamp_on[1] ? LAMP_ON_CURRENT_MA : 0, LED2);
+    /* Arm each controllable lamp to its boot brightness (both full by default
+     * — see ctx_init). The buttons tap-toggle / hold-dim these at runtime via
+     * lamp_buttons_update(). */
+    set_led_current(lamp_level_ma[ctx.lamp_level[0]], LED1);
+    set_led_current(lamp_level_ma[ctx.lamp_level[1]], LED2);
 
     /* ────────────────────────────────────────────────────────────────────
      * SYS_INIT → SYS_RUN
