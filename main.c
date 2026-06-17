@@ -310,6 +310,109 @@ static void lamp_buttons_update(system_ctx_t *c)
 }
 
 /* =========================================================================
+ * LED BAR DISPLAY — UI policy layer
+ * =========================================================================
+ *
+ * Two front-panel 5-segment bar graphs (driven by the multiplexer in
+ * SPCBoardAPI.c — update_led_display()):
+ *
+ *   LED_BAR_1 → battery state-of-charge fuel gauge (fills DISP_LED1→5)
+ *   LED_BAR_2 → solar panel output power           (fills DISP_LED5→1)
+ *
+ * The two bars are wired mirror-imaged on the PCB, so bar 2 fills from the
+ * opposite segment to keep both gauges reading "up" in the same direction.
+ *
+ * Each bar shows a 0..5 level from the thresholds in hw_config.h. A bar instead
+ * flashes ALL five segments when its source is missing:
+ *   - battery bar blinks when no cell is present (V_bat < UI_BAT_PRESENT_MV),
+ *   - panel bar blinks when there's no usable sun (flag_has_sun clear — this
+ *     already folds in the dusk "panel floating but delivering <200 mW" case).
+ * A present-but-empty battery or a sunny-but-idle panel shows 0 solid segments,
+ * not a blink — blink means "source absent", not "source low".
+ *
+ * Policy only: this computes the two 5-bit segment masks each UI tick and hands
+ * them to the HAL via update_led_bar(). The mux (update_led_display()) is what
+ * actually lights them and is pumped from the 1 ms SysTick ISR.
+ */
+
+/* Level (0..5) → segment mask filling up from DISP_LED1 (bit 0). */
+static uint8_t bar_mask_from_low(uint8_t level)
+{
+    if (level > 5) level = 5;
+    return (uint8_t)((1u << level) - 1u);
+}
+
+/* Level (0..5) → segment mask filling down from DISP_LED5 (bit 4). */
+static uint8_t bar_mask_from_high(uint8_t level)
+{
+    if (level > 5) level = 5;
+    return (uint8_t)(((1u << level) - 1u) << (5 - level));
+}
+
+/* Battery voltage → fuel-gauge level 0..5. */
+static uint8_t battery_level(const system_ctx_t *c)
+{
+    uint16_t mv = c->meas.bat_voltage;
+    if (mv >= UI_BAT_SEG5_MV) return 5;
+    if (mv >= UI_BAT_SEG4_MV) return 4;
+    if (mv >= UI_BAT_SEG3_MV) return 3;
+    if (mv >= UI_BAT_SEG2_MV) return 2;
+    if (mv >= UI_BAT_SEG1_MV) return 1;
+    return 0;
+}
+
+/* Panel power → bar level 0..5. */
+static uint8_t panel_level(const system_ctx_t *c)
+{
+    int32_t mw = c->meas.panel_power;
+    if (mw >= UI_PANEL_SEG5_MW) return 5;
+    if (mw >= UI_PANEL_SEG4_MW) return 4;
+    if (mw >= UI_PANEL_SEG3_MW) return 3;
+    if (mw >= UI_PANEL_SEG2_MW) return 2;
+    if (mw >= UI_PANEL_SEG1_MW) return 1;
+    return 0;
+}
+
+/* Recompute both bars' segment content from the latest measurements. Cheap;
+ * called on the UI tick. The mux renders whatever this last stored. */
+static void ui_display_update(const system_ctx_t *c)
+{
+    /* All-on for the first half of each period, dark for the second. */
+    bool blink_on = ((time_now() / UI_BLINK_PERIOD_MS) & 1u) == 0u;
+
+    uint8_t bar1 = (c->meas.bat_voltage < UI_BAT_PRESENT_MV)
+                   ? (blink_on ? 0x1Fu : 0x00u)
+                   : bar_mask_from_low(battery_level(c));
+
+    uint8_t bar2 = (!c->flag_has_sun.value)
+                   ? (blink_on ? 0x1Fu : 0x00u)
+                   : bar_mask_from_high(panel_level(c));
+
+    update_led_bar(bar1, LED_BAR_1);
+    update_led_bar(bar2, LED_BAR_2);
+}
+
+/*
+ * Power-on sweep: light one more segment on each bar every UI_BOOT_ANIM_STEP_MS
+ * until all five are on. Both bars fill from their "empty" end so the two
+ * mirror-imaged gauges sweep toward each other. Blocking — runs once during
+ * bring-up. SysTick is already live here (configured in system_init), so it
+ * refreshes the mux while we just hold each frame for one step.
+ */
+static void led_boot_animation(void)
+{
+    for (uint8_t n = 1; n <= 5; n++) {
+        update_led_bar(bar_mask_from_low(n),  LED_BAR_1);
+        update_led_bar(bar_mask_from_high(n), LED_BAR_2);
+
+        uint32_t t0 = time_now();
+        while ((time_now() - t0) < UI_BOOT_ANIM_STEP_MS) {
+            /* hold this frame; the SysTick ISR drives the multiplexer */
+        }
+    }
+}
+
+/* =========================================================================
  * HardFault_Handler — Cortex-M0+ fault trap with UART post-mortem
  * =========================================================================
  *
@@ -408,6 +511,16 @@ void SysTick_Handler(void)
         read_adc_values();   /* harvest completed conversions into moving average */
         adc_read_step();     /* kick off next conversion pair */
     }
+
+    /* Service the LED-bar multiplexer here, not in the main loop: the mux must
+     * alternate the two bars on a steady ~4 ms cadence, but the foreground loop
+     * stalls for tens of ms inside the blocking UART telemetry writes (and any
+     * other blocking work), which froze one bar lit and the other dark long
+     * enough to flicker visibly. Run from the 1 ms tick (self-rate-limited to
+     * 4 ms inside) so refresh is immune to whatever the foreground is doing.
+     * Content (leds[]) is still produced in the foreground via update_led_bar();
+     * single-byte reads here are atomic on Cortex-M0+, so no lock is needed. */
+    update_led_display();
 }
 
 /* =========================================================================
@@ -491,6 +604,12 @@ int main(void)
     set_led_current(lamp_level_ma[ctx.lamp_level[0]], LED1);
     set_led_current(lamp_level_ma[ctx.lamp_level[1]], LED2);
 
+    /* Bring up the front-panel bar graphs: blank, then a power-on segment
+     * sweep so the operator sees the firmware came alive before the gauges
+     * start tracking battery / panel power in the main loop. */
+    led_display_init();
+    led_boot_animation();
+
     /* ────────────────────────────────────────────────────────────────────
      * SYS_INIT → SYS_RUN
      * ──────────────────────────────────────────────────────────────────── */
@@ -572,6 +691,11 @@ int main(void)
 
             /* One-line UART log per region whose state changed. */
             log_state_transitions(now, em_old, chg_old, mppt_old);
+
+            /* Refresh the bar-graph content from this tick's measurements
+             * (battery SoC + panel power, or a blink if either source is
+             * absent). The mux pumped at the top of the loop renders it. */
+            ui_display_update(&ctx);
         }
 
         /* ── 1 s tick: UART diagnostic logging ── */
