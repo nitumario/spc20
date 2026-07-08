@@ -54,11 +54,13 @@ volatile uint8_t leds[2] = {0};              // Shared LED state storage
  * PWM output mapping.
  * Index mapping must match usage in set_pwm_duty_cycle() and set_* functions.
  */
-const PWM_Config _pwm_outputs[4] = {
+const PWM_Config _pwm_outputs[6] = {
     {PWM_VCHG_INST, DL_TIMER_CC_1_INDEX, 0},        // PWM for charging path (buck)
     {PWM_LED_OUTPUT_INST, DL_TIMER_CC_0_INDEX, 0},  // PWM for LED boost converter
-    {LEDCTRL_1_INST, DL_TIMER_CC_1_INDEX, 0},       // PWM for LED1 current control
-    {LEDCTRL_2_INST, DL_TIMER_CC_0_INDEX, 0},       // PWM for LED2 current control
+    {LEDCTRL_1_INST, DL_TIMER_CC_1_INDEX, 0},       // LED1 current ref (PA9,  TIMA0 CCP1)
+    {LEDCTRL_2_INST, DL_TIMER_CC_0_INDEX, 0},       // LED2 current ref (PB4,  TIMA1 CCP0)
+    {LEDCTRL_1_INST, DL_TIMER_CC_0_INDEX, 0},       // LED3 current ref (PB8,  TIMA0 CCP0)
+    {LEDCTRL_1_INST, DL_TIMER_CC_3_INDEX, 0},       // LED4 current ref (PA12, TIMA0 CCP3)
 };
 
 /* ============================================================================
@@ -1045,6 +1047,8 @@ void set_led_voltage(uint16_t voltage){
 void set_led_current(uint16_t current, LED_OUTPUT led){
     const PWM_Config *ch = (led == LED1) ? &_pwm_outputs[2]
                          : (led == LED2) ? &_pwm_outputs[3]
+                         : (led == LED3) ? &_pwm_outputs[4]
+                         : (led == LED4) ? &_pwm_outputs[5]
                          : (const PWM_Config *)0;
     if (ch == (const PWM_Config *)0) return;
 

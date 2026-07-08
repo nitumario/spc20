@@ -536,22 +536,30 @@ typedef struct {
      *   - LED bar display mode
      *   - battery percentage display state
      *
-     * Lamp brightness — per-lamp state for the two MCU-controllable LED-output
+     * Lamp brightness — per-lamp state for the four MCU-controllable LED-output
      * lamps, driven by main()'s lamp_buttons_update():
-     *   lamp_level[0] = lamp 1 (LEDCTRL1 / LED1, driven by BTN1)
-     *   lamp_level[1] = lamp 2 (LEDCTRL2 / LED2, driven by BTN2)
+     *   lamp_level[0] = lamp 1 (LEDCTRL1 / LED1, PA9  TIMA0 CCP1)
+     *   lamp_level[1] = lamp 2 (LEDCTRL2 / LED2, PB4  TIMA1 CCP0)
+     *   lamp_level[2] = lamp 3 (LEDCTRL3 / LED3, PB8  TIMA0 CCP0)
+     *   lamp_level[3] = lamp 4 (LEDCTRL4 / LED4, PA12 TIMA0 CCP3)
      * lamp_level is a brightness step: 0 = off, LAMP_DIM_LEVELS = full (mapped
      * to an LED current by lamp_level_ma[] in main.c). A short tap toggles
      * full/off; press-and-hold dims one level per LAMP_DIM_STEP_MS down to off.
-     * lamp_hold_steps counts the dim steps already applied in the current hold
-     * so the cadence is paced off the button's pressStartTime.
-     * Only LEDCTRL1/2 reach the MCU; the other LED channels (LEDCTRL3/4) are
-     * not routed to it and stay at their hardwired reference. energy_mode
-     * still owns the shared LED boost + output switch, so a lamp physically
-     * lights only when its level is non-zero AND the rail is up (e.g. not shed
-     * in SAFE_MODE).
+     *
+     * The two front-panel buttons each drive a *pair* of lamps as a synced
+     * group (see lamp_buttons_update()):
+     *   BTN1 -> lamps 1 & 2     BTN2 -> lamps 3 & 4
+     * lamp_hold_steps is therefore indexed per *button* (2 entries), counting
+     * the dim steps already applied in the current hold so the cadence is paced
+     * off the button's pressStartTime.
+     *
+     * All four LEDCTRL nets reach the MCU (schematic R2: LEDCTRL3=PB8,
+     * LEDCTRL4=PA12), sharing TIMA0 with LEDCTRL1 plus TIMA1 for LEDCTRL2.
+     * energy_mode still owns the shared LED boost + output switch, so a lamp
+     * physically lights only when its level is non-zero AND the rail is up
+     * (e.g. not shed in SAFE_MODE).
      */
-    uint8_t lamp_level[2];
+    uint8_t lamp_level[4];
     uint8_t lamp_hold_steps[2];
 
 } system_ctx_t;
@@ -622,10 +630,10 @@ static inline void ctx_init(system_ctx_t *ctx)
     /* Assume temperature OK until first measurement */
     ctx->temp_charge_ok = true;
 
-    /* Both lamps default to full brightness, mirroring the boot LED-current
+    /* All four lamps default to full brightness, mirroring the boot LED-current
      * arming in main(). A tap toggles full/off; press-and-hold dims to off. */
-    ctx->lamp_level[0] = LAMP_DIM_LEVELS;
-    ctx->lamp_level[1] = LAMP_DIM_LEVELS;
+    for (uint8_t i = 0; i < 4; i++)
+        ctx->lamp_level[i] = LAMP_DIM_LEVELS;
     ctx->lamp_hold_steps[0] = 0;
     ctx->lamp_hold_steps[1] = 0;
 }

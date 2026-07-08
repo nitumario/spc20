@@ -208,15 +208,16 @@ static void apply_pwm(system_ctx_t *c)
  * LAMP BUTTON HANDLER
  * =========================================================================
  *
- * The two front-panel buttons each toggle one LED-output lamp:
+ * The two front-panel buttons each drive a synced PAIR of LED-output lamps:
  *
- *   BTN1 (BUTTONS[0]) -> LEDCTRL1 (LED1) -> lamp 1
- *   BTN2 (BUTTONS[1]) -> LEDCTRL2 (LED2) -> lamp 2
+ *   BTN1 (BUTTONS[0]) -> LEDCTRL1+LEDCTRL2 (LED1, LED2) -> lamps 1 & 2
+ *   BTN2 (BUTTONS[1]) -> LEDCTRL3+LEDCTRL4 (LED3, LED4) -> lamps 3 & 4
  *
- * These are the only two of the four LED current-source channels wired to
- * the MCU (see MCU_pin_definitions.csv / SPC_20.syscfg). LEDCTRL3/LEDCTRL4
- * are not routed to the MCU, so the remaining lamps cannot be switched in
- * firmware — they sit at their hardwired reference (always on).
+ * All four LED current-source channels are wired to the MCU (schematic R2:
+ * LEDCTRL1=PA9, LEDCTRL2=PB4, LEDCTRL3=PB8, LEDCTRL4=PA12). LEDCTRL1/3/4
+ * share TIMA0 (CCP1/CCP0/CCP3); LEDCTRL2 is TIMA1 CCP0. The button->lamp
+ * grouping lives in btn_lamp_group[]; the gesture below is applied to both
+ * lamps in a group so they track as one.
  *
  * Two gestures per button (the HAL gives us press/release edges, a 500 ms
  * hold threshold in BUTTONS[].holdThreshold, and pressStartTime):
@@ -256,7 +257,14 @@ static const uint16_t lamp_level_ma[LAMP_DIM_LEVELS + 1] = {
     135, 135, 145, 145, LAMP_ON_CURRENT_MA,
 };
 
-static const LED_OUTPUT lamp_led[2] = { LED1, LED2 };
+static const LED_OUTPUT lamp_led[4] = { LED1, LED2, LED3, LED4 };
+
+/* Button -> lamp-group map. Each front-panel button drives a synced pair of
+ * lamps; the gesture is applied identically to both members of the group. */
+static const uint8_t btn_lamp_group[2][2] = {
+    { 0, 1 },   /* BTN1 (BUTTONS[0]) -> lamp 1 + lamp 2 */
+    { 2, 3 },   /* BTN2 (BUTTONS[1]) -> lamp 3 + lamp 4 */
+};
 
 /* Drive a lamp's current level to its LED channel and log the change. */
 static void lamp_apply(system_ctx_t *c, uint8_t i)
@@ -276,35 +284,45 @@ static void lamp_apply(system_ctx_t *c, uint8_t i)
 
 static void lamp_buttons_update(system_ctx_t *c)
 {
-    for (uint8_t i = 0; i < 2; i++) {
-        Button *btn = &BUTTONS[i];
+    for (uint8_t b = 0; b < 2; b++) {
+        Button *btn = &BUTTONS[b];
+        const uint8_t *grp = btn_lamp_group[b];   /* the two lamps this button drives */
 
-        /* New press: start a fresh hold-step count. */
+        /* New press: start a fresh hold-step count for this button. */
         if (is_button_pressed(btn))
-            c->lamp_hold_steps[i] = 0;
+            c->lamp_hold_steps[b] = 0;
 
         /* Hold = dim. While the button is physically down (state 0 = pressed),
-         * apply one level drop per LAMP_DIM_STEP_MS elapsed since press. The
-         * while-loop catches up if this runs late, keeping a steady cadence. */
+         * apply one level drop per LAMP_DIM_STEP_MS elapsed since press to BOTH
+         * lamps in the group. The while-loop catches up if this runs late,
+         * keeping a steady cadence. */
         if (btn->state == 0) {
             uint32_t held = time_now() - btn->pressStartTime;
             uint8_t due = (uint8_t)(held / LAMP_DIM_STEP_MS);
             if (due > LAMP_DIM_LEVELS) due = LAMP_DIM_LEVELS;
-            while (c->lamp_hold_steps[i] < due) {
-                c->lamp_hold_steps[i]++;
-                if (c->lamp_level[i] > 0) {
-                    c->lamp_level[i]--;
-                    lamp_apply(c, i);
+            while (c->lamp_hold_steps[b] < due) {
+                c->lamp_hold_steps[b]++;
+                for (uint8_t k = 0; k < 2; k++) {
+                    uint8_t i = grp[k];
+                    if (c->lamp_level[i] > 0) {
+                        c->lamp_level[i]--;
+                        lamp_apply(c, i);
+                    }
                 }
             }
         }
 
         /* Tap = toggle. A release that never crossed the hold threshold
          * (isHeld still false) is a short tap; a hold-release is ignored here
-         * because the dimming above already handled it. */
+         * because the dimming above already handled it. Toggle the whole group
+         * together, following the first lamp so the pair tracks as one. */
         if (is_button_released(btn) && !is_button_held(btn)) {
-            c->lamp_level[i] = (c->lamp_level[i] > 0) ? 0 : LAMP_DIM_LEVELS;
-            lamp_apply(c, i);
+            uint8_t level = (c->lamp_level[grp[0]] > 0) ? 0 : LAMP_DIM_LEVELS;
+            for (uint8_t k = 0; k < 2; k++) {
+                uint8_t i = grp[k];
+                c->lamp_level[i] = level;
+                lamp_apply(c, i);
+            }
         }
     }
 }
@@ -598,11 +616,11 @@ int main(void)
     }
 
     set_led_voltage(LED_BOOST_TARGET_MV);
-    /* Arm each controllable lamp to its boot brightness (both full by default
-     * — see ctx_init). The buttons tap-toggle / hold-dim these at runtime via
-     * lamp_buttons_update(). */
-    set_led_current(lamp_level_ma[ctx.lamp_level[0]], LED1);
-    set_led_current(lamp_level_ma[ctx.lamp_level[1]], LED2);
+    /* Arm each controllable lamp to its boot brightness (all four full by
+     * default — see ctx_init). The buttons tap-toggle / hold-dim these at
+     * runtime via lamp_buttons_update(): BTN1 -> lamps 1&2, BTN2 -> lamps 3&4. */
+    for (uint8_t i = 0; i < 4; i++)
+        set_led_current(lamp_level_ma[ctx.lamp_level[i]], lamp_led[i]);
 
     /* Bring up the front-panel bar graphs: blank, then a power-on segment
      * sweep so the operator sees the firmware came alive before the gauges
@@ -649,7 +667,7 @@ int main(void)
         if ((now - last_button) >= TICK_BUTTON_MS) {
             last_button = now;
             update_buttons();
-            lamp_buttons_update(&ctx);   /* toggle lamps 1/2 on button presses */
+            lamp_buttons_update(&ctx);   /* BTN1 -> lamps 1&2, BTN2 -> lamps 3&4 */
         }
 
         /* ── 50 ms tick: the deterministic pipeline ──

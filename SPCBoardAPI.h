@@ -44,6 +44,8 @@ void system_init(void);
 typedef enum {
     LED1,
     LED2,
+    LED3,
+    LED4,
     LED_NONE
 } LED_OUTPUT;
 
