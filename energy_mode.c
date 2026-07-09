@@ -149,6 +149,19 @@ static void activate_charger_region(system_ctx_t *ctx)
 
 /* ── Per-state entry actions ── */
 
+/* USB_EN is owned by energy_mode, but the LOAD_DUMP_TEST bench build can force
+ * it off while both buttons are held (ctx->usb_force_off, set in load_dump_test()).
+ * Route every entry-action USB enable through here so the dump's USB cut isn't
+ * undone by the mode transition that dropping the USB load itself triggers.
+ * In a production build usb_force_off is always false → plain enable_usb_boost(). */
+static void em_set_usb(system_ctx_t *ctx)
+{
+    if (ctx->usb_force_off)
+        disable_usb_boost();
+    else
+        enable_usb_boost();
+}
+
 static void enter_idle(system_ctx_t *ctx)
 {
     disable_charge_switch();
@@ -160,7 +173,7 @@ static void enter_idle(system_ctx_t *ctx)
      * be running for any current to flow — see set_led_current() in main(). */
     enable_battery_switch();
     enable_output_switch();
-    enable_usb_boost();
+    em_set_usb(ctx);
     enable_led_boost();
     disable_input_buck();
 
@@ -175,7 +188,7 @@ static void enter_charge_only(system_ctx_t *ctx)
      * otherwise a load appearing mid-charge can never trip has_load and we'd
      * never advance to CHARGE_AND_LOAD. */
     enable_output_switch();
-    enable_usb_boost();
+    em_set_usb(ctx);
     enable_led_boost();
 
     activate_charger_region(ctx);
@@ -185,7 +198,7 @@ static void enter_charge_and_load(system_ctx_t *ctx)
 {
     enable_battery_switch();
     enable_output_switch();
-    enable_usb_boost();
+    em_set_usb(ctx);
     enable_led_boost();
 
     activate_charger_region(ctx);
@@ -197,7 +210,7 @@ static void enter_discharge_only(system_ctx_t *ctx)
     disable_input_buck();
     enable_battery_switch();
     enable_output_switch();
-    enable_usb_boost();
+    em_set_usb(ctx);
     enable_led_boost();
 }
 

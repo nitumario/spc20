@@ -532,6 +532,13 @@ typedef struct {
                                       * EM_SAFE_MODE was entered (sleep timer) */
     bool     idle_sleep_pending;     /* true = timeout reached, enter sleep     */
 
+    /* Bench override (LOAD_DUMP_TEST): when true, energy_mode's entry actions
+     * keep USB_EN OFF instead of enabling it. energy_mode owns USB_EN and would
+     * otherwise re-enable the rail on the mode transition that dropping the USB
+     * load itself triggers — see load_dump_test() in main.c. Always false in a
+     * production build (nothing sets it), so behaviour is unchanged there. */
+    bool     usb_force_off;
+
     /* Region 2: charger */
     charger_ctx_t charger;
 

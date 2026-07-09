@@ -274,6 +274,15 @@
 #define LAMP_DIM_LEVELS           20
 #define LAMP_DIM_STEP_MS          250
 
+/* Bench instrumentation (NOT for production). When 1, holding BOTH front-panel
+ * buttons past the 500 ms hold threshold cuts all four lamps to off in a single
+ * 20 ms tick — a synchronized load dump so the charge-current transient can be
+ * captured on an oscilloscope (CH1 = I_CHARGE amp output). Fires once per
+ * gesture; release both buttons to re-arm. Leave a USB load running separately
+ * as extra baseline — it stays through the dump. See load_dump_test() in main.c.
+ * Keep 0 in normal builds; flip to 1 only for the bench flash. */
+#define LOAD_DUMP_TEST            1
+
 /* =========================================================================
  * 4. LOAD DETECTION
  * =========================================================================

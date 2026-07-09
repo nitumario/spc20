@@ -331,6 +331,76 @@ static void lamp_buttons_update(system_ctx_t *c)
     }
 }
 
+#if LOAD_DUMP_TEST
+/* Bench-only synchronized load dump (hw_config.h LOAD_DUMP_TEST). In this build
+ * the normal lamp buttons are disabled (see the call site) so a stray tap can't
+ * change the load mid-test — this handler owns the lamps entirely:
+ *
+ *   - LOAD: with both buttons up and no load applied (at boot, and after each
+ *     dump), it drives all four lamps to full and re-enables the USB rail (clearing
+ *     usb_force_off) so there's a full load to dump, and emits "LOAD_ARMED".
+ *   - DUMP: holding BOTH buttons past their 500 ms hold threshold drops all four
+ *     lamps to the off-floor AND cuts the USB rail in ONE tick, redirecting the
+ *     buck's surplus into the battery so CH1 (I_CHARGE) captures the transient, and
+ *     emits "LOAD_DUMP". The four set_led_current() calls and disable_usb_boost()
+ *     run back-to-back with NO UART between them, so the whole load drops within
+ *     microseconds (lamp_apply() is avoided here precisely because its per-lamp
+ *     logging would stagger the drops ~1 ms).
+ *
+ * Cutting USB needs the usb_force_off override: energy_mode OWNS USB_EN and
+ * re-enables it on the very next mode transition — and dropping the USB load itself
+ * causes that transition (DISCHARGE_ONLY → IDLE). Without the latch the rail comes
+ * straight back on and, because the AP2151 load switches can't restart into a
+ * still-plugged device (they stall ~0.9-1.6 V), oscillates 5V → ~1.6V → 0. The
+ * DUMP branch sets usb_force_off so energy_mode's entry actions keep USB off for
+ * the whole hold; the LOAD branch clears it on release.
+ *
+ * The load auto-reloads on the next both-up, so the test is repeatable: dump →
+ * hold (lamps + USB stay off) → release both → lamps + USB come back → dump again.
+ * NOTE: on release, re-enabling USB into a still-plugged CC bench load can itself
+ * stall the AP2151 at ~1.6 V (hardware limit) — fine for a self-limiting/resistive
+ * load; with a stubborn CC load, drop the load before releasing. */
+static void load_dump_test(system_ctx_t *c)
+{
+    static bool loaded = false;   /* is the lamp load currently applied? */
+
+    bool both_up   = (BUTTONS[0].state == 1) && (BUTTONS[1].state == 1);
+    /* isHeld latches — update_buttons() only clears it on the next press-down
+     * edge, not on release — so it stays set after the buttons come back up.
+     * Gate on state==0 (currently pressed) too, or the dump re-fires every tick
+     * after release and races the re-arm (endless LOAD_DUMP/LOAD_ARMED). */
+    bool both_held = (BUTTONS[0].state == 0) && is_button_held(&BUTTONS[0]) &&
+                     (BUTTONS[1].state == 0) && is_button_held(&BUTTONS[1]);
+
+    /* (Re)load the lamps to full once both buttons are up and nothing is applied,
+     * and release the USB override so energy_mode brings the rail back. */
+    if (both_up && !loaded) {
+        for (uint8_t i = 0; i < 4; i++) {
+            c->lamp_level[i] = LAMP_DIM_LEVELS;
+            set_led_current(lamp_level_ma[LAMP_DIM_LEVELS], lamp_led[i]);
+        }
+        c->usb_force_off = false;            /* let energy_mode re-enable USB */
+        enable_usb_boost();
+        loaded = true;
+        send_string("LOAD_ARMED\r\n");
+    }
+
+    /* Dump: both held → cut all four lamps AND the USB rail in one tick, and latch
+     * usb_force_off so energy_mode keeps USB off (it re-enables on the DISCHARGE_ONLY
+     * → IDLE transition the load-drop causes) until the buttons are released. */
+    if (loaded && both_held) {
+        loaded = false;                      /* re-load on next both-up */
+        for (uint8_t i = 0; i < 4; i++) {
+            c->lamp_level[i] = 0;
+            set_led_current(0, lamp_led[i]); /* all four back-to-back, no UART between */
+        }
+        c->usb_force_off = true;
+        disable_usb_boost();                 /* boost EN + both AP2151 load switches, still no UART */
+        send_string("LOAD_DUMP\r\n");        /* scope/telemetry marker */
+    }
+}
+#endif
+
 /* =========================================================================
  * LED BAR DISPLAY — UI policy layer
  * =========================================================================
@@ -929,7 +999,11 @@ int main(void)
         if ((now - last_button) >= TICK_BUTTON_MS) {
             last_button = now;
             update_buttons();
+#if LOAD_DUMP_TEST
+            load_dump_test(&ctx);        /* both-button hold = load dump; normal lamp buttons disabled */
+#else
             lamp_buttons_update(&ctx);   /* BTN1 -> lamps 1&2, BTN2 -> lamps 3&4 */
+#endif
         }
 
         /* ── 50 ms tick: the deterministic pipeline ──
