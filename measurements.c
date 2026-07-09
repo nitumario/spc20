@@ -119,11 +119,20 @@ void measurements_update(system_ctx_t *ctx)
      *   Positive = battery is gaining charge (charging)
      *   Negative = battery is losing charge (discharging)
      *
-     *   chg_current is what flows through the charge MOSFET into the battery.
-     *   dsg_current is what flows out through the discharge MOSFET to loads.
-     *   The difference is the net current into the battery.
+     * chg_current IS the net battery current directly. Per the R2 schematic
+     * (Charger sheet), the buck output (VCHG) fans out into three separate
+     * shunt-sensed branches:
+     *   - R440 (5 mR) in the 3V2BAT battery branch  -> I_CHARGE  (chg_current)
+     *   - R432 (5 mR) in the 3VOUT output branch     -> I_DISCHARGE (dsg_current)
+     *   - panel-side shunt                           -> I_PANEL   (panel_current)
+     * The charge sensor is bidirectional (mid-ref offset, signed): it already
+     * reads what actually flows in/out of the cell. The load runs in its OWN
+     * branch (dsg_current), fed straight off the bus by the buck — it never
+     * passes through the charge shunt. So do NOT subtract dsg_current here;
+     * that double-counts the load and shows a phantom discharge whenever the
+     * buck is simultaneously charging and carrying a load.
      */
-    m->i_bat_net = (int32_t)m->chg_current - (int32_t)m->dsg_current;
+    m->i_bat_net = (int32_t)m->chg_current;
 
     /* ── Temperature (°C) ── */
     m->bat_temp   = get_temperature(TEMP1);
@@ -196,29 +205,55 @@ void flags_update(system_ctx_t *ctx)
     uint32_t now = time_now();
     bool charging = (ctx->energy_mode == EM_CHARGE_ONLY ||
                      ctx->energy_mode == EM_CHARGE_AND_LOAD);
-    bool panel_unusable = charging && (m->panel_power < PANEL_USABLE_MIN_MW);
 
+    /* Path 1 — voltage collapse / sunset (the original debounce). A dark or
+     * loaded-into-the-knee panel reads below PANEL_MIN_CLEAR_MV. This counter
+     * now sees ONLY the voltage signal, so a transient regulation collapse
+     * resets it the instant V_panel recovers and it can no longer CHAIN into
+     * the power path below. That chaining was the charge-on/off bug: an MPPT
+     * probe drove the panel over its knee (~1 s of sub-4200 mV readings), the
+     * panel_safety_backoff then overshot the rail up to near open circuit
+     * (P_panel < the dusk floor) — and because both conditions fed one 30-tick
+     * counter without ever resetting, a recoverable ~1 s dip reached the clear
+     * threshold and tore the whole charger down into a fresh MPPT re-climb. */
     bool sun_set   = (m->panel_voltage > PANEL_MIN_MV) &&
                      (now >= ctx->has_sun_relock_ms);
-    bool sun_clear = (m->panel_voltage < PANEL_MIN_CLEAR_MV) || panel_unusable;
-
-    bool was_sun = ctx->flag_has_sun.value;
+    bool sun_clear = (m->panel_voltage < PANEL_MIN_CLEAR_MV);
     debounce_update(&ctx->flag_has_sun, sun_set, sun_clear);
 
-    /* If this tick is the one that cleared has_sun and the panel-power path
-     * was the reason, arm the re-set lockout so the floating Voc can't
-     * immediately re-arm the charger. */
-    if (was_sun && !ctx->flag_has_sun.value && panel_unusable)
-        ctx->has_sun_relock_ms = now + HAS_SUN_RELOCK_MS;
+    /* Path 2 — dead-but-floating panel at dusk. The charger is loading the
+     * panel yet it delivers < PANEL_USABLE_MIN_MW while still floating near Voc
+     * (V_panel > PANEL_MIN_MV, so path 1 never fires). Runs on its OWN, longer
+     * counter (HAS_SUN_DUSK_CLEAR_COUNT) so the inner loop's near-OC re-acquire
+     * (LOAD_REACQUIRE_MA, ~1-2 s) can restore delivered power before this
+     * trips. Gated on V_panel HIGH: during a real collapse V_panel is LOW, so
+     * that event advances path 1, not this one — the two can't compound.
+     * Clearing here arms the re-set lockout, since the unloaded panel floats
+     * straight back above PANEL_MIN_MV (re-probe ~once a minute, not instantly). */
+    bool panel_dead = ctx->flag_has_sun.value && charging &&
+                      (m->panel_voltage > PANEL_MIN_MV) &&
+                      (m->panel_power   < PANEL_USABLE_MIN_MW);
+    if (panel_dead) {
+        if (++ctx->has_sun_dusk_count >= HAS_SUN_DUSK_CLEAR_COUNT) {
+            ctx->flag_has_sun.value = false;
+            ctx->flag_has_sun.count = 0;
+            ctx->has_sun_dusk_count = 0;
+            ctx->has_sun_relock_ms  = now + HAS_SUN_RELOCK_MS;
+        }
+    } else {
+        ctx->has_sun_dusk_count = 0;
+    }
 
     /* ── has_load: hysteresis only ──
      *
-     * Set when I_discharge > 50 mA.
-     * Clear when I_discharge < 30 mA.
+     * Set when I_discharge > LOAD_DETECT_MA (120 mA).
+     * Clear when I_discharge < LOAD_DETECT_CLEAR_MA (80 mA).
      *
-     * The 20 mA gap prevents toggling from sensor noise around the
-     * threshold. No debounce count needed — load connect/disconnect
-     * events are clean transitions, not gradual like solar.
+     * Both thresholds clear the discharge shunt's ~45 mA zero-offset so the
+     * offset floor can't latch or hold has_load with nothing plugged in. The
+     * 40 mA gap prevents toggling from sensor noise around the threshold. No
+     * debounce count needed — load connect/disconnect events are clean
+     * transitions, not gradual like solar.
      */
     if (ctx->has_load) {
         if (m->dsg_current < LOAD_DETECT_CLEAR_MA)

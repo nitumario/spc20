@@ -25,7 +25,7 @@
  *     │    EM_DISCHARGE_ONLY → EM_SAFE_MODE                    │
  *     │    Controls: CHARGER_EN, BATTERY_EN, OUTPUT_EN, USB_EN  │
  *     │    Activates/deactivates the charger region             │
- *     │    Sleep is entered from EM_IDLE after timeout          │
+ *     │    Sleep entered from EM_IDLE / EM_SAFE_MODE on timeout │
  *     │                                                         │
  *     │  [region 2: CHARGER]                                    │
  *     │    CHG_INACTIVE → CHG_PRECHARGE → CHG_CC → CHG_CV      │
@@ -93,8 +93,11 @@
  * protective actions; ENERGY_MGMT sees those flags and reacts.
  *
  * There is no SYS_SLEEP state. Sleep is an action taken from
- * EM_IDLE (inside ENERGY_MGMT) after a timeout. The MCU enters
- * low-power mode and wakes back into SYS_RUN via interrupt.
+ * EM_IDLE or EM_SAFE_MODE (inside ENERGY_MGMT) after a timeout:
+ * main()'s system_sleep() parks the MCU in STANDBY0 (LFCLK only)
+ * and wakes back into SYS_RUN on a button edge or when a periodic
+ * wake-check (LFCLK timer) sees sun / a load / a battery condition
+ * that the current state would react to.
  */
 typedef enum {
     SYS_INIT,
@@ -173,7 +176,8 @@ typedef enum {
  *   - chg_current: can read negative if current flows backward
  *     (shouldn't happen in normal operation, but the sensor can see it)
  *   - i_bat_net: signed. positive = battery charging, negative = discharging.
- *     This is derived: chg_current − dsg_current.
+ *     Equal to chg_current: the charge shunt sits in the battery branch and
+ *     already reads net cell current (the load runs in its own branch).
  */
 typedef struct {
     /* Voltages (mV) */
@@ -191,7 +195,7 @@ typedef struct {
 
     /* Derived */
     int32_t  panel_power;       /* panel_voltage × panel_current / 1000  (mW) */
-    int32_t  i_bat_net;         /* chg_current − dsg_current (signed, mA)     */
+    int32_t  i_bat_net;         /* = chg_current (battery-branch shunt, signed mA) */
 
     /* Temperature (°C, from thermistor lookup) */
     int16_t  bat_temp;          /* battery temperature sensor                  */
@@ -497,6 +501,12 @@ typedef struct {
     uint32_t has_sun_relock_ms;      /* suppress has_sun re-set until time_now() reaches this;
                                       * armed when a panel-power clear fires (flags_update) so a
                                       * dead-but-floating panel can't re-arm the charger instantly */
+    uint16_t has_sun_dusk_count;     /* dusk detector: consecutive ticks the panel floats high yet
+                                      * delivers < PANEL_USABLE_MIN_MW while charging. Its OWN
+                                      * counter (NOT the flag_has_sun debounce) so a transient
+                                      * regulation collapse can't chain the voltage + power clear
+                                      * paths into one 30-tick teardown. See HAS_SUN_DUSK_CLEAR_COUNT
+                                      * and flags_update(). */
     bool has_load;                   /* I_dsg > LOAD_DETECT_MA (hysteresis) */
     bool bat_full;                   /* charger signaled taper complete     */
     bool panel_limited;              /* I_chg < allowed_chg - margin AND sun */
@@ -518,8 +528,9 @@ typedef struct {
 
     /* Region 1: energy mode */
     energy_mode_state_t energy_mode;
-    uint32_t idle_start_ms;          /* when EM_IDLE was entered (sleep timer)  */
-    bool     idle_sleep_pending;     /* true = idle timeout reached, enter sleep*/
+    uint32_t idle_start_ms;          /* inactivity anchor: when EM_IDLE or
+                                      * EM_SAFE_MODE was entered (sleep timer) */
+    bool     idle_sleep_pending;     /* true = timeout reached, enter sleep     */
 
     /* Region 2: charger */
     charger_ctx_t charger;
@@ -626,6 +637,7 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->flag_has_sun.count_threshold = HAS_SUN_DEBOUNCE_COUNT;
     ctx->flag_has_sun.clear_threshold = HAS_SUN_CLEAR_COUNT;
     ctx->has_sun_relock_ms = 0;      /* no lockout at boot — probe the panel immediately */
+    ctx->has_sun_dusk_count = 0;
 
     /* Assume temperature OK until first measurement */
     ctx->temp_charge_ok = true;

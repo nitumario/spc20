@@ -38,4 +38,12 @@
 /* evaluate flags → transition energy mode → set hardware enables */
 void energy_mode_update(system_ctx_t *ctx);
 
+/* Re-apply the CURRENT state's entry actions (hardware enables) without a
+ * transition. Used by system_sleep() on full wake to restore the rails it
+ * tore down for STANDBY (LED boost, sense front-end) exactly as the active
+ * state prescribes — IDLE gets its detection rails back, SAFE_MODE stays
+ * shed. Also re-anchors the state's inactivity timer (enter_* actions).
+ * Same mechanism as the fault-clear re-arm inside energy_mode_update(). */
+void energy_mode_reapply_entry(system_ctx_t *ctx);
+
 #endif /* ENERGY_MODE_H */

@@ -236,6 +236,27 @@ void refresh_vbatm_sense(void){
     DL_GPIO_setPins(EN_VBATM_EN_PORT, EN_VBATM_EN_PIN);
 }
 
+/*
+ * Measurement front-end gating for sleep.
+ *
+ * VBATM_EN (battery-sense divider) and CRT_SNS_EN (current-sense amps) are
+ * asserted once at boot in system_init() and normally stay on. During
+ * STANDBY windows nothing reads the ADC, so their quiescent draw is pure
+ * waste — the sleep loop parks them low and re-asserts them at the start
+ * of every wake-check. The re-assert IS the fresh enable edge the VBATM
+ * sense latch needs (see refresh_vbatm_sense above), so gating is safe by
+ * the same mechanism that already re-pulses it every second in normal RUN.
+ */
+void enable_measure_sense(void){
+    DL_GPIO_setPins(EN_VBATM_EN_PORT, EN_VBATM_EN_PIN);
+    DL_GPIO_setPins(EN_CRT_SNS_EN_PORT, EN_CRT_SNS_EN_PIN);
+}
+
+void disable_measure_sense(void){
+    DL_GPIO_clearPins(EN_VBATM_EN_PORT, EN_VBATM_EN_PIN);
+    DL_GPIO_clearPins(EN_CRT_SNS_EN_PORT, EN_CRT_SNS_EN_PIN);
+}
+
 
 /* ============================================================================
  * ADC MODULE - CONFIGURATION, FILTERING, AND CONVERSION
@@ -606,6 +627,14 @@ void GROUP1_IRQHandler(void){
     }
     uint32_t b_status = DL_GPIO_getEnabledInterruptStatus(GPIOB, 0xFFFFFFFFu);
     if(b_status){
+        /* Button edge → wake flag for the sleep loop. GROUP1's NVIC line is
+         * only enabled while sleeping (buttons are polled in normal RUN), so
+         * this fires exclusively as a STANDBY wake source. Both edges are
+         * armed (RISE_FALL in SysConfig): a press that happened before WFI
+         * still delivers its release edge, so a wake can't be lost. */
+        if(b_status & (BTNS_BTN1_PIN | BTNS_BTN2_PIN)){
+            gButtonWakeFlag = true;
+        }
         DL_GPIO_clearInterruptStatus(GPIOB, b_status);
     }
 }
@@ -717,6 +746,28 @@ uint32_t get_output_power(void){
 
 int32_t get_power_into_battery(void){
     return (int32_t)get_battery_voltage()*get_charge_current();
+}
+
+/*
+ * Instantaneous variants for the sleep wake-check: identical conversion
+ * math to the averaged getters above, but sourced from the latest raw
+ * conversion result (Adc*Result, refreshed on every harvest) instead of
+ * avg_readings. After a STANDBY window the 64-sample moving average is a
+ * mixture of previous wake-checks; one fresh harvest makes these current.
+ * Channel indices per the read_adc_values() mapping comment:
+ *   ADC0 mem0 = I_DISCHARGE, mem2 = VBATM; ADC1 mem0 = VPANEL.
+ */
+uint16_t get_input_voltage_now(void){
+    return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc1Result[0]/(ADC.max_adc1_value)/VPANEL_DIV_RATIO);
+}
+
+uint16_t get_battery_voltage_now(void){
+    return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc0Result[2]/(ADC.max_adc0_value)/VBATM_DIV_RATIO);
+}
+
+uint16_t get_discharge_current_now(void){
+    float v_idischarge = (ADC.VREF*(float)ADC.Adc0Result[0]/(ADC.max_adc0_value));
+    return (uint16_t)(v_idischarge/OUT_CUR_GAIN/CHG_CUR_RES);
 }
 
 uint16_t get_led_transistor_voltage(LED_OUTPUT led){
@@ -1447,6 +1498,18 @@ void update_timestamp(void){
     timestamp++;
 }
 
+/*
+ * Credit time that passed while SysTick was stopped (STANDBY). The sleep
+ * loop measures the slept duration on the LFCLK wake timer and adds it
+ * here so every time_now()-based schedule (debounce, relock windows, tick
+ * baselines) sees continuous wall-clock time across sleep. Caller must
+ * hold PRIMASK (or have SysTick stopped) — this is a read-modify-write
+ * against the ISR's increment.
+ */
+void timestamp_advance(uint32_t ms){
+    timestamp += ms;
+}
+
 uint32_t time_now(void){
     return timestamp;
 }
@@ -1456,6 +1519,10 @@ uint32_t time_now(void){
  * ============================================================================ */
 
 volatile bool check_buttons = false;
+
+/* Sleep wake source: set by GROUP1_IRQHandler on any BTN1/BTN2 edge while
+ * the sleep loop has the GROUP1 NVIC line enabled. See SPCBoardAPI.h. */
+volatile bool gButtonWakeFlag = false;
 
 void buttons_init(void) { }
 

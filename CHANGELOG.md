@@ -1,3 +1,34 @@
+# [v0.20] - 08.07.26
+## Real deep sleep: STANDBY0 with button wake + periodic wake-checks (IDLE and SAFE_MODE)
+
+Changed files: `main.c`, `energy_mode.c`, `energy_mode.h`, `SPCBoardAPI.c`, `SPCBoardAPI.h`, `system_types.h`, `hw_config.h`
+
+### Why
+The old idle sleep was a bare `__WFI()` that could not work. The SysConfig power policy has always been STANDBY0, so the WFI did drop the core into deep sleep — but **no wake source was armed**: the buttons' GPIO interrupts were configured at pin level yet the GROUP1 NVIC line was never enabled (`usb_fault_init()` is commented out), and the LFCLK wake timer provisioned in the syscfg (`ADC_LOW_POWER`, TIMG8) was never started. The only enabled interrupts were UART RX (noise), RTC READY, and stale ADC completions — so the device either woke instantly on a leftover ADC/SysTick pend (and then ran at full power for another 2 minutes) or dozed with no legitimate way to ever notice sun, a load, or a button again. Worse, STANDBY freezes the PD1 PWM timers, so a wake would have resumed with all four PWM peripherals' registers wiped (see retention below) and — with the LED boost left enabled by `enter_idle()` — a LEDCTRL pin frozen low is the runaway max-LED-current state from the 2026-06-16 bench session.
+
+### NEW: `system_sleep()` (`main.c`)
+- Entered from the main loop on `idle_sleep_pending`. Holds the MCU in STANDBY0; only returns on a real wake condition, with hardware restored and the ms clock corrected.
+- **Wake sources** (armed only inside sleep): BTN1/BTN2 edges via GROUP1 (immediate full wake — `gButtonWakeFlag` set by the ISR), and TIMG8 `ADC_LOW_POWER` (STANDBY-capable, LFCLK 16 Hz) firing every `SLEEP_WAKE_INTERVAL_MS` (10 s) for a wake-check.
+- **Wake-check** (~`SLEEP_CHECK_SETTLE_MS` = 60 ms awake): sense rails re-asserted, SysTick resumes and refills the ADC, then raw single-sample thresholds decide full wake vs re-sleep. From IDLE: `V_panel > PANEL_MIN_MV` (respecting the dusk relock), `I_dsg > LOAD_DETECT_MA`, or `V_bat < BAT_LOW_MV` (cell present > 500 mV). From SAFE_MODE: only `V_bat > BAT_SAFE_RECOVER_MV` — waking for sun would spin awake all day while the recovery latch holds. False wakes are cheap: the debounced pipeline re-verifies and re-sleeps after one idle timeout.
+- **Lost-wakeup race closed**: WFI runs under PRIMASK with SysTick stopped and its pended exception cleared (`PENDSTCLR`) — a button edge in the check window pends in the NVIC and makes WFI fall through instead of being consumed early.
+- **Timekeeping**: slept duration is measured on the LFCLK timer (full interval when the ZERO event is NVIC-pending, else `LOAD − count`) and credited via new `timestamp_advance()` under PRIMASK — `time_now()` is continuous across sleep, so debounce windows, the has_sun relock, and tick baselines survive unaware.
+- **PD1 retention handled**: TIMG6 (buck FB), TIMG7 (LED boost), TIMA0/TIMA1 (LEDCTRL) lose their registers in STANDBY (SysConfig warning; everything else used is PD0 or retentive). `SYSCFG_DL_saveConfiguration()` at entry, `SYSCFG_DL_restoreConfiguration()` at wake, then `set_buck_pwm(ctx->pwm)` / `set_led_voltage()` / `set_led_current()` re-commit application values before `energy_mode_reapply_entry()` re-enables any rail.
+- **What sleep powers down** beyond the entered state: LED boost rail (mandatory — LEDCTRL freeze hazard; gated on all lamps off so nothing visible is lost), LED bar display (content blanked + anodes parked), measurement front-end (`VBATM_EN` + `CRT_SNS_EN`, re-asserted per check — the enable edge is the same re-lock `refresh_vbatm_sense()` uses), and the unused RTC READY interrupt. **USB boost + AP2151s stay ON in IDLE**: they cannot restart into a plugged load (2026-07-08 revert), so a USB device plugged mid-sleep is powered by hardware immediately and detected at the next check.
+- UART: entry/exit lines (`SLEEP: enter (IDLE) …` / `SLEEP: wake=BTN|SUN|LOAD|VBAT slept=… checks=…`); TX shifter drained before clock-gating so the last byte isn't garbled.
+
+### CHANGED: sleep entry policy (`energy_mode.c`)
+- `maybe_arm_sleep()` replaces the inline IDLE timeout: arms after `IDLE_SLEEP_TIMEOUT_MS` gated on **no latched fault** (recovery needs pipeline ticks — sleeping would freeze a recoverable fault indefinitely) and, in IDLE, **all lamps off** (never kill a lamp the user lit to save power).
+- **SAFE_MODE now sleeps too** (same timeout, no lamp gate — the rail is already shed): with loads shed, the awake MCU plus the blinking bar graphs were the dominant drain on an already-low cell. `enter_safe_mode()` anchors `idle_start_ms` (which is now the shared IDLE/SAFE inactivity anchor). Note the bars stop blinking while asleep; a button press wakes for one timeout window and shows the SAFE blink again.
+- `energy_mode_reapply_entry()` exported: re-applies the current state's entry actions (same mechanism as the fault-clear re-arm) so sleep restores IDLE's detection rails but keeps SAFE_MODE shed.
+
+### NEW: HAL support (`SPCBoardAPI.c/.h`)
+- `gButtonWakeFlag` + GROUP1 ISR button-edge detection; `timestamp_advance()`; `enable/disable_measure_sense()` (VBATM_EN + CRT_SNS_EN pair); `get_input_voltage_now()` / `get_battery_voltage_now()` / `get_discharge_current_now()` — instantaneous (latest-conversion) variants for the wake-check, since the 64-sample averages are stale after a STANDBY window.
+
+### Bench validation needed
+Timer-only change validated by compile (tiarmclang 4.0.4, zero warnings) — needs hardware: (1) UART shows `SLEEP: enter` ~2 min after dark/no-load, then silence with wake-check gaps; (2) supply current drops between checks (MCU STANDBY ~µA vs mA); (3) button press wakes instantly and the tap still toggles the lamp; (4) lamp/USB PWM behavior after a sleep→wake cycle (retention restore!); (5) `wake=SUN` on panel illumination and `wake=LOAD` ≤10 s after plugging a USB load; (6) SAFE_MODE sleep + `wake=VBAT` on recovery; (7) JTAG note: STANDBY kills the debug session — bench with UART, not the debugger.
+
+---
+
 # [v0.19] - 17.06.26
 ## Front-panel LED bar graphs: battery + panel-power gauges with boot sweep
 

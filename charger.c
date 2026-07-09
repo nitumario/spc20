@@ -285,8 +285,24 @@ static void cc_regulate(system_ctx_t *ctx)
     } else if (v_panel > v_sp + (int32_t)PANEL_VREG_DEADBAND_MV) {
         /* Above MPP with current-headroom (clamp 1 didn't fire) → DRAW MORE (pwm DOWN) → V falls. */
         pwm_step(ctx, -PANEL_VREG_STEP);
+    } else if (i_chg < (int32_t)LOAD_REACQUIRE_MA) {
+        /* Clamp 3: in-band but delivering ~nothing → RE-ACQUIRE (pwm DOWN).
+         * This is the tail of a panel_safety_backoff overshoot: the emergency
+         * backoff snapped the rail from a collapse straight up to near open
+         * circuit, which sits INSIDE the wide deadband, so both branches above
+         * hold and the buck idles unloaded (chg_current ~10 mA). Left alone,
+         * P_panel stays below the dusk floor and has_sun eventually gives up —
+         * the charge-on/off teardown. Instead keep drawing more, one paced
+         * step, to walk the operating point back onto the panel. Self-limiting:
+         * stops the instant current returns above LOAD_REACQUIRE_MA. On a dead
+         * panel at dusk it loads the panel down until V_panel collapses and the
+         * voltage-path has_sun clear fires. cc_regulate only runs in
+         * PRECHARGE/CC (CV uses cv_regulate), so there is no CV interaction, and
+         * clamps 0/1 already returned for reverse / over-current, so this can
+         * only fire in the genuine near-open-circuit dead zone. */
+        pwm_step(ctx, -PANEL_VREG_STEP);
     }
-    /* Within the deadband around the MPP → stable, hold PWM. */
+    /* Within the deadband and delivering current → stable, hold PWM. */
 }
 #else
 /*

@@ -74,6 +74,12 @@ void timer_init(void);
 void update_timestamp(void);
 uint32_t time_now(void);
 
+/* Credit wall-clock time that passed while SysTick was stopped (STANDBY).
+ * Called by the sleep loop with the slept duration measured on the LFCLK
+ * wake timer, so time_now()-based scheduling stays continuous across sleep.
+ * Call only with the SysTick interrupt masked/stopped (read-modify-write). */
+void timestamp_advance(uint32_t ms);
+
 /* ============================================================================
  * GPIO CONTROL FUNCTIONS
  * ============================================================================ */
@@ -98,6 +104,15 @@ void disable_battery_switch(void);
 /* Re-pulse VBATM_EN so the battery-voltage sense divider re-locks to a
  * cell hot-plugged/removed after boot. Call periodically on a slow tick. */
 void refresh_vbatm_sense(void);
+
+/* Gate the measurement front-end (VBATM_EN battery-sense divider +
+ * CRT_SNS_EN current-sense amps) as a pair. Disabled across STANDBY
+ * windows to stop their quiescent draw; every enable provides the fresh
+ * rising edge the VBATM sense latch needs (same mechanism as
+ * refresh_vbatm_sense). Settle is µs-scale — well inside the sleep
+ * check's SLEEP_CHECK_SETTLE_MS. */
+void enable_measure_sense(void);
+void disable_measure_sense(void);
 
 /* ============================================================================
  * ADC MODULE
@@ -132,6 +147,17 @@ int16_t  get_temperature(TEMP_SENSOR temp_sensor);    /* °C, truncated */
 int32_t  get_input_power(void);            /* mW */
 uint32_t get_output_power(void);           /* mW */
 int32_t  get_power_into_battery(void);     /* mW */
+
+/* Instantaneous (latest-conversion) readings for the sleep wake-check.
+ * The get_*() functions above read the 64-sample moving average, which
+ * after a STANDBY window still holds samples from previous wake-checks;
+ * these read the most recent raw conversion result instead (per-channel
+ * HW averaging still applies), so a single fresh harvest is enough to
+ * evaluate the coarse wake thresholds. Not for regulation — single-sample
+ * noise is fine against thresholds with tens-of-mV / tens-of-mA margins. */
+uint16_t get_input_voltage_now(void);      /* V_panel, mV */
+uint16_t get_battery_voltage_now(void);    /* V_bat,   mV */
+uint16_t get_discharge_current_now(void);  /* I_dsg,   mA */
 
 /* ============================================================================
  * PWM MODULE
@@ -196,6 +222,12 @@ typedef struct {
 
 extern volatile bool check_buttons;
 extern Button BUTTONS[2];
+
+/* Set by GROUP1_IRQHandler on any BTN1/BTN2 edge. Only meaningful while
+ * the sleep loop has the GROUP1 NVIC line enabled (it is disabled in
+ * normal RUN, where buttons are polled); the sleep loop clears it at
+ * entry and treats it as "user touched the panel → full wake". */
+extern volatile bool gButtonWakeFlag;
 
 void buttons_init(void);
 bool get_button_state(const Button* btn);

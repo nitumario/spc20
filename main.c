@@ -24,6 +24,10 @@
  * Other periodic tasks (independent of the pipeline):
  *   - Buttons polled every TICK_BUTTON_MS (20 ms)
  *   - UART logging every TICK_LOG_MS (1000 ms)
+ *
+ * Deep sleep: after IDLE_SLEEP_TIMEOUT_MS of unchanged IDLE/SAFE_MODE,
+ * system_sleep() parks the MCU in STANDBY0 with button-edge wake and a
+ * periodic LFCLK wake-check (see the DEEP SLEEP section below).
  */
 
 #include "ti_msp_dl_config.h"
@@ -78,7 +82,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.19\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.20\r\n"
                 "==============================================\r\n");
 }
 
@@ -508,6 +512,264 @@ void HardFault_Handler(void)
 }
 
 /* =========================================================================
+ * DEEP SLEEP — STANDBY0 with button + periodic-check wake
+ * =========================================================================
+ *
+ * Entered from the main loop when energy_mode arms idle_sleep_pending
+ * (IDLE or SAFE_MODE unchanged for IDLE_SLEEP_TIMEOUT_MS, no lamp lit, no
+ * fault latched). The SysConfig power policy is STANDBY0, so __WFI() here
+ * gates everything but the LFCLK domain: CPU, SysTick, ADC, UART and all
+ * PWM timers stop; GPIO levels and peripheral registers are retained; the
+ * RTC and TIMG8 (both PD0) keep running off LFCLK.
+ *
+ * What sleep changes relative to the state it was entered from:
+ *   - LED boost rail OFF. Mandatory, not just savings: TIMA0/TIMA1 freeze
+ *     in STANDBY, and a LEDCTRL pin frozen low is the runaway max-current
+ *     state (bench 2026-06-16). With EN_LED low the pin state is inert.
+ *     Only sleeps with all lamps off (gated in energy_mode), so nothing
+ *     visible is lost.
+ *   - LED bar display blanked (content zeroed + anodes parked).
+ *   - Measurement front-end (VBATM_EN + CRT_SNS_EN) gated off between
+ *     wake-checks.
+ *   - RTC READY interrupt masked: it is not used by any logic and would
+ *     wake the core needlessly.
+ *   Everything else keeps the entered state's configuration — notably the
+ *   USB boost + load switches stay ON in IDLE (the AP2151s cannot restart
+ *   into a plugged load — 2026-07 revert — so a USB device plugged during
+ *   sleep is powered by hardware immediately and merely *detected* at the
+ *   next wake-check).
+ *
+ * Wake sources (armed only inside this function):
+ *   - BTN1/BTN2 edges via GROUP1 → immediate full wake (buttons stay
+ *     polled in normal RUN; the NVIC line is enabled only while asleep).
+ *   - ADC_LOW_POWER (TIMG8, LFCLK, STANDBY-capable — provisioned in the
+ *     syscfg for exactly this) every SLEEP_WAKE_INTERVAL_MS → wake-check:
+ *     sense rails up, SLEEP_CHECK_SETTLE_MS of normal SysTick-driven ADC
+ *     harvesting, then raw thresholds decide full wake vs re-sleep.
+ *
+ * Wake-check conditions (raw, single-sample — the pipeline's debounced
+ * flags re-verify everything after wake, so a false wake just costs one
+ * idle timeout before re-sleeping):
+ *   from IDLE:      V_panel > PANEL_MIN_MV (respecting the dusk relock)
+ *                   I_dsg   > LOAD_DETECT_MA
+ *                   V_bat   < BAT_LOW_MV (cell present: > 500 mV, the
+ *                             same disconnected-sense guard fault_mgr uses)
+ *   from SAFE_MODE: V_bat   > BAT_SAFE_RECOVER_MV
+ *                   (no sun/load wake: SAFE_MODE only exits on recovery,
+ *                    so waking for sun would burn the cell all day)
+ *
+ * Timekeeping: SysTick is stopped across each WFI, so the slept duration
+ * is measured on the wake timer and credited to the ms timestamp
+ * (timestamp_advance) before SysTick resumes — time_now() stays
+ * continuous and every downstream schedule (debounce, relock, tick
+ * baselines) survives sleep unaware.
+ */
+
+typedef enum {
+    SLEEP_WAKE_NONE = 0,
+    SLEEP_WAKE_BUTTON,      /* front-panel button edge                     */
+    SLEEP_WAKE_SUN,         /* V_panel above has_sun set threshold         */
+    SLEEP_WAKE_LOAD,        /* discharge current above load-detect         */
+    SLEEP_WAKE_VBAT,        /* battery crossed a threshold the current
+                             * state must react to (low in IDLE,
+                             * recovered in SAFE_MODE)                     */
+} sleep_wake_t;
+
+static const char *sleep_wake_name(sleep_wake_t w)
+{
+    switch (w) {
+        case SLEEP_WAKE_BUTTON: return "BTN";
+        case SLEEP_WAKE_SUN:    return "SUN";
+        case SLEEP_WAKE_LOAD:   return "LOAD";
+        case SLEEP_WAKE_VBAT:   return "VBAT";
+        default:                return "???";
+    }
+}
+
+/* TIMG8 (ADC_LOW_POWER) ISR — the periodic wake source. Reaching the
+ * handler at all IS the wake-up; it only has to read-clear the pending
+ * ZERO event so the IRQ line releases. The sleep loop learns "the timer
+ * fired" from NVIC pending state (read under PRIMASK, before this runs). */
+void ADC_LOW_POWER_INST_IRQHandler(void)
+{
+    (void)DL_TimerG_getPendingInterrupt(ADC_LOW_POWER_INST);
+}
+
+static void system_sleep(system_ctx_t *c)
+{
+    int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
+        "SLEEP: enter (%s) interval=%lu ms @ %lu ms\r\n",
+        em_state_name(c->energy_mode),
+        (unsigned long)SLEEP_WAKE_INTERVAL_MS,
+        (unsigned long)time_now());
+    if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
+
+    /* Drain the TX shifter: printToUART blocks per byte on FIFO space, not
+     * on completion — clock-gating the UART mid-byte garbles the tail. */
+    while (DL_UART_Main_isBusy(UART_0_INST)) { }
+
+    /* ── Power down what sleep owns ── */
+    update_led_bar(0x00, LED_BAR_1);     /* blank content so the SysTick mux */
+    update_led_bar(0x00, LED_BAR_2);     /* renders dark during wake-checks  */
+    disable_led_bar();
+    disable_led_boost();                 /* LEDCTRL freeze hazard — see above */
+    disable_measure_sense();
+    DL_RTC_disableInterrupt(RTC, DL_RTC_INTERRUPT_READY);
+
+    /* The four PWM timers (TIMG6 buck FB, TIMG7 LED boost, TIMA0/TIMA1
+     * LEDCTRL) sit in PD1 and do NOT retain register contents through
+     * STANDBY (SysConfig retention warning — everything else we use is
+     * either PD0 or has retention). Snapshot them once here; restored on
+     * full wake. Harmless while asleep: the buck is disabled (BUCK_DIS,
+     * GPIO — retained) and the LED rail is off, so blank timers drive
+     * nothing. */
+    SYSCFG_DL_saveConfiguration();
+
+    /* ── Arm wake sources ── */
+    gButtonWakeFlag = false;
+    DL_TimerG_stopCounter(ADC_LOW_POWER_INST);
+    DL_TimerG_setLoadValue(ADC_LOW_POWER_INST, (uint32_t)SLEEP_TIMER_LOAD_COUNTS);
+    NVIC_ClearPendingIRQ(ADC_LOW_POWER_INST_INT_IRQN);
+    NVIC_EnableIRQ(ADC_LOW_POWER_INST_INT_IRQN);
+    NVIC_ClearPendingIRQ(BTNS_INT_IRQN);
+    NVIC_EnableIRQ(BTNS_INT_IRQN);
+
+    sleep_wake_t wake = SLEEP_WAKE_NONE;
+    uint32_t slept_ms = 0;
+    uint32_t checks   = 0;
+
+    while (wake == SLEEP_WAKE_NONE) {
+
+        /* ── STANDBY window ──
+         * PRIMASK closes the classic lost-wakeup race: a button edge
+         * between the flag check and WFI pends in the NVIC (ISRs can't
+         * run) and makes WFI fall straight through. SysTick must be
+         * stopped AND its pended exception cleared first, or a tick that
+         * fired in the last millisecond aborts every entry attempt. */
+        __disable_irq();
+        if (!gButtonWakeFlag) {
+            DL_SYSTICK_disable();
+            SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk;
+
+            /* Fresh full interval each pass (down-counter: LOAD → 0). */
+            DL_TimerG_setTimerCount(ADC_LOW_POWER_INST,
+                                    (uint32_t)SLEEP_TIMER_LOAD_COUNTS);
+            DL_TimerG_startCounter(ADC_LOW_POWER_INST);
+
+            __WFI();   /* STANDBY0 until an NVIC-enabled interrupt pends */
+
+            DL_TimerG_stopCounter(ADC_LOW_POWER_INST);
+
+            /* Credit the slept wall-clock time from the LFCLK timer while
+             * PRIMASK still blocks the SysTick increment. If the ZERO
+             * event is what woke us the counter has already reloaded, so
+             * the pending IRQ means "one full interval plus whatever ran
+             * off the fresh reload"; otherwise (button/spurious) the
+             * elapsed counts are LOAD − current. */
+            uint32_t cnt = DL_TimerG_getTimerCount(ADC_LOW_POWER_INST);
+            if (cnt > SLEEP_TIMER_LOAD_COUNTS)      /* defensive: down-counter */
+                cnt = SLEEP_TIMER_LOAD_COUNTS;      /* can't exceed LOAD       */
+            uint32_t credit = ((SLEEP_TIMER_LOAD_COUNTS - cnt) * 1000UL)
+                              / SLEEP_TIMER_TICK_HZ;
+            if (NVIC_GetPendingIRQ(ADC_LOW_POWER_INST_INT_IRQN))
+                credit += SLEEP_WAKE_INTERVAL_MS;
+            timestamp_advance(credit);
+            slept_ms += credit;
+
+            DL_SYSTICK_enable();
+        }
+        __enable_irq();   /* pended ISRs (button edge, wake timer) run now */
+
+        if (gButtonWakeFlag) {
+            wake = SLEEP_WAKE_BUTTON;
+            break;
+        }
+
+        /* ── Wake-check ──
+         * Runs on the periodic tick and on any spurious wake (a stale ADC
+         * completion at entry, UART RX noise, USB_FLT edge) — checking
+         * costs ~60 ms and re-sleeping is always safe. SysTick is live
+         * again: its 10 ms ADC tick restarts conversions and harvests
+         * fresh Adc*Result sets into the (still valid — samples only ever
+         * land while awake with sense on) moving-average window. */
+        checks++;
+        enable_measure_sense();
+
+        uint32_t t0 = time_now();
+        while ((time_now() - t0) < SLEEP_CHECK_SETTLE_MS) {
+            if (gButtonWakeFlag) break;      /* press mid-check */
+        }
+        if (gButtonWakeFlag) {
+            wake = SLEEP_WAKE_BUTTON;
+            break;
+        }
+
+        uint16_t v_bat = get_battery_voltage_now();
+
+        if (c->energy_mode == EM_SAFE_MODE) {
+            /* Only battery recovery matters: eval_safe_mode() exits on
+             * nothing else, so waking for sun/load would spin awake all
+             * day while the latch holds (see SAFE_MODE recovery note). */
+            if (v_bat > BAT_SAFE_RECOVER_MV)
+                wake = SLEEP_WAKE_VBAT;
+        } else {
+            uint16_t v_panel = get_input_voltage_now();
+            uint16_t i_dsg   = get_discharge_current_now();
+
+            if (v_panel > PANEL_MIN_MV && time_now() >= c->has_sun_relock_ms)
+                wake = SLEEP_WAKE_SUN;
+            else if (i_dsg > LOAD_DETECT_MA)
+                wake = SLEEP_WAKE_LOAD;
+            else if (v_bat > 500 && v_bat < BAT_LOW_MV)
+                wake = SLEEP_WAKE_VBAT;   /* wake to shed via SAFE_MODE —
+                                           * the USB boost is still up and
+                                           * bleeding the cell in IDLE   */
+        }
+
+        if (wake == SLEEP_WAKE_NONE)
+            disable_measure_sense();
+    }
+
+    /* ── Full wake: disarm and restore ── */
+    NVIC_DisableIRQ(ADC_LOW_POWER_INST_INT_IRQN);
+    NVIC_ClearPendingIRQ(ADC_LOW_POWER_INST_INT_IRQN);
+    NVIC_DisableIRQ(BTNS_INT_IRQN);
+    NVIC_ClearPendingIRQ(BTNS_INT_IRQN);
+    DL_TimerG_stopCounter(ADC_LOW_POWER_INST);
+    DL_RTC_enableInterrupt(RTC, DL_RTC_INTERRUPT_READY);
+
+    enable_measure_sense();
+    refresh_vbatm_sense();   /* clean re-lock edge for a hot-plugged cell */
+
+    /* Bring the PD1 PWM timers back from the dead (see save at entry),
+     * then re-commit the application's output values through the normal
+     * HAL paths — each one stop/sets/starts its timer, so all four come
+     * back running regardless of restore's counter semantics. Order
+     * matters: LEDCTRL references must be sane BEFORE the entry actions
+     * below re-enable the LED boost rail, or the lamps would flash at an
+     * undefined current for a tick. */
+    SYSCFG_DL_restoreConfiguration();
+    set_buck_pwm(c->pwm);                    /* parked at PWM_MIN_DUTY here */
+    set_led_voltage(LED_BOOST_TARGET_MV);
+    for (uint8_t i = 0; i < 4; i++)
+        set_led_current(lamp_level_ma[c->lamp_level[i]], lamp_led[i]);
+
+    /* Re-apply the current state's entry actions: IDLE gets its detection
+     * rails (LED boost included) back, SAFE_MODE stays shed, and the
+     * state's inactivity anchor restarts so an unfounded wake re-sleeps
+     * after one timeout. The bar graphs repopulate on the next UI tick. */
+    energy_mode_reapply_entry(c);
+
+    len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
+        "SLEEP: wake=%s slept=%lu ms checks=%lu @ %lu ms\r\n",
+        sleep_wake_name(wake),
+        (unsigned long)slept_ms,
+        (unsigned long)checks,
+        (unsigned long)time_now());
+    if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
+}
+
+/* =========================================================================
  * SysTick ISR — fires every 1 ms
  * =========================================================================
  *
@@ -736,28 +998,20 @@ int main(void)
             refresh_vbatm_sense();
         }
 
-        /* ── Idle sleep ──
-         * energy_mode sets idle_sleep_pending after IDLE_SLEEP_TIMEOUT_MS
-         * (2 min) with no sun and no load. Enter low-power stop mode;
-         * a GPIO interrupt (button press or load connect) or the RTC
-         * will wake the MCU back into this loop.
-         *
-         * After wake-up, clear the pending flag and reset the idle
-         * timer so we get a fresh 2-minute window. The next pipeline
-         * tick will re-evaluate energy_mode which will either stay in
-         * IDLE (starting a new timeout) or transition out if conditions
-         * changed while we slept. */
+        /* ── Deep sleep ──
+         * energy_mode arms idle_sleep_pending after IDLE_SLEEP_TIMEOUT_MS
+         * of unchanged IDLE or SAFE_MODE (lamps off, no fault latched).
+         * system_sleep() holds the MCU in STANDBY0 — waking briefly every
+         * SLEEP_WAKE_INTERVAL_MS to sniff for sun / load / battery
+         * movement, instantly on a button edge — and only returns on a
+         * real wake condition, with the current state's hardware enables
+         * re-applied and time_now() credited for the slept duration. The
+         * next pipeline tick (which fires immediately: the tick baselines
+         * below are now far in the past) re-evaluates everything through
+         * the normal debounced path. */
         if (ctx.idle_sleep_pending) {
             ctx.idle_sleep_pending = false;
-            ctx.idle_start_ms = time_now();
-
-            /* Disable peripherals that draw current in sleep */
-            disable_led_bar();
-
-            __WFI();  /* Wait For Interrupt — enter low-power mode */
-
-            /* Woken by interrupt — resume. SysTick_Handler resumes
-             * timestamp counting automatically. */
+            system_sleep(&ctx);
         }
     }
 }

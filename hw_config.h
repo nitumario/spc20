@@ -109,6 +109,18 @@
  * above PANEL_MIN_MV the instant we stop loading it, which would otherwise
  * re-set has_sun immediately and re-activate the buck. Mirrors MPPT HOLD. */
 #define HAS_SUN_RELOCK_MS         60000UL
+/* Dusk detector debounce (×50 ms), SEPARATE from HAS_SUN_CLEAR_COUNT. The
+ * "panel floats near Voc yet delivers < PANEL_USABLE_MIN_MW" test runs on its
+ * OWN counter (ctx->has_sun_dusk_count) so a transient regulation collapse
+ * can't chain its voltage-collapse ticks and its near-OC recovery-tail ticks
+ * onto one 30-tick clear — the failure that turned a ~1 s MPPT collapse into a
+ * full charger teardown + fresh re-climb (the observed charge-on/off cycle).
+ * Must outlast the inner loop's worst-case near-OC re-acquire after a
+ * panel_safety_backoff overshoot (LOAD_REACQUIRE_MA walks the operating point
+ * back onto load in ~1–2 s), with margin. 80 ticks = 4 s rides that out yet
+ * still calls a genuine dusk within a few seconds (the 60 s relock throttles
+ * re-probing regardless). */
+#define HAS_SUN_DUSK_CLEAR_COUNT  80
 /* Emergency floor: regulation backs off hard below this. Must be BELOW the
  * vreg band low edge (setpoint − deadband = 5300 mV) so it never fires while
  * the loop holds the panel on its power plateau, and ABOVE the has_sun clear
@@ -192,6 +204,19 @@
  * to the setpoint is a handful of steps (≈1-2 s), then it holds. */
 #define PANEL_VREG_INTERVAL_MS    400UL
 
+/* Minimum-load re-acquire threshold (mA, charge-side). If cc_regulate finds
+ * V_panel INSIDE the regulation band yet chg_current below this, the buck is
+ * parked near open circuit delivering ~nothing — the tail of a
+ * panel_safety_backoff overshoot that the wide deadband would otherwise hold
+ * indefinitely (near-OC sits inside setpoint ± PANEL_VREG_DEADBAND_MV, so
+ * neither regulation branch corrects it). The loop then steps toward more
+ * current (pwm DOWN, one paced step) to re-acquire the MPP instead of holding.
+ * In real sun this self-terminates the instant delivered current returns above
+ * the threshold; on a dead panel at dusk it loads the panel down until the
+ * voltage-collapse has_sun clear fires. ~60 mA ≈ PANEL_USABLE_MIN_MW (200 mW)
+ * at V_bat, so the re-acquire keeps delivered power above the dusk floor. */
+#define LOAD_REACQUIRE_MA         60
+
 /* =========================================================================
  * 3. BUCK CONVERTER (TPS56347)
  * =========================================================================
@@ -247,11 +272,14 @@
  * =========================================================================
  *
  * "has_load" is based on measured discharge current.
- * The discharge current sensor has some offset/noise,
- * so we need a threshold above zero.
+ * The discharge shunt (R432) has a ~45 mA zero-offset that wanders up to
+ * ~50 mA with noise, so BOTH thresholds must sit clear of that floor — the
+ * old 50/30 window straddled the offset, so a noise spike latched has_load
+ * and the offset then held it above the 30 mA clear point forever (phantom
+ * CHG+LOAD with nothing plugged in). Any real output/USB load is >=100 mA.
  */
-#define LOAD_DETECT_MA            50      /* I_load above this → has_load = true                  */
-#define LOAD_DETECT_CLEAR_MA      30      /* I_load below this → has_load = false (hysteresis)    */
+#define LOAD_DETECT_MA            120     /* I_load above this → has_load = true                  */
+#define LOAD_DETECT_CLEAR_MA      80      /* I_load below this → has_load = false (hysteresis)    */
 
 /* =========================================================================
  * 5. CHARGER TUNING
@@ -534,7 +562,53 @@
 #define TICK_LOG_MS               1000    /* UART logging interval                                */
 #define VBATM_REFRESH_MS          1000    /* re-pulse VBATM_EN so a hot-plugged cell shows up     */
 
-#define IDLE_SLEEP_TIMEOUT_MS     120000UL /* 2 min in IDLE with no activity → enter sleep        */
+/* Inactivity window before arming deep sleep. Applies to EM_IDLE (nothing
+ * to do) and EM_SAFE_MODE (loads shed, waiting on battery recovery — the
+ * state where MCU draw matters most, since it is bleeding a depleted cell).
+ * Sleep entry is additionally gated on: no latched fault (fault recovery
+ * needs pipeline ticks) and, in IDLE, all lamps off (never turn off a
+ * light the user is using to save power). */
+#define IDLE_SLEEP_TIMEOUT_MS     120000UL /* 2 min in IDLE/SAFE with no activity → enter sleep   */
+
+/* ── Deep sleep (STANDBY0) wake scheduling ──
+ *
+ * In sleep the MCU sits in STANDBY0 (LFCLK only — SysTick, ADC, PWM timers
+ * and UART are all clock-gated; GPIO levels and all peripheral registers
+ * are retained). Wake sources, both armed only for the duration of sleep:
+ *
+ *   1. Button edges (PB6/PB7, GROUP1 NVIC) — immediate full wake.
+ *   2. The ADC_LOW_POWER timer (TIMG8, one of the two STANDBY-capable
+ *      timers, clocked LFCLK/8/256 = 16 Hz) — periodic wake-check: the
+ *      firmware runs for ~SLEEP_CHECK_SETTLE_MS, refreshes the ADC, and
+ *      inspects raw V_panel / I_dsg / V_bat to decide "full wake" vs
+ *      "back to STANDBY".
+ *
+ * The interval trades wake latency for average power: the check costs
+ * ~60 ms awake, so at 10 s the MCU duty cycle is ~0.6 %. Loads plugged
+ * into the USB rail are POWERED immediately regardless (the boost + load
+ * switches stay on through sleep — the AP2151s cannot restart into a
+ * plugged load, see the 2026-07 idle-gating revert); the interval only
+ * bounds how long until the firmware *notices* and leaves IDLE. */
+#define SLEEP_WAKE_INTERVAL_MS    10000UL
+
+/* Tick rate of the wake timer. MUST match the ADC_LOW_POWER instance in
+ * SPC_20.syscfg: LFCLK 32768 Hz / divider 8 / prescale 256 = 16 Hz
+ * (62.5 ms per count; 16-bit counter → max interval ~68 min). The
+ * generated 1 s LOAD_VALUE of 15 in ti_msp_dl_config.h confirms it. */
+#define SLEEP_TIMER_TICK_HZ       16U
+
+/* Awake window per periodic wake-check before sampling the sensors. Must
+ * cover the sense-rail settle (µs — same enable edge refresh_vbatm_sense
+ * relies on) plus at least one full ADC harvest: SysTick resumes on wake
+ * and re-kicks conversions every TICK_ADC_MS, and a sequence takes ~a few
+ * ms, so 60 ms guarantees several fresh Adc*Result sets even if the
+ * conversion that was frozen mid-flight at STANDBY entry glitches. */
+#define SLEEP_CHECK_SETTLE_MS     60UL
+
+/* Wake-timer LOAD value for one SLEEP_WAKE_INTERVAL_MS period (N+1 counts
+ * per period, hence the −1 — matches the generated 1 s LOAD_VALUE of 15). */
+#define SLEEP_TIMER_LOAD_COUNTS \
+    ((uint32_t)(SLEEP_WAKE_INTERVAL_MS * SLEEP_TIMER_TICK_HZ / 1000UL) - 1UL)
 
 /* =========================================================================
  * 10. BATTERY CAPACITY (for coulomb counter / SOC)

@@ -209,6 +209,15 @@ static void enter_safe_mode(system_ctx_t *ctx)
     disable_output_switch();   /* shed loads */
     disable_usb_boost();       /* shed USB */
     disable_led_boost();       /* shed LED boost */
+
+    /* SAFE_MODE also sleeps: with loads shed, the awake MCU (plus the
+     * blinking bar graphs) is the dominant drain on an already-low cell,
+     * so after IDLE_SLEEP_TIMEOUT_MS of unchanged SAFE_MODE the system
+     * drops into STANDBY and wake-checks for V_bat recovery / buttons.
+     * idle_start_ms doubles as the inactivity anchor for both IDLE and
+     * SAFE_MODE — they are mutually exclusive states. */
+    ctx->idle_start_ms = time_now();
+    ctx->idle_sleep_pending = false;
 }
 
 /* =========================================================================
@@ -398,6 +407,48 @@ static void apply_entry_actions(system_ctx_t *ctx, energy_mode_state_t s)
     }
 }
 
+/* Public wrapper: restore the current state's hardware enables without a
+ * transition. Used by system_sleep() after wake (and mirrors the internal
+ * fault-clear re-arm path). Idempotent — GPIO writes are unconditional. */
+void energy_mode_reapply_entry(system_ctx_t *ctx)
+{
+    apply_entry_actions(ctx, ctx->energy_mode);
+}
+
+/*
+ * maybe_arm_sleep — in-state check for IDLE and SAFE_MODE.
+ *
+ * Arms idle_sleep_pending (consumed by main(), which calls system_sleep())
+ * once the state has been unchanged for IDLE_SLEEP_TIMEOUT_MS, gated on:
+ *
+ *   - No latched fault: fault recovery is throttled but still needs the
+ *     pipeline to tick every FAULT_RECOVER_WAIT_MS; sleeping would freeze
+ *     a recoverable fault in place indefinitely.
+ *   - (IDLE only) all lamps off: in IDLE the LED boost is up and a
+ *     non-zero lamp_level is a lamp the user deliberately lit — sleep
+ *     kills the LED rail, so never enter it over a burning lamp. Not
+ *     checked in SAFE_MODE, where the rail is already shed and the lamps
+ *     are dark regardless of their stored levels.
+ */
+static void maybe_arm_sleep(system_ctx_t *ctx, bool check_lamps)
+{
+    if (ctx->idle_sleep_pending)
+        return;
+
+    if (ctx->fault.code != FAULT_NONE)
+        return;
+
+    if (check_lamps) {
+        for (uint8_t i = 0; i < 4; i++) {
+            if (ctx->lamp_level[i] != 0)
+                return;
+        }
+    }
+
+    if ((time_now() - ctx->idle_start_ms) >= IDLE_SLEEP_TIMEOUT_MS)
+        ctx->idle_sleep_pending = true;
+}
+
 void energy_mode_update(system_ctx_t *ctx)
 {
     energy_mode_state_t old_state = ctx->energy_mode;
@@ -437,12 +488,16 @@ void energy_mode_update(system_ctx_t *ctx)
             apply_entry_actions(ctx, old_state);
         }
         if (old_state == EM_IDLE) {
-            /* Idle sleep timeout: if nothing happens for IDLE_SLEEP_TIMEOUT_MS,
-             * signal that main loop should enter low-power mode. */
-            if (!ctx->idle_sleep_pending &&
-                (time_now() - ctx->idle_start_ms) >= IDLE_SLEEP_TIMEOUT_MS) {
-                ctx->idle_sleep_pending = true;
-            }
+            /* Idle sleep timeout: if nothing happens for IDLE_SLEEP_TIMEOUT_MS
+             * (and no lamp is lit, no fault latched), signal the main loop to
+             * enter STANDBY via system_sleep(). */
+            maybe_arm_sleep(ctx, true);
+        }
+        if (old_state == EM_SAFE_MODE) {
+            /* SAFE_MODE sleeps too — loads are shed, so the awake MCU is the
+             * main drain on the depleted cell. Lamps are dark here (LED boost
+             * shed), so only the fault gate applies. */
+            maybe_arm_sleep(ctx, false);
         }
         return;
     }
