@@ -172,21 +172,28 @@
  * The setpoint is a per-panel quantity and must follow the panel. */
 #define PANEL_VREG_SETPOINT_MV    6500U
 
-/* Half-width of the regulation deadband around the setpoint (mV). The
- * panel's power top is FLAT (≥97 % of peak from ~5.0–7.8 V), so the band
- * is deliberately wide: 6500 ± 1200 → hold anywhere in 5.3–7.7 V.
+/* Half-width of the regulation deadband around the setpoint (mV). This is
+ * a PER-PANEL quantity and must be sized to the deployed panel's I-V shape.
  *
- * Why this wide: PWM is COARSE on this plant. One count moves the buck
- * rail ~2.9 mV (LUT span 3772→2786 mV over 343 counts), which across the
- * ~65 mΩ charge path is ~45 mA of battery current ≈ ~25 mA of panel
- * current at 6.5 V (measured, May bench log: pwm 143→140 moved Ichg
- * −180→−38 mA). The band must span MORE panel current than one step
- * quantum, or there may be NO reachable operating point inside it — the
- * loop then hops across the band every interval and whipsaws the panel
- * over its I-V knee (the residual bounce seen after the pacing fix).
- * 5.3–7.7 V on the flat top spans ~47 mA panel-side ≈ 2 PWM counts, so a
- * landing point always exists, and any in-band point is ≥97 % of MPP. */
-#define PANEL_VREG_DEADBAND_MV    1200U
+ * The wide ±1200 value was sized for the old flat-top 4× array, whose power
+ * top is FLAT (≥97 % of peak from ~5.0–7.8 V) — there the band could be
+ * wide with every in-band point still ≥97 % of MPP. On the current
+ * sharp-kneed panel that same width is TOO wide: the band spans from the
+ * I-V knee up to near open circuit, so an MPPT probe or irradiance flutter
+ * can walk the operating point over the knee and collapse V_panel, then the
+ * near-vertical curve snaps it back to near-OC (delivering ~nothing) still
+ * inside the band — the charge-on/off limit cycle fixed in v0.21. ±500
+ * keeps the band off the knee for this panel.
+ *
+ * Lower bound: PWM is COARSE on this plant. One count moves the buck rail
+ * ~2.9 mV (LUT span 3772→2786 mV over 343 counts), which across the ~65 mΩ
+ * charge path is ~45 mA of battery current ≈ ~25 mA of panel current at
+ * 6.5 V (measured, May bench log: pwm 143→140 moved Ichg −180→−38 mA). The
+ * band must still span MORE panel current than one step quantum, or there
+ * may be NO reachable operating point inside it and the loop whipsaws every
+ * interval; the sharp knee means ±500 already spans several counts of panel
+ * current here. Re-confirm this and PANEL_VREG_STEP if the panel changes. */
+#define PANEL_VREG_DEADBAND_MV    500U
 
 /* PWM counts per regulation step. ONE count (~45 mA charge-side, ~25 mA
  * panel-side — see deadband note) is already ~20 % of this array's MPP

@@ -1,3 +1,32 @@
+# [v0.21] - 09.07.26
+## Fix charge-on/off limit cycle: narrower deadband + near-OC re-acquire + decoupled has_sun clear paths
+
+Changed files: `charger.c`, `measurements.c`, `system_types.h`, `hw_config.h`
+
+### Why
+Bench log (13 V OC panel, ~10.9 V knee, MPP ~12 V, good sun): the charger reached `MPPT:HLD` and charged perfectly (V_panel 12.25 V, I_chg 1.24 A, 4.6 W) but repeatedly tore itself down — `EM: CHG_ONLY → IDLE → CHG_ONLY`, `MPPT: … → OFF → TRK` — charging in bursts. Root cause was a self-inflicted limit cycle, not a charge-control fault:
+
+1. The ±1200 mV regulation deadband (sized for the old flat-top 4× array) is too wide for this sharp-kneed panel: its band spans from the knee up to near open circuit. An MPPT probe / irradiance flutter walks the operating point to the knee and tips it over → V_panel collapses to ~3.6 V.
+2. `panel_safety_backoff` (+5/400 ms) lifts the rail, but the near-vertical I-V curve snaps V_panel from the collapse straight up to near-OC, leaving the buck drawing ~10 mA.
+3. Near-OC (~12.6 V) sits *inside* the wide deadband, so `cc_regulate` holds there — stuck, delivering almost no power.
+4. `has_sun`'s clear was one 30-tick (1.5 s) counter fed by `(V_panel < 4200) OR (charging AND P_panel < 200)`. The collapse asserted the voltage path (~1 s), then the near-OC tail asserted the power path — the two **chained on one counter without resetting**, reached 30, and cleared `has_sun`. `eval_charge_only` then dropped to IDLE, killed the buck, and the fresh `enter_tracking` re-seeded Voc and re-climbed with coarse steps → crossed the knee again → repeat. The design comment budgeted only the ~1.2 s voltage collapse for the ride-through; it never accounted for the power-path tail extending the same counter.
+
+### CHANGED: near-OC re-acquire (`charger.c` `cc_regulate`, `CHARGER_INPUT_VREG=1`)
+- New clamp 3: when V_panel is inside the deadband but `chg_current < LOAD_REACQUIRE_MA` (60 mA), the buck is parked near open circuit delivering nothing — the tail of a backoff overshoot the wide band would otherwise hold forever. Step toward more current (pwm down) one paced step instead of holding, walking the operating point back onto the panel. Self-terminates the instant real current returns; on a dead panel at dusk it loads the panel down until the voltage-collapse clear fires. Runs only in PRECHARGE/CC (CV uses `cv_regulate`); clamps 0/1 already returned for reverse/over-current, so it can only fire in the genuine near-OC dead zone.
+
+### CHANGED: split the has_sun clear paths (`measurements.c`, `system_types.h`, `hw_config.h`)
+- The voltage-collapse clear (path 1) now sees ONLY `V_panel < PANEL_MIN_CLEAR_MV` — a transient collapse resets it the instant V_panel recovers, and it can no longer chain into the power path.
+- The dusk clear (path 2, dead-but-floating panel) moves to its OWN counter `has_sun_dusk_count` with a longer window `HAS_SUN_DUSK_CLEAR_COUNT` (80 ticks / 4 s), gated on `V_panel > PANEL_MIN_MV` so a collapse (V_panel low) advances path 1, not this one. The longer window rides out the near-OC re-acquire (~1-2 s); a genuine dusk still trips within a few seconds and arms the 60 s relock exactly as before.
+- New: `LOAD_REACQUIRE_MA` (60), `HAS_SUN_DUSK_CLEAR_COUNT` (80) in `hw_config.h`; `has_sun_dusk_count` field in `system_ctx_t`.
+
+### CHANGED: narrow the regulation deadband for the sharp-kneed panel (`hw_config.h`)
+- `PANEL_VREG_DEADBAND_MV` 1200 → 500. The ±1200 width was sized for the old flat-top 4× array; on the sharp-kneed panel it spans from the knee up to near open circuit (root cause #1), so a probe/flutter that tips over the knee lands *inside* the band and sticks. ±500 keeps the band clear of the knee. Deadband is per-panel — re-confirm it (and `PANEL_VREG_STEP`) if the panel changes; the comment in `hw_config.h` carries the coarse-PWM lower-bound reasoning.
+
+### Bench validation needed
+Compiles clean (tiarmclang 4.0.4, no new warnings). On hardware, in steady good sun: (1) `MPPT:HLD` holds without `EM: CHG_ONLY → IDLE` bounces; (2) an MPPT re-probe or brief cloud produces at most a ~1-2 s current dip, not a teardown; (3) genuine dusk still clears `has_sun` (within ~4 s) and drops to IDLE/SAFE without oscillating; (4) confirm `LOAD_REACQUIRE_MA` / deadband are right for the deployed panel (both are per-panel).
+
+---
+
 # [v0.20] - 08.07.26
 ## Real deep sleep: STANDBY0 with button wake + periodic wake-checks (IDLE and SAFE_MODE)
 
