@@ -286,6 +286,7 @@ corrupts dV/dI attribution).
 ├── mppt.h/c            — DISABLED  TRACKING  HOLD state machine
 ├── energy_mode.h/c     — IDLE  CHARGE  DISCHARGE  SAFE state machine
 ├── fault_mgr.h/c       — fault detection and management
+├── docs/fault_recovery.md — recovery policy for each fault bit
 ├── SPCBoardAPI.h/c     — hardware abstraction layer (GPIO, ADC, PWM, RTC, UART)
 ├── main.c              — system state machine, main loop, SysTick ISR
 ├── SPC_20.syscfg       — TI SysConfig peripheral configuration
