@@ -244,8 +244,8 @@
  * operating point. */
 #define LED_BOOST_TARGET_MV       11500
 
-/* Drive current when a button-controlled lamp (LEDCTRL1/LEDCTRL2) is switched
- * ON. Lands on the 145/155 mA LUT bins (output_currents_led_mA), well under
+/* Drive current when a button-controlled lamp (any of LED1–LED4 / LEDCTRL1–4)
+ * is switched ON. Lands on the 145/155 mA LUT bins (output_currents_led_mA), well under
  * the 350 mA per-channel hardware max. Switching a lamp OFF commands 0 mA,
  * which set_led_current() drives to compare 99 (~15 mA, the dimmest in-range
  * value on the inverted-polarity channel). compare==period is forbidden and

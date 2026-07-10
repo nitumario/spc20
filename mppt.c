@@ -49,7 +49,7 @@
  * the baseline counts as a reversal (don't walk on noise / on a flat
  * power top / when the allowed_chg clamp, not the panel, bounds the
  * current). MPPT_SP_CONVERGE_REVERSALS reversals → HOLD for
- * MPPT_HOLD_TIME_MS, then re-probe IF the panel is still the bottleneck
+ * MPPT_SP_HOLD_TIME_MS, then re-probe IF the panel is still the bottleneck
  * (panel_limited) — this is the upward re-probe path that recovers full
  * capability when the sun comes back after a cloudy spell.
  *
@@ -639,7 +639,7 @@ static void enter_hold(system_ctx_t *ctx)
  * releasing to BUCK_MAX here would re-trigger the panel overload that
  * caused MPPT to engage in the first place. Upward re-probe happens
  * when MPPT enters TRACKING again (currently only on activation when
- * panel_limited fires; a periodic re-probe is a future improvement).
+ * panel_limited fires).
  */
 static void enter_disabled(system_ctx_t *ctx)
 {

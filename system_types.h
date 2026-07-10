@@ -48,11 +48,6 @@
  *     │  Periodically attempts recovery for latched faults.     │
  *     └────────────────────────────────────────────────────────┘
  *
- *     ┌─ UI_MGR (Placeholder) ─────────────────────────────────┐
- *     │  Handles buttons + LED bar battery level display.      │
- *     │  Runs in parallel. Does not affect power decisions.    │
- *     └────────────────────────────────────────────────────────┘
- *
  * Reading guide:
  *   1. State enums       — what states each machine can be in
  *   2. Measurements      — what the ADC tells us
@@ -84,13 +79,13 @@
  *   SYS_INIT  → hardware is initializing, all outputs disabled,
  *               transitions to SYS_RUN when setup is complete.
  *
- *   SYS_RUN   → normal operation. The three child HSMs
- *               (ENERGY_MGMT, FAULT_MGR, UI_MGR) all execute
- *               every tick inside this state.
+ *   SYS_RUN   → normal operation. Two child HSMs (ENERGY_MGMT and
+ *               FAULT_MGR) execute every tick inside this state.
  *
  * There is no SYS_FAULT state. Faults are handled by FAULT_MGR
- * which is a parallel region INSIDE RUN. It sets flags and takes
- * protective actions; ENERGY_MGMT sees those flags and reacts.
+ * which is a parallel region INSIDE RUN. It latches fault bits and
+ * takes protective hardware actions directly; ENERGY_MGMT re-arms the
+ * affected switches once the fault clears.
  *
  * There is no SYS_SLEEP state. Sleep is an action taken from
  * EM_IDLE or EM_SAFE_MODE (inside ENERGY_MGMT) after a timeout:
@@ -420,12 +415,15 @@ typedef struct {
  * This prevents the scenario where a transient fault sets and clears
  * within one tick, and the system never notices.
  *
- * How ENERGY_MGMT sees faults:
- *   ENERGY_MGMT reads ctx->fault.code to check for specific faults,
- *   and ctx->fault.active to check "is anything faulted."
- *   FAULT_MGR may have already disabled a switch (e.g., battery switch
- *   on overvoltage), so ENERGY_MGMT must not re-enable it while the
- *   fault is active.
+ * How faults are consumed:
+ *   The mode-selection guards (eval_* in energy_mode.c) do NOT branch on
+ *   fault.code — protection is enforced by fault_take_action() disabling
+ *   hardware directly, plus the charger's own CHG_FAULT_BLOCK_MASK gate.
+ *   energy_mode reads fault.code only to (a) gate deep sleep while any
+ *   fault is latched and (b) detect the fault-clear falling edge (via
+ *   prev_code) and re-apply the current state's entry actions, re-arming
+ *   the GPIOs fault_take_action() tore down.
+ *   (fault.active mirrors code != FAULT_NONE; no reader consumes it today.)
  */
 
 /* Fault ID bits — each fault gets one bit in the bitmask */
@@ -468,7 +466,7 @@ typedef struct {
  *   1. measurements_update(ctx)  → writes ctx->meas
  *   2. flags_update(ctx)         → writes ctx->flags (has_sun, bat_low, etc.)
  *   3. power_budget_update(ctx)  → writes ctx->allowed_chg, ctx->i_buck_max
- *   4. fault_check(ctx)          → writes ctx->fault, may disable switches
+ *   4. fault_mgr_update(ctx)     → writes ctx->fault, may disable switches
  *   5. energy_mode_update(ctx)   → writes ctx->energy_mode, enables/disables HW
  *   6. mppt_update(ctx)          → writes ctx->mppt, may write ctx->pwm
  *   7. charger_update(ctx)       → writes ctx->charger, may write ctx->pwm
@@ -477,10 +475,6 @@ typedef struct {
  * This order is the contract. Each step reads fields written by
  * earlier steps and writes fields read by later steps.
  * Within one tick there are no races because execution is sequential.
- *
- * Note: UI_MGR (buttons + LED bar display) will be added later
- * as a parallel step that reads ctx for display but never writes
- * power-related fields.
  */
 typedef struct {
 
@@ -492,9 +486,10 @@ typedef struct {
 
     /* ── Flags (written by flags_update, step 2) ──
      *
-     * These debounced booleans drive all state machine transitions.
-     * State machines read these; they never read raw meas values
-     * for transition decisions.
+     * These debounced booleans drive the energy-mode transitions. Those
+     * guards read the flags, not raw meas — with a few deliberate raw-mV
+     * exceptions (the charger's V_bat precharge/CC/CV thresholds and
+     * SAFE_MODE recovery, which must not be debounced).
      */
     debounce_flag_t flag_bat_low;    /* V_bat < BAT_LOW_MV                  */
     debounce_flag_t flag_has_sun;    /* V_panel > PANEL_MIN_MV (debounced)  */
@@ -541,12 +536,7 @@ typedef struct {
     /* ── FAULT_MGR child HSM (parallel to ENERGY_MGMT) ── */
     fault_ctx_t fault;
 
-    /* ── UI_MGR child HSM (parallel, added later) ──
-     * Placeholder. Will contain:
-     *   - button state (short press, long press)
-     *   - LED bar display mode
-     *   - battery percentage display state
-     *
+    /*
      * Lamp brightness — per-lamp state for the four MCU-controllable LED-output
      * lamps, driven by main()'s lamp_buttons_update():
      *   lamp_level[0] = lamp 1 (LEDCTRL1 / LED1, PA9  TIMA0 CCP1)

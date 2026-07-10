@@ -25,7 +25,7 @@
  *                    one MPPT_SP_STEP_MV per dwell. Legacy: paced PWM
  *                    perturbations.
  *   MPPT_HOLD      — converged (or capped). Setpoint mode: setpoint
- *                    frozen, re-probes after MPPT_HOLD_TIME_MS while
+ *                    frozen, re-probes after MPPT_SP_HOLD_TIME_MS while
  *                    panel_limited. Legacy: PWM parked at best point,
  *                    mppt_limit_ma published.
  *

@@ -207,11 +207,21 @@ static inline bool mppt_owns_pwm(const system_ctx_t *ctx)
  * cannot command more than the panel can give and walk it off the
  * I-V knee.
  *
- * Priority:
+ * Priority (highest first; matches the "Clamp N" labels in the body):
+ *   0. Reverse-current escape (hard): if chg_current is strongly negative
+ *      the sync FETs are back-pumping battery charge into the panel —
+ *      lift the rail fast (pwm DOWN by the backoff step).
  *   1. Battery-intake clamp (hard): if chg_current exceeds allowed_chg,
  *      reduce current regardless of V_panel. allowed_chg already encodes
  *      the precharge trickle / CC-zone / CV-taper limits (power_budget).
  *   2. Panel-voltage loop: otherwise steer V_panel toward the setpoint.
+ *   3. In-band re-acquire: if within the deadband but delivering almost
+ *      nothing (a panel_safety_backoff overshoot parked the rail near
+ *      open circuit), draw more so the operating point walks back onto
+ *      the panel instead of letting has_sun time out.
+ *
+ * (panel_safety_backoff, the emergency V_panel floor, runs BEFORE this
+ * function in the state handlers — it is not one of the clamps here.)
  *
  * PWM sign (the structural truth, NOT the limit-cycle correlation that
  * misled an earlier attempt): pwm = PWM_MIN_DUTY (399) is the off/idle

@@ -36,8 +36,14 @@
  *   This matches the charger's "deactivated → INACTIVE" exit action
  *   from charger_states.csv.
  *
- *   MPPT is reset to DISABLED with mppt_limit = BUCK_MAX when charger
- *   is deactivated, so power_budget sees no panel constraint next tick.
+ *   Deactivating the charger does NOT reset mppt_limit_ma: the learned
+ *   panel capability is PRESERVED so a brief EM bounce can't release
+ *   allowed_chg back to BUCK_MAX and re-overload the panel. MPPT itself
+ *   transitions to DISABLED on its next tick (mppt_update sees !charging),
+ *   which also preserves the limit. (Under CHARGER_INPUT_VREG=1 the limit
+ *   is BUCK_MAX at all times anyway — the panel is protected by the
+ *   voltage loop, not a current budget.) See deactivate_charger_region()
+ *   and the mppt_limit_ma comment in system_types.h.
  */
 
 #include "energy_mode.h"
@@ -457,7 +463,8 @@ void energy_mode_update(system_ctx_t *ctx)
     /* ── Fault-clear edge detection ──
      *
      * fault_take_action() in fault_mgr can disable hardware (input buck,
-     * charge switch, output switch, USB boost) when a fault is raised.
+     * charge switch, output switch, USB boost, LED boost) when a fault
+     * is raised.
      * When the fault later auto-recovers, fault_mgr clears the bit but
      * does NOT re-enable any GPIOs — that is energy_mode's job, and
      * energy_mode only writes GPIOs on a state transition. If no
@@ -509,7 +516,9 @@ void energy_mode_update(system_ctx_t *ctx)
      * This is a no-op if leaving a non-charging state.
      *
      * The charger deactivation resets: PWM → min duty, BUCK_DIS asserted,
-     * charger → INACTIVE, MPPT → DISABLED, bat_full → false.
+     * charger → INACTIVE, bat_full → false. It deliberately does NOT reset
+     * mppt_limit_ma; MPPT drops to DISABLED on its next mppt_update tick,
+     * preserving the learned panel limit (see deactivate_charger_region).
      */
     bool was_charging = (old_state == EM_CHARGE_ONLY ||
                          old_state == EM_CHARGE_AND_LOAD);

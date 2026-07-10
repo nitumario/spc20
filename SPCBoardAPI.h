@@ -10,17 +10,18 @@
  *  - GPIO power-path control (enable/disable — no toggle)
  *  - ADC measurement and unit conversion
  *  - PWM configuration
- *  - LED display (raw segment/bar primitives; policy handled by UI_MGR)
- *  - Button interface (read-only events; policy handled by UI_MGR)
+ *  - LED display (raw segment/bar primitives; content/policy driven by main.c)
+ *  - Button interface (read-only events; policy driven by main.c)
  *  - RTC management
  *  - UART transmit
  *
- * Excluded from HAL (moved or pending move to application layer):
+ * Excluded from HAL (moved to application layer or dropped):
  *  - power_manager(), apply_mppt_perturb_observe_step() → energy_mode / mppt
- *  - handle_button_input() → UI_MGR
- *  - handle_ir(), receive_command(), handle_uart() → UI_MGR or dropped
+ *  - handle_button_input() → main.c (lamp_buttons_update)
+ *  - handle_ir(), receive_command() → dropped; no IR/command receiver
+ *  - handle_uart() → dropped; UART is transmit-only now
  *  - turn_on_outputs(), turn_off_outputs() → energy_mode (calls individual enables)
- *  - display_time(), displayChargeStorage(), etc. → UI_MGR
+ *  - display_time(), displayChargeStorage(), etc. → main.c (LED bar gauges)
  *  - toggle_*() → removed; state machine uses explicit enable/disable
  *  - get_*_log() → removed; logging reads ctx->meas directly
  * ============================================================================
@@ -198,7 +199,7 @@ extern const uint8_t CHARACTERS[7];
 void led_display_init(void);
 void update_led_bar(uint8_t data, LED_BAR_ID led_bar_id);
 void update_seven_segment_display(uint8_t data, LED_DIGIT_ID led_digit_id);
-void update_led_display(void);   /* drives mux timing; content set by UI_MGR via update_led_bar() */
+void update_led_display(void);   /* drives mux timing; content set by main.c via update_led_bar() */
 
 /* ============================================================================
  * BUTTON INTERFACE

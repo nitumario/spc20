@@ -924,8 +924,7 @@ int main(void)
 
         /* ── 20 ms tick: button polling ──
          * Runs at TICK_BUTTON_MS. update_buttons() updates internal
-         * debounce state. UI_MGR (not yet implemented) would read the
-         * results and drive the LED display. */
+         * debounce state. */
         if ((now - last_button) >= TICK_BUTTON_MS) {
             last_button = now;
             update_buttons();

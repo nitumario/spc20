@@ -14,9 +14,11 @@
  *     to produce the boolean flags that state machines read.
  *
  * Separation:
- *   State machines NEVER read ctx->meas for transition decisions.
- *   They read flags only. This ensures all noise filtering happens
- *   in one place (here), and state machines see clean signals.
+ *   State-machine transitions run off the debounced flags rather than
+ *   raw ctx->meas, so noise filtering happens in one place (here). The
+ *   few deliberate exceptions read raw meas on purpose: the charger's
+ *   V_bat precharge/CC/CV thresholds, and SAFE_MODE recovery (which must
+ *   NOT be debounced — see energy_mode.c and the CHANGELOG).
  */
 
 #ifndef MEASUREMENTS_H

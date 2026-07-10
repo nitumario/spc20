@@ -17,11 +17,17 @@
  *
  *   State             CHARGER_EN  BATTERY_EN  OUTPUT_EN  USB_EN  BUCK_DIS
  *   ──────────────────────────────────────────────────────────────────────
- *   IDLE              off         off         off        off     asserted
- *   CHARGE_ONLY       on          on          off        off     released
+ *   IDLE              off         on          on         on      asserted
+ *   CHARGE_ONLY       on          on          on         on      released
  *   CHARGE_AND_LOAD   on          on          on         on      released
  *   DISCHARGE_ONLY    off         on          on         on      asserted
  *   SAFE_MODE         off         on          off        off     asserted
+ *
+ *   BATTERY_EN stays on in every runtime state (the cell buffers the bus).
+ *   OUTPUT_EN + USB_EN (and the LED boost) also stay on in IDLE and the
+ *   charging states so a load appearing can be sensed (has_load) and wake
+ *   the FSM — only SAFE_MODE sheds them. LED boost tracks OUTPUT_EN and is
+ *   off in SAFE_MODE; it is not shown as a separate column.
  *
  * Charger/MPPT region activation:
  *   Charger is activated in CHARGE_ONLY and CHARGE_AND_LOAD.

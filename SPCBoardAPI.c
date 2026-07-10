@@ -601,10 +601,12 @@ void ADC1_INST_IRQHandler(void){
  * the first edge would vector to the SDK's weak Default_Handler (while(1))
  * and freeze the MCU — SysTick stops, the main pipeline never runs again.
  *
- * Today none of these IRQs drive any application logic (UART is TX-only,
- * the RTC is polled, buttons are polled in update_buttons()). Each handler
- * therefore just reads-and-clears the pending status and returns, which is
- * sufficient to release the IRQ line and let the main loop continue.
+ * UART and RTC drive no application logic (UART is TX-only, the RTC is
+ * polled), so their handlers just read-and-clear the pending status to
+ * release the IRQ line. GROUP1 is the exception: its NVIC line is enabled
+ * only while sleeping, where it sets the button wake flag for the sleep
+ * loop (see GROUP1_IRQHandler); in normal RUN the buttons are polled in
+ * update_buttons().
  */
 void UART_0_INST_IRQHandler(void){
     switch(DL_UART_getPendingInterrupt(UART_0_INST)){
@@ -811,10 +813,6 @@ int16_t get_temperature(TEMP_SENSOR temp_sensor){
  * PWM MODULE
  * ============================================================================ */
 
-/*
- * Placeholder for PWM init.
- * Expected to configure timers in SysConfig and/or enable runtime settings.
- */
 void pwm_init(void){}
 
 /* ============================================================================
@@ -1513,10 +1511,6 @@ void timestamp_advance(uint32_t ms){
 uint32_t time_now(void){
     return timestamp;
 }
-
-/* ============================================================================
- * STUBS — buttons + LED display not wired up yet
- * ============================================================================ */
 
 volatile bool check_buttons = false;
 
