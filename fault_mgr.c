@@ -14,13 +14,14 @@
  *      faults and clear any whose recovery condition holds.
  *
  * Protective actions are the minimum necessary to contain the fault.
- * energy_mode_update() re-runs later in the same tick and sees the
- * fault bits; it is responsible for the overall mode selection.
- * Because energy_mode calls its own enable/disable functions based on
- * its target state, a latched fault should be interpreted by it as an
- * override — but today energy_mode does not consult ctx->fault.code
- * directly. We therefore also disable hardware here so a fault can't
- * be silently papered over.
+ * energy_mode_update() re-runs later in the same tick, but its
+ * mode-selection guards pick a state from the flags alone — they never
+ * branch on fault.code, so a latched fault would not disable anything on
+ * its own. We therefore take the protective hardware action here directly,
+ * so a fault can't be silently papered over. energy_mode does read
+ * fault.code elsewhere: to gate deep sleep, and to re-arm these GPIOs on
+ * the fault-clear falling edge (see fault.prev_code). The charger also
+ * gates itself on CHG_FAULT_BLOCK_MASK.
  *
  * Hysteresis — why recovery thresholds differ from trip thresholds:
  *   Example: bat overvolt trips at 3700 mV, recovers at 3400 mV. Without
@@ -51,6 +52,7 @@ static void fault_take_action(uint16_t fault_bit)
             disable_charge_switch();
             disable_output_switch();
             disable_usb_boost();
+            disable_led_boost();
             break;
 
         case FAULT_BAT_OVERVOLT:
@@ -66,6 +68,7 @@ static void fault_take_action(uint16_t fault_bit)
             /* Discharge-side overcurrent — drop the loads. */
             disable_output_switch();
             disable_usb_boost();
+            disable_led_boost();
             break;
 
         case FAULT_BAT_UNDERVOLT:
@@ -74,6 +77,7 @@ static void fault_take_action(uint16_t fault_bit)
              * on bat_low anyway). */
             disable_output_switch();
             disable_usb_boost();
+            disable_led_boost();
             disable_input_buck();
             disable_charge_switch();
             break;

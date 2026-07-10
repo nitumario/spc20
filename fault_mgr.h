@@ -18,11 +18,13 @@
  *
  * What it does NOT do:
  *   - It does not pull the system out of SYS_RUN (there is no SYS_FAULT).
- *   - It does not re-enable switches on recovery. energy_mode re-evaluates
- *     its transitions every tick and will re-enable the appropriate
- *     switches once ctx->fault.code is clear.
- *   - It does not decide the energy mode. It just latches flags; the
- *     energy mode FSM reads those flags and chooses a safe state.
+ *   - It does not re-enable switches on recovery. When fault.code returns
+ *     to zero, energy_mode detects that falling edge and re-applies the
+ *     current state's entry actions to re-arm the switches it tore down
+ *     (see fault.prev_code).
+ *   - It does not decide the energy mode. Protection comes from the direct
+ *     hardware disables above; the mode-selection guards do NOT branch on
+ *     fault.code — they pick a state from the debounced flags alone.
  *
  * Fault bits (defined in system_types.h):
  *   FAULT_OVERTEMP          — bat_temp or board_temp over limit
