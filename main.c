@@ -82,7 +82,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.23\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.24\r\n"
                 "==============================================\r\n");
 }
 
@@ -373,13 +373,12 @@ static void lamp_buttons_update(system_ctx_t *c)
  * The two bars are wired mirror-imaged on the PCB, so bar 2 fills from the
  * opposite segment to keep both gauges reading "up" in the same direction.
  *
- * Each bar shows a 0..5 level from the thresholds in hw_config.h. A bar instead
- * flashes ALL five segments when its source is missing:
- *   - battery bar blinks when no cell is present (V_bat < UI_BAT_PRESENT_MV),
- *   - panel bar blinks when there's no usable sun (flag_has_sun clear — this
+ * Each bar shows a 0..5 level from the thresholds in hw_config.h. A bar stays
+ * completely dark when its source is missing:
+ *   - battery bar is off when no cell is present (V_bat < UI_BAT_PRESENT_MV),
+ *   - panel bar is off when there's no usable sun (flag_has_sun clear — this
  *     already folds in the dusk "panel floating but delivering <200 mW" case).
- * A present-but-empty battery or a sunny-but-idle panel shows 0 solid segments,
- * not a blink — blink means "source absent", not "source low".
+ * A present-but-empty battery or a sunny-but-idle panel also shows 0 segments.
  *
  * Policy only: this computes the two 5-bit segment masks each UI tick and hands
  * them to the HAL via update_led_bar(). The mux (update_led_display()) is what
@@ -428,15 +427,12 @@ static uint8_t panel_level(const system_ctx_t *c)
  * called on the UI tick. The mux renders whatever this last stored. */
 static void ui_display_update(const system_ctx_t *c)
 {
-    /* All-on for the first half of each period, dark for the second. */
-    bool blink_on = ((time_now() / UI_BLINK_PERIOD_MS) & 1u) == 0u;
-
     uint8_t bar1 = (c->meas.bat_voltage < UI_BAT_PRESENT_MV)
-                   ? (blink_on ? 0x1Fu : 0x00u)
+                   ? 0x00u
                    : bar_mask_from_low(battery_level(c));
 
     uint8_t bar2 = (!c->flag_has_sun.value)
-                   ? (blink_on ? 0x1Fu : 0x00u)
+                   ? 0x00u
                    : bar_mask_from_high(panel_level(c));
 
     update_led_bar(bar1, LED_BAR_1);
@@ -1002,8 +998,8 @@ int main(void)
             log_state_transitions(now, em_old, chg_old, mppt_old, bw_old);
 
             /* Refresh the bar-graph content from this tick's measurements
-             * (battery SoC + panel power, or a blink if either source is
-             * absent). The mux pumped at the top of the loop renders it. */
+             * (battery SoC + panel power; an absent source leaves its bar
+             * dark). The mux pumped at the top of the loop renders it. */
             ui_display_update(&ctx);
         }
 

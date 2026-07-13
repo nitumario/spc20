@@ -1,3 +1,18 @@
+# [v0.24] - 13.07.26
+## Keep absent-source LED bars dark
+
+Changed files: `main.c`, `hw_config.h`, `energy_mode.c`, `CHANGELOG.md`
+
+- The battery bar now stays fully off while `V_bat < UI_BAT_PRESENT_MV`
+  instead of flashing all five segments.
+- The panel bar now stays fully off while `flag_has_sun` is clear instead of
+  flashing all five segments. Normal battery-level and panel-power gauges, and
+  the one-time boot sweep, are unchanged.
+- Removed the unused `UI_BLINK_PERIOD_MS` setting and updated the boot banner
+  to `v0.24`.
+
+---
+
 # [v0.23] - 12.07.26
 ## Battery protection wake probe: recover the hot-plug ≈0.8 V lockout (S-8240 protection-open)
 
@@ -733,4 +748,3 @@ All removed items are either replaced by the new module architecture
 ### NEW: PRECHARGE timeout → FAULT
 - **Old:** "15min timeout failure" — destination unspecified.
 - **New:** Explicit `timeout → FAULT` transition. A battery that can't exit precharge in 15 minutes is likely damaged or disconnected.
-

@@ -245,9 +245,9 @@ static void enter_safe_mode(system_ctx_t *ctx)
      * handler brings the buck + charge switch back up on the next tick — a
      * deliberate re-arm, never a stale enable carried across the transition. */
 
-    /* SAFE_MODE also sleeps: with loads shed, the awake MCU (plus the
-     * blinking bar graphs) is the dominant drain on an already-low cell,
-     * so after IDLE_SLEEP_TIMEOUT_MS of unchanged SAFE_MODE the system
+    /* SAFE_MODE also sleeps: with loads shed, the awake MCU and its support
+     * rails are the dominant drain on an already-low cell, so after
+     * IDLE_SLEEP_TIMEOUT_MS of unchanged SAFE_MODE the system
      * drops into STANDBY and wake-checks for V_bat recovery / buttons.
      * idle_start_ms doubles as the inactivity anchor for both IDLE and
      * SAFE_MODE — they are mutually exclusive states. */
