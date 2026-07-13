@@ -437,6 +437,42 @@ typedef struct {
 #define FAULT_PRECHARGE_TIMEOUT (1U << 6)   /* precharge exceeded 15 min          */
 #define FAULT_TEMP_CHARGE_BLOCK (1U << 7)   /* too cold or hot to charge          */
 
+/*
+ * Battery protection wake probe (energy_mode.c bat_wake_tick) — recovers
+ * from the S-8240 protection-open lockout, where V_BATM reads a ≈0.8 V
+ * bias node instead of the cell and FAULT_BAT_UNDERVOLT latches on a
+ * measurement that can never recover by itself. The probe applies a short
+ * fixed-target charger stimulus (the S-8240's release condition), then
+ * validates with the buck OFF that a plausible cell voltage persists.
+ * See the BAT_WAKE_* block in hw_config.h and
+ * docs/bug_battery_hotplug_800mv_lockout.md.
+ */
+typedef enum {
+    BAT_WAKE_MONITOR = 0,   /* watching for the protection-open signature   */
+    BAT_WAKE_PROBE,         /* buck driving the fixed probe target          */
+    BAT_WAKE_SETTLE,        /* buck off, ADC moving average flushing        */
+    BAT_WAKE_VALIDATE,      /* observing off-state V_bat persistence        */
+    BAT_WAKE_RETRY_WAIT,    /* rate-limit window before the next attempt    */
+    BAT_WAKE_TERMINAL       /* gave up — holds until panel/fault state changes */
+} bat_wake_phase_t;
+
+typedef enum {
+    BAT_WAKE_RES_NONE = 0,
+    BAT_WAKE_RES_VALIDATED,   /* off-state V_bat held ≥ BAT_WAKE_VALID_MIN_MV */
+    BAT_WAKE_RES_NO_BATTERY,  /* collapsed back into the 0.8 V signature      */
+    BAT_WAKE_RES_WAKE_FAILED, /* persisted but below the rescue floor         */
+    BAT_WAKE_RES_ABORTED      /* sun lost / panel collapse / extra fault      */
+} bat_wake_result_t;
+
+typedef struct {
+    bat_wake_phase_t  phase;
+    bat_wake_result_t last_result;   /* outcome of the most recent probe     */
+    uint16_t detect_ticks;           /* consecutive candidate ticks (MONITOR)*/
+    uint8_t  attempts;               /* probes since the budget last reset   */
+    uint32_t phase_start_ms;         /* entry time of the current phase      */
+    uint16_t validate_min_mv;        /* min V_bat seen in the validate window*/
+} bat_wake_ctx_t;
+
 typedef struct {
     uint16_t code;              /* bitmask of active faults                    */
     uint16_t prev_code;         /* code from previous tick — used by
@@ -536,6 +572,9 @@ typedef struct {
     /* ── FAULT_MGR child HSM (parallel to ENERGY_MGMT) ── */
     fault_ctx_t fault;
 
+    /* ── Battery protection wake probe (SAFE_MODE in-state, energy_mode.c) ── */
+    bat_wake_ctx_t bat_wake;
+
     /*
      * Lamp brightness — per-lamp state for the four MCU-controllable LED-output
      * lamps, driven by main()'s lamp_buttons_update():
@@ -609,6 +648,10 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->fault.prev_code = FAULT_NONE;
     ctx->fault.history = FAULT_NONE;
     ctx->fault.active = false;
+
+    /* Protection wake probe idle, full attempt budget */
+    ctx->bat_wake.phase       = BAT_WAKE_MONITOR;
+    ctx->bat_wake.last_result = BAT_WAKE_RES_NONE;
 
     /* bat_low debounce configuration. clear_threshold = 1 keeps the
      * original immediate-clear behaviour (recovery above the hysteresis
@@ -693,6 +736,31 @@ static inline const char* mppt_state_name(mppt_state_t s)
         case MPPT_TRACKING: return "TRK";
         case MPPT_HOLD:     return "HLD";
         default:            return "???";
+    }
+}
+
+static inline const char* bat_wake_phase_name(bat_wake_phase_t s)
+{
+    switch (s) {
+        case BAT_WAKE_MONITOR:    return "MON";
+        case BAT_WAKE_PROBE:      return "WAKE_PROBE";
+        case BAT_WAKE_SETTLE:     return "SETTLE";
+        case BAT_WAKE_VALIDATE:   return "VALIDATE";
+        case BAT_WAKE_RETRY_WAIT: return "RETRY_WAIT";
+        case BAT_WAKE_TERMINAL:   return "TERMINAL";
+        default:                  return "???";
+    }
+}
+
+static inline const char* bat_wake_result_name(bat_wake_result_t r)
+{
+    switch (r) {
+        case BAT_WAKE_RES_NONE:        return "NONE";
+        case BAT_WAKE_RES_VALIDATED:   return "VALIDATED";
+        case BAT_WAKE_RES_NO_BATTERY:  return "NO_BATTERY";
+        case BAT_WAKE_RES_WAKE_FAILED: return "WAKE_FAILED";
+        case BAT_WAKE_RES_ABORTED:     return "ABORTED";
+        default:                       return "???";
     }
 }
 

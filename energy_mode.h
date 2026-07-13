@@ -61,4 +61,23 @@ void led_boost_follow_lamps(system_ctx_t *ctx);
  * Same mechanism as the fault-clear re-arm inside energy_mode_update(). */
 void energy_mode_reapply_entry(system_ctx_t *ctx);
 
+/* True when a supervised BAT_UNDERVOLT rescue trickle is permitted: we are in
+ * EM_SAFE_MODE, BAT_UNDERVOLT is the SOLE latched fault (so no charge-blocking
+ * fault — temp/overvolt/overcurrent — is co-latched), there is usable sun, and
+ * V_bat is at/above the BAT_RESCUE_MIN_MV hard floor. energy_mode.c brings the
+ * charge path up (loads stay shed) under this condition so the cell can climb
+ * back to the undervolt recovery threshold; charger.c consults it to keep
+ * running, since SAFE_MODE is otherwise not a charging mode. See
+ * BAT_RESCUE_MIN_MV / BAT_RESCUE_TIMEOUT_MS in hw_config.h. */
+bool safe_mode_rescue_active(const system_ctx_t *ctx);
+
+/* True while the battery protection wake probe (SAFE_MODE in-state, see
+ * bat_wake_tick in energy_mode.c) is actively driving the battery node or
+ * waiting for the V_bat moving average to flush afterwards — i.e. while the
+ * V_bat measurement must NOT be trusted. Consumed by fault_mgr (holds the
+ * BAT_UNDERVOLT latch against a probe-driven phantom recovery), by
+ * eval_safe_mode (holds SAFE_MODE against a phantom exit), and by
+ * safe_mode_rescue_active (keeps the rescue from starting mid-probe). */
+bool bat_wake_probe_busy(const system_ctx_t *ctx);
+
 #endif /* ENERGY_MODE_H */

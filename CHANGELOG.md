@@ -1,3 +1,170 @@
+# [v0.23] - 12.07.26
+## Battery protection wake probe: recover the hot-plug ≈0.8 V lockout (S-8240 protection-open)
+
+Changed files: `hw_config.h`, `system_types.h`, `energy_mode.c`, `energy_mode.h`, `fault_mgr.c`, `main.c`, `docs/fault_recovery.md`
+
+### Why — the undervolt latch can fire on a measurement that isn't the cell
+Bench 2026-07-12 (`serial_20260712_215354.log`, full analysis in
+`docs/bug_battery_hotplug_800mv_lockout.md`): removing the battery while the MCU
+stays powered over debug makes the S-8240 protection IC (U46) open Q416/Q417 in
+the battery-NEGATIVE path. With cell negative disconnected from system ground,
+the single-ended `V_BATM` channel reads a protection-biased node at a stable
+744–896 mV — **not** the cell. Firmware classified that as genuine undervoltage
+(the 500 mV disconnected-cell guard assumed "missing battery reads ~0", which
+the bench disproved), latched `FAULT_BAT_UNDERVOLT`, entered SAFE_MODE, and shed
+the charge path. But a charger connection is exactly the S-8240's release
+condition — so the protective action removed the only stimulus that could ever
+make the measurement valid again. Reconnecting a healthy 3.3 V battery changed
+nothing (still ~0.85 V), a 13 V panel with `has_sun:1` changed nothing, and the
+lockout even survived MCU reset (the FETs stay open). The v0.22 rescue can't
+start (reading < `BAT_RESCUE_MIN_MV`), and lowering that floor wouldn't help:
+`activate_charger_region()` would target the false `V_bat` + 50 mV ≈ the 2.79 V
+LUT floor — *below* the real cell, no release differential, and it would also
+gut the deep-cell safety floor.
+
+### Fix — a bounded wake probe + buck-OFF persistence validation (`bat_wake_tick`, `energy_mode.c`)
+A SAFE_MODE in-state FSM, separate from the charger FSM and from the deep-cell
+rescue. Key principle: firmware **cannot** distinguish "battery missing",
+"protection open", and "genuinely damaged deep cell" from the initial reading —
+so the probe never clears a fault, never trusts an on-state voltage (the buck
+drives an EMPTY connector to the commanded voltage), and decides everything
+from what persists with the stimulus removed.
+- **Candidate detection** (`BAT_WAKE_DETECT_TICKS` = 2 s, all clauses each tick):
+  `V_bat` inside the signature window `BAT_PROT_SIG_MIN/MAX_MV` (600–1100 mV),
+  `FAULT_BAT_UNDERVOLT` the **sole** latched fault, usable sun, no load, 3VOUT
+  collapsed (< 1 V). Detection alone declares nothing.
+- **Probe** (≤ `BAT_WAKE_PROBE_MS` = 3 s): buck + charge switch up at the
+  **fixed** LUT target `BAT_WAKE_PROBE_TARGET_MV` (= 3650 mV CV limit — above
+  any healthy cell's resting voltage, so the S-8240's VM pin sees the charger
+  differential; never `V_bat + headroom`, the one number known to be wrong).
+  Loads stay shed. Cut early once `BAT_WAKE_PROBE_CUT_MA` (200 mA, the
+  precharge ceiling) flows — stimulus demonstrably delivered. Abort on sun
+  loss, `V_panel < PANEL_SAFETY_MV` (weak panel), or any additional fault.
+- **Validation**: buck OFF, `BAT_WAKE_SETTLE_MS` (1.5 s) to flush the 640 ms
+  V_bat moving average, then the off-state minimum over `BAT_WAKE_VALIDATE_MS`
+  (1 s) decides: ≥ 1500 mV → **VALIDATED** (measurement real again — existing
+  machinery takes over: rescue for 1500..3200, fault recovery + SAFE exit at
+  ≥ 3200, all unchanged); back in the signature → **NO_BATTERY** (or still
+  open) → rate-limited retry; between → **WAKE_FAILED** (real cell below the
+  hard floor) → terminal, fault retained, no unattended charging.
+- **Retry policy**: one attempt per `BAT_WAKE_RETRY_MS` (60 s, the panel relock
+  cadence), max `BAT_WAKE_MAX_ATTEMPTS` (3), then TERMINAL until the panel is
+  removed or the fault set changes — an empty connector is never pulsed forever.
+- **Untrusted-measurement gates** (`bat_wake_probe_busy()`, `energy_mode.h`):
+  while the probe drives the node or the MA is flushing, three consumers hold:
+  `fault_mgr`'s undervolt recovery (a driven 3.65 V phantom would clear the
+  latch and re-arm loads onto an empty connector via the fault-clear re-arm
+  edge), `eval_safe_mode`'s recovery comparison (same phantom would exit SAFE →
+  CHARGE_ONLY), and `safe_mode_rescue_active()` (a driven ≥1500 mV reading
+  would start the rescue mid-probe and fight for the buck).
+- **UART**: `BATWAKE: <phase> -> <phase> res:<result> try:n/3 Vbat:<raw>` event
+  lines from the existing transition logger; the signature value is only ever
+  logged as the raw untrusted reading, never as a confirmed cell voltage.
+
+### Also fixed — undervolt latched with sun present never reached SAFE_MODE
+The `eval_*` guards pick a state from flags alone; with `has_sun` true none of
+them selects SAFE_MODE. So an undervolt latched *while the panel was connected*
+(hot-unplug mid-charge, or the 0.8 V signature appearing under sun) parked EM in
+CHARGE_ONLY with all hardware disabled by the fault action — the charger toggled
+PWM into a dead buck until `FAULT_PRECHARGE_TIMEOUT`, and neither the rescue nor
+the wake probe (both SAFE_MODE in-state) could ever run. `energy_mode_update()`
+now forces `EM_SAFE_MODE` while `FAULT_BAT_UNDERVOLT` is latched — the state
+that actually models the torn-down hardware, and the one `docs/fault_recovery.md`
+already documented as the invariant ("Energy mode will be in EM_SAFE_MODE").
+This routes ALL undervolt handling — genuine and protection-open — through the
+rescue/probe recovery paths regardless of sun at latch time.
+
+### Bench validation needed (acceptance criteria in the bug doc)
+(1) Hot-plug recovery: debug-power boot, no battery → connect healthy battery →
+connect panel: one `WAKE_PROBE`, `VALIDATED`, real `Vbat` reported, undervolt
+clears ≤ 10 s later, EM exits SAFE → CHARGE_ONLY. (2) No-battery probe: panel
+present, no battery — connector energized ≤ 3 s per attempt, `NO_BATTERY`,
+3 attempts 60 s apart, then TERMINAL. (3) Weak-panel probe → `ABORTED`, no rapid
+cycling. (4) Deep cell (bench source 1.2–1.4 V behind the released FETs) →
+`WAKE_FAILED`, terminal, no unattended charge. (5) Undervolt under sun now
+lands in SAFE (not CHG_ONLY) and the rescue/probe engage. (6) Normal charging,
+MPPT, CV taper regression unchanged after a validated connection.
+
+---
+
+# [v0.22] - 10.07.26
+## Supervised undervolt rescue: make BAT_UNDERVOLT recoverable instead of self-blocking
+
+Changed files: `hw_config.h`, `energy_mode.c`, `energy_mode.h`, `charger.c`, `fault_mgr.c`, `main.c`, `docs/fault_recovery.md`
+
+> (v0.21 — the has_sun dusk-counter split + `LOAD_REACQUIRE_MA` in-band re-acquire
+> that fixed the sharp-knee charge-on/off limit cycle — shipped in the source under
+> the v0.20 boot banner and never got its own CHANGELOG entry. This entry is v0.22.)
+
+### Why — a Class 3 defect: the fault could never clear itself
+`FAULT_BAT_UNDERVOLT` latches at `BAT_UNDERVOLT_MV` (2000 mV) and its recovery
+condition is `V_bat > BAT_UNDERVOLT_RECOVER_MV` (3200 mV). But the fault's
+protective action disables the buck + charge switch, and by that voltage
+`bat_low` has long since forced `EM_SAFE_MODE`, which *also* holds the buck off.
+Nothing in the system could raise the cell from ~2.0 V to 3.2 V — relaxation
+rebound doesn't cover 1.2 V — so the fault blocked its own cure. This is the
+same "no unattended solar recovery once SAFE_MODE latches" caveat from the June
+dusk-drain work, now expressed as a fault that can never clear.
+
+### Fix — a supervised, precharge-rate rescue trickle inside SAFE_MODE
+While `FAULT_BAT_UNDERVOLT` is the **sole** latched fault, there is usable sun,
+and `V_bat >= BAT_RESCUE_MIN_MV` (1500 mV), SAFE_MODE re-permits the charge path
+(loads stay shed) so the cell can climb back to the 3200 mV recovery threshold.
+`power_budget` already SoC-gates `battery_limit` to 200 mA below 3000 mV, so no
+new current limit is needed — the rescue is inherently a precharge trickle.
+- **Sole-fault gate** (`safe_mode_rescue_active()`, `energy_mode.c/.h`): requiring
+  `fault.code == FAULT_BAT_UNDERVOLT` means no charge-blocking fault (overtemp,
+  temp-charge-block, overvolt, overcurrent-chg, precharge-timeout) can be
+  co-latched, so we never trickle into a hot/cold/faulted cell. The moment the
+  rescue's own escalation raises `FAULT_PRECHARGE_TIMEOUT`, the predicate flips
+  false and the rescue stops.
+- **Hard floor** `BAT_RESCUE_MIN_MV` (1500 mV): below it, stay latched — a
+  LiFePO4 this deep is in copper-dissolution territory and must not be recharged
+  unattended. 500..1500 mV is the hard-latched band (500 mV is the existing
+  disconnected-cell sense guard).
+- **Charge-path re-arm** (`safe_mode_rescue_tick()`, `energy_mode.c`): the SAFE_MODE
+  in-state handler calls `activate_charger_region()` when the rescue holds (buck +
+  charge switch up, PWM pre-positioned, self-guarded on `CHG_INACTIVE`) and
+  `deactivate_charger_region()` + `disable_charge_switch()` when it stops. Every
+  SAFE_MODE *entry* still sheds the charge path first — the rescue is a deliberate
+  re-arm on the next tick, never a stale enable carried across the transition.
+- **Charger run gate** (`charger.c`): `charger_update()` now also runs when
+  `safe_mode_rescue_active()` is true (SAFE_MODE is otherwise not a charging mode).
+  Because the rescue requires undervolt to be the sole fault, `CHG_FAULT_BLOCK_MASK`
+  can never be set while it fires, so the two conditions never conflict.
+- **Rescue timeout** (`charger.c`, `BAT_RESCUE_TIMEOUT_MS` = 30 min): the rescue
+  enters `CHG_PRECHARGE` (V_bat < 3000) from a deeper start than a normal
+  precharge, so while undervolt is latched `tick_precharge` uses the longer
+  30-min window before escalating to `FAULT_PRECHARGE_TIMEOUT` — the correct
+  "cell is damaged" terminal, user-assisted state. A normal precharge keeps its
+  15-min `BAT_PRECHARGE_TIMEOUT_MS`.
+- **Recovery alignment**: `FAULT_BAT_UNDERVOLT` recovery stays at 3200 mV, which
+  now equals `BAT_SAFE_RECOVER_MV` — the fault clears and SAFE_MODE exits to
+  CHARGE_ONLY on the same threshold, handing the (already-active) charger off
+  without a reset (`activate_charger_region` no-ops on a running charger).
+
+### Scope / known limitation
+The rescue is **supervised**: it only runs while awake, and the MCU stays awake
+whenever a fault is latched (`maybe_arm_sleep` gate, unchanged). Sun appearing
+while awake starts the rescue within a tick. It does NOT yet recover fully
+unattended overnight — with undervolt latched and no sun the MCU cannot sleep,
+so it slowly bleeds the cell (pre-existing behaviour, strictly improved: the
+cell was previously bricked forever). A fully unattended version would also need
+SAFE_MODE to sleep on a lone-undervolt + no-sun condition and the SAFE_MODE
+wake-check to wake on sun — deliberately left out of this change.
+
+### Bench validation needed
+Own bench session (changes battery-safety behaviour): (1) drain a cell into
+SAFE_MODE + `FAULT_BAT_UNDERVOLT`, then illuminate the panel — UART should show
+the charge path re-arm (`CHG: OFF -> PRE`) with EM still `SAFE`, `Ichg` at
+precharge trickle, loads staying shed; (2) confirm `V_bat` climbs and at 3200 mV
+the undervolt fault clears and EM exits SAFE → CHARGE_ONLY cleanly; (3) hold a
+cell below 1500 mV under sun and confirm NO rescue (hard latch); (4) co-latch a
+temp-charge-block (cold cell) and confirm the rescue does not fire; (5) a
+non-climbing cell escalates to `FAULT_PRECHARGE_TIMEOUT` at ~30 min.
+
+---
+
 # [v0.20] - 08.07.26
 ## Real deep sleep: STANDBY0 with button wake + periodic wake-checks (IDLE and SAFE_MODE)
 

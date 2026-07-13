@@ -82,7 +82,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.20\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.23\r\n"
                 "==============================================\r\n");
 }
 
@@ -99,7 +99,8 @@ static void log_boot_banner(void)
 static void log_state_transitions(uint32_t now,
                                   energy_mode_state_t em_old,
                                   charger_state_t chg_old,
-                                  mppt_state_t mppt_old)
+                                  mppt_state_t mppt_old,
+                                  bat_wake_phase_t bw_old)
 {
     if (ctx.energy_mode != em_old) {
         int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
@@ -120,6 +121,25 @@ static void log_state_transitions(uint32_t now,
             "MPPT: %s -> %s @ %lu ms\r\n",
             mppt_state_name(mppt_old), mppt_state_name(ctx.mppt.state),
             (unsigned long)now);
+        if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
+    }
+    /* Protection wake probe. The MON -> WAKE_PROBE edge is the
+     * PROTECTION_UNKNOWN candidate detection (the ≈0.8 V reading is never
+     * logged as a confirmed cell voltage — Vbat here is the raw untrusted
+     * measurement); result names come from bat_wake_result_name(). */
+    if (ctx.bat_wake.phase != bw_old) {
+        const char *res = (ctx.bat_wake.last_result != BAT_WAKE_RES_NONE &&
+                           (bw_old == BAT_WAKE_PROBE ||
+                            bw_old == BAT_WAKE_VALIDATE))
+                        ? bat_wake_result_name(ctx.bat_wake.last_result)
+                        : "-";
+        int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
+            "BATWAKE: %s -> %s res:%s try:%u/%u Vbat:%u @ %lu ms\r\n",
+            bat_wake_phase_name(bw_old),
+            bat_wake_phase_name(ctx.bat_wake.phase),
+            res,
+            (unsigned)ctx.bat_wake.attempts, (unsigned)BAT_WAKE_MAX_ATTEMPTS,
+            ctx.meas.bat_voltage, (unsigned long)now);
         if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
     }
 }
@@ -948,10 +968,11 @@ int main(void)
             last_main = now;
 
             /* Snapshot FSM states so we can log any region that
-             * transitioned during this tick. Cheap (3 enum copies). */
+             * transitioned during this tick. Cheap (4 enum copies). */
             energy_mode_state_t em_old   = ctx.energy_mode;
             charger_state_t     chg_old  = ctx.charger.state;
             mppt_state_t        mppt_old = ctx.mppt.state;
+            bat_wake_phase_t    bw_old   = ctx.bat_wake.phase;
 
             /* Step 1: read all sensors → ctx->meas */
             measurements_update(&ctx);
@@ -978,7 +999,7 @@ int main(void)
             apply_pwm(&ctx);
 
             /* One-line UART log per region whose state changed. */
-            log_state_transitions(now, em_old, chg_old, mppt_old);
+            log_state_transitions(now, em_old, chg_old, mppt_old, bw_old);
 
             /* Refresh the bar-graph content from this tick's measurements
              * (battery SoC + panel power, or a blink if either source is

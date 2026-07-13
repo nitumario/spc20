@@ -62,6 +62,110 @@
 #define BAT_UNDERVOLT_MV          2000    /* hard fault: disconnect loads immediately             */
 #define BAT_UNDERVOLT_RECOVER_MV  3200    /* clear undervolt fault above this                    */
 
+/* ── Supervised undervolt rescue (see energy_mode.c safe_mode_rescue_*) ──
+ *
+ * BAT_UNDERVOLT latches at 2000 mV and only clears at 3200 mV, but its
+ * protective action (and SAFE_MODE) disable the buck — so nothing could
+ * raise the cell back to 3200 and the fault could never clear itself. The
+ * rescue re-permits the charge path (loads still shed) while the fault is
+ * the SOLE latched fault, there is usable sun, and V_bat is above the hard
+ * floor below. power_budget already SoC-gates battery_limit to 200 mA below
+ * 3000 mV, so the rescue is inherently a precharge-rate trickle.
+ *
+ * Hard floor: below this, stay latched — a LiFePO4 this deep is in
+ * copper-dissolution territory and must not be recharged unattended. Sits
+ * above the BAT_UNDERVOLT detection floor (2000) but well above the 500 mV
+ * disconnected-cell sense guard, so 500..1500 mV is the hard-latched band. */
+#define BAT_RESCUE_MIN_MV         1500
+
+/* Rescue precharge timeout (ms). The rescue enters the charger's PRECHARGE
+ * state (V_bat < 3000 on entry) and reuses its timeout plumbing, but from a
+ * deeper start than a normal precharge — so it gets a longer window before
+ * the cell is declared damaged. Expiry escalates to FAULT_PRECHARGE_TIMEOUT
+ * (the correct terminal, user-assisted "cell is dead" state) exactly like a
+ * normal precharge timeout. 30 min at the 200 mA trickle is gentle enough
+ * for a genuinely deep cell yet still gives up on one that won't climb. */
+#define BAT_RESCUE_TIMEOUT_MS     1800000UL
+
+/* ── Battery protection wake probe (see bat_wake_tick in energy_mode.c) ──
+ *
+ * When the S-8240 protection IC (U46) opens Q416/Q417 in the battery-NEGATIVE
+ * path (battery hot-unplug under debug power, deep overdischarge cutout),
+ * cell negative is no longer the ADC ground reference and the single-ended
+ * V_BATM channel reads a protection-biased node at ≈0.8 V — NOT the cell
+ * voltage. Firmware previously classified that signature as genuine
+ * undervoltage and latched a self-blocking lockout: SAFE_MODE sheds the buck,
+ * the supervised rescue can't start (reading < BAT_RESCUE_MIN_MV), and the
+ * S-8240 never sees the charger connection it needs to close the FETs again.
+ * See docs/bug_battery_hotplug_800mv_lockout.md and the 2026-07-12 bench log.
+ *
+ * The wake probe is a short, energy-limited charger stimulus at a FIXED
+ * target (never V_bat + headroom — V_bat is untrusted here), followed by a
+ * buck-OFF persistence test: only a real, reconnected cell holds a plausible
+ * voltage with the stimulus removed (the buck can drive an EMPTY connector to
+ * the commanded voltage, so an on-state reading proves nothing). */
+
+/* Protection-open signature window (mV). Bench 2026-07-12: the node reads
+ * 744–896 mV stable, identically for "battery absent" and "battery present
+ * but protection open" — the window cannot distinguish the two; only the
+ * off-state persistence test can. Board/temperature spread untested, hence
+ * the generous margins. Sits inside the 500..2000 undervolt band, above the
+ * 500 mV disconnected-sense guard. */
+#define BAT_PROT_SIG_MIN_MV       600
+#define BAT_PROT_SIG_MAX_MV       1100
+
+/* Consecutive 50 ms ticks the candidate condition must hold before a probe
+ * (2 s). Outlasts the 640 ms V_bat moving-average window with margin, so a
+ * cell sliding through the window during removal can't start a probe. */
+#define BAT_WAKE_DETECT_TICKS     40
+
+/* Output rail must have collapsed (loads shed) for a candidate — a live
+ * 3VOUT means loads are (or were just) energized and this is not the
+ * quiescent lockout state. */
+#define BAT_WAKE_OUT_COLLAPSED_MV 1000
+
+/* Fixed probe target (mV): the LiFePO4 CV limit. Must exceed any healthy
+ * cell's resting voltage (≤ ~3.4 V full) so the S-8240's VM pin sees a
+ * charger-connection differential and releases; capped at the CV limit so
+ * the driven node can never exceed normal charge voltage. NEVER derived
+ * from the measured V_bat, which is invalid in the protection-open state
+ * (V_bat + headroom would command ≈2.79 V, below the cell — no release). */
+#define BAT_WAKE_PROBE_TARGET_MV  BAT_CV_VOLTAGE_MV
+
+/* Probe stimulus duration cap (ms). A protection IC that merely needs
+ * charger detection releases promptly; this is NOT a charging window. */
+#define BAT_WAKE_PROBE_MS         3000UL
+
+/* End the stimulus early once this much charge current flows (mA) — the
+ * charger connection has demonstrably been delivered (body-diode current
+ * into a protected cell, or inrush into a just-released one). Reuses the
+ * precharge ceiling. The 64-sample MA lags ~320 ms, so a reconnection
+ * transient can briefly overshoot this; the panel's power limit and
+ * FAULT_OVERCURRENT_CHG bound that overshoot. */
+#define BAT_WAKE_PROBE_CUT_MA     BAT_PRECHARGE_MAX_MA
+
+/* Buck-off settle before the persistence test (ms). Must flush the full
+ * 640 ms V_bat moving-average window so no probe-driven samples remain;
+ * 1500 ms ≈ 2.3 windows. */
+#define BAT_WAKE_SETTLE_MS        1500UL
+
+/* Persistence observation window (ms, ≈20 ticks). V_bat must hold a
+ * plausible cell voltage for the WHOLE window with the buck off. */
+#define BAT_WAKE_VALIDATE_MS      1000UL
+
+/* Minimum off-state voltage accepted as "a real cell is connected" (mV).
+ * Equal to the rescue hard floor so a validated cell hands off seamlessly:
+ * ≥3200 recovers via the normal fault/SAFE exits, 1500..3200 via the
+ * supervised rescue, and a persistent reading below this floor is the
+ * terminal deep-cell case (retain the fault, no unattended charging). */
+#define BAT_WAKE_VALID_MIN_MV     BAT_RESCUE_MIN_MV
+
+/* Retry pacing and budget. One attempt per panel-relock-style interval,
+ * bounded attempts, then terminal until the panel is removed or the fault
+ * state changes — never continuous pulsing into an empty connector. */
+#define BAT_WAKE_RETRY_MS         HAS_SUN_RELOCK_MS
+#define BAT_WAKE_MAX_ATTEMPTS     3
+
 /* =========================================================================
  * 2. SOLAR PANEL / BUCK INPUT LIMITS
  * =========================================================================

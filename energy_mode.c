@@ -240,6 +240,11 @@ static void enter_safe_mode(system_ctx_t *ctx)
     disable_usb_boost();       /* shed USB */
     disable_led_boost();       /* shed LED boost */
 
+    /* The charge path is shed on every SAFE_MODE entry. If a supervised
+     * undervolt rescue is warranted (see safe_mode_rescue_tick), the in-state
+     * handler brings the buck + charge switch back up on the next tick — a
+     * deliberate re-arm, never a stale enable carried across the transition. */
+
     /* SAFE_MODE also sleeps: with loads shed, the awake MCU (plus the
      * blinking bar graphs) is the dominant drain on an already-low cell,
      * so after IDLE_SLEEP_TIMEOUT_MS of unchanged SAFE_MODE the system
@@ -374,6 +379,13 @@ static energy_mode_state_t eval_discharge_only(const system_ctx_t *ctx)
 
 static energy_mode_state_t eval_safe_mode(const system_ctx_t *ctx)
 {
+    /* While the protection wake probe is busy, V_bat is either being
+     * DRIVEN by the buck (a 3.65 V reading with no battery attached) or
+     * still flushing through the moving average — recovery must not be
+     * judged on it. Hold SAFE_MODE; the probe is bounded to a few seconds. */
+    if (bat_wake_probe_busy(ctx))
+        return EM_SAFE_MODE;
+
     /*
      * SAFE_MODE recovery requires V_bat > BAT_SAFE_RECOVER_MV (3200 mV).
      * This is a raw voltage comparison, NOT the debounced bat_low flag.
@@ -479,6 +491,278 @@ static void maybe_arm_sleep(system_ctx_t *ctx, bool check_lamps)
         ctx->idle_sleep_pending = true;
 }
 
+/*
+ * safe_mode_rescue_active — is a supervised BAT_UNDERVOLT rescue permitted?
+ *
+ * All four must hold:
+ *   - we are in SAFE_MODE (the state where the undervolt latch strands us);
+ *   - BAT_UNDERVOLT is the SOLE latched fault. Requiring it alone means no
+ *     charge-blocking fault (overtemp, temp-charge-block, overvolt,
+ *     overcurrent-chg, precharge-timeout) can be co-latched, so we never
+ *     trickle into a hot/cold/faulted cell — and the moment the rescue's own
+ *     escalation raises FAULT_PRECHARGE_TIMEOUT this goes false and the rescue
+ *     stops. (USB-overvolt / discharge-overcurrent don't persist here — their
+ *     rails are shed in SAFE_MODE — so they only ever delay a rescue by one
+ *     recovery window, never block it.)
+ *   - there is usable sun (flag_has_sun already folds in the dusk power-gate);
+ *   - raw V_bat is at/above the hard floor (below it, stay latched);
+ *   - the protection wake probe is not busy: while it drives the battery
+ *     node the V_bat reading is untrusted, and a driven ≥1500 mV reading
+ *     would otherwise start the rescue mid-probe and fight for the buck.
+ *
+ * Consumed by safe_mode_rescue_tick() here and by the charger's run gate.
+ */
+bool safe_mode_rescue_active(const system_ctx_t *ctx)
+{
+    return (ctx->energy_mode == EM_SAFE_MODE) &&
+           (ctx->fault.code == FAULT_BAT_UNDERVOLT) &&
+           ctx->flag_has_sun.value &&
+           (ctx->meas.bat_voltage >= BAT_RESCUE_MIN_MV) &&
+           !bat_wake_probe_busy(ctx);
+}
+
+/*
+ * safe_mode_rescue_tick — in-state manager for the supervised rescue.
+ *
+ * Runs each tick while SAFE_MODE is unchanged. When the rescue is warranted it
+ * brings the charge path up (loads stay shed — enter_safe_mode already
+ * disabled output/USB/LED and we never re-enable them here); when it is not, it
+ * tears the charge path back down to the fully-shed SAFE_MODE configuration.
+ *
+ * activate_charger_region() pre-positions PWM and self-guards on CHG_INACTIVE,
+ * so calling it every tick is a no-op once the charger self-activates into
+ * PRECHARGE. The charger runs because charger_update()'s gate also honours
+ * safe_mode_rescue_active(); power_budget clamps the intake to <=200 mA below
+ * 3000 mV, so the trickle is inherently precharge-rate. If the cell never
+ * climbs past 3000 mV, the charger's PRECHARGE timeout (extended to
+ * BAT_RESCUE_TIMEOUT_MS while undervolt is latched) escalates to
+ * FAULT_PRECHARGE_TIMEOUT — which then makes this predicate false and ends the
+ * rescue at the correct terminal, user-assisted state.
+ */
+static void safe_mode_rescue_tick(system_ctx_t *ctx)
+{
+    if (safe_mode_rescue_active(ctx)) {
+        activate_charger_region(ctx);          /* buck + charge switch up */
+    } else if (ctx->charger.state != CHG_INACTIVE) {
+        /* Window closed (sun lost, cell fell below the hard floor, or a
+         * charge-blocking fault appeared): return to the shed config. */
+        deactivate_charger_region(ctx);        /* buck off, charger INACTIVE */
+        disable_charge_switch();               /* the one switch deactivate leaves */
+    }
+}
+
+/* =========================================================================
+ * BATTERY PROTECTION WAKE PROBE (SAFE_MODE in-state)
+ * =========================================================================
+ *
+ * Recovers from the S-8240 protection-open lockout (see the BAT_WAKE_*
+ * block in hw_config.h and docs/bug_battery_hotplug_800mv_lockout.md):
+ * with Q416/Q417 open, V_BATM reads a ≈0.8 V bias node, FAULT_BAT_UNDERVOLT
+ * latches on that invalid measurement, and neither the fault recovery
+ * (needs 3200 mV) nor the supervised rescue (needs 1500 mV) can ever run —
+ * while the one stimulus that would close the protection FETs again, a
+ * charger connection, is exactly what SAFE_MODE keeps disabled.
+ *
+ * The probe applies that stimulus briefly and safely:
+ *
+ *   MONITOR    — candidate = the 0.8 V signature has been stable for
+ *                BAT_WAKE_DETECT_TICKS while undervolt is the SOLE fault,
+ *                usable sun is present, loads are shed and 3VOUT has
+ *                collapsed. A missing battery produces the SAME signature,
+ *                so candidacy alone never clears a fault or declares a cell.
+ *   WAKE_PROBE — buck + charge switch up at the FIXED LUT target
+ *                BAT_WAKE_PROBE_TARGET_MV (3.65 V, the CV limit). Never
+ *                V_bat + headroom: the measured V_bat is the one value we
+ *                know to be wrong, and it would command ≈2.79 V — below the
+ *                cell, no release differential. Cut early once
+ *                BAT_WAKE_PROBE_CUT_MA flows (stimulus delivered), on
+ *                timeout, or on any abort (sun lost, panel collapse below
+ *                PANEL_SAFETY_MV, any additional fault latching).
+ *   SETTLE     — buck and charge switch OFF; wait out the 640 ms V_bat
+ *                moving average (plus margin) so no driven samples remain.
+ *   VALIDATE   — the arbiter. A driven reading proves nothing (the buck
+ *                charges an EMPTY connector to the commanded voltage), so
+ *                require the OFF-state V_bat to hold ≥ BAT_WAKE_VALID_MIN_MV
+ *                for the whole window:
+ *                  ≥ 1500 mV → VALIDATED. The measurement is real again;
+ *                    the existing machinery takes over untouched (rescue
+ *                    for 1500..3200, fault recovery + SAFE exit at ≥3200).
+ *                  back in the signature → NO_BATTERY (or still open):
+ *                    rate-limited retry, bounded attempts.
+ *                  in between → WAKE_FAILED: a real but deeply damaged
+ *                    cell. Terminal — keep the fault, no unattended charge.
+ *   RETRY_WAIT — one attempt per BAT_WAKE_RETRY_MS, at most
+ *                BAT_WAKE_MAX_ATTEMPTS per budget.
+ *   TERMINAL   — attempts exhausted or WAKE_FAILED. Holds until the panel
+ *                is removed or the fault set changes (both reset the
+ *                budget), so an empty connector is never pulsed forever.
+ *
+ * While the probe is BUSY (PROBE/SETTLE/VALIDATE) the V_bat measurement is
+ * untrusted-by-construction, so three consumers are gated on
+ * bat_wake_probe_busy(): eval_safe_mode's recovery comparison (or a driven
+ * 3.65 V reading would bounce SAFE → CHARGE_ONLY onto a phantom battery),
+ * fault_mgr's BAT_UNDERVOLT recovery (same phantom would clear the latch),
+ * and safe_mode_rescue_active() (a driven reading ≥1500 mV would start the
+ * rescue mid-probe and fight for the buck).
+ */
+
+bool bat_wake_probe_busy(const system_ctx_t *ctx)
+{
+    return (ctx->bat_wake.phase == BAT_WAKE_PROBE)  ||
+           (ctx->bat_wake.phase == BAT_WAKE_SETTLE) ||
+           (ctx->bat_wake.phase == BAT_WAKE_VALIDATE);
+}
+
+/* Tear the probe stimulus down NOW (mirror of the SAFE_MODE shed config). */
+static void bat_wake_cut_stimulus(system_ctx_t *ctx)
+{
+    ctx->pwm = PWM_MIN_DUTY;
+    disable_input_buck();
+    disable_charge_switch();
+}
+
+/* The full candidate condition — every clause must hold each tick. */
+static bool bat_wake_candidate(const system_ctx_t *ctx)
+{
+    return (ctx->fault.code == FAULT_BAT_UNDERVOLT) &&      /* SOLE fault  */
+           ctx->flag_has_sun.value &&                       /* usable panel */
+           !ctx->has_load &&                                /* loads quiet  */
+           (ctx->meas.out_voltage < BAT_WAKE_OUT_COLLAPSED_MV) &&
+           (ctx->meas.bat_voltage >= BAT_PROT_SIG_MIN_MV) &&
+           (ctx->meas.bat_voltage <= BAT_PROT_SIG_MAX_MV);
+}
+
+/* Attempt-budget / hold reset condition: the panel went away or the fault
+ * set changed (undervolt cleared, or another fault joined). Either way the
+ * situation the budget was counting against no longer exists. */
+static bool bat_wake_reset_condition(const system_ctx_t *ctx)
+{
+    return !ctx->flag_has_sun.value ||
+           (ctx->fault.code != FAULT_BAT_UNDERVOLT);
+}
+
+static void bat_wake_tick(system_ctx_t *ctx)
+{
+    bat_wake_ctx_t *bw = &ctx->bat_wake;
+    uint32_t now = time_now();
+
+    switch (bw->phase) {
+
+    case BAT_WAKE_MONITOR:
+        if (bat_wake_reset_condition(ctx)) {
+            bw->attempts = 0;
+            bw->detect_ticks = 0;
+            break;
+        }
+        if (!bat_wake_candidate(ctx)) {
+            bw->detect_ticks = 0;
+            break;
+        }
+        if (++bw->detect_ticks < BAT_WAKE_DETECT_TICKS)
+            break;
+        bw->detect_ticks = 0;
+        if (bw->attempts >= BAT_WAKE_MAX_ATTEMPTS) {
+            bw->phase = BAT_WAKE_TERMINAL;      /* budget spent */
+            break;
+        }
+        /* Start the probe. Fixed LUT target — see the header comment. */
+        bw->attempts++;
+        bw->last_result = BAT_WAKE_RES_NONE;
+        bw->phase = BAT_WAKE_PROBE;
+        bw->phase_start_ms = now;
+        ctx->pwm = set_charging_voltage(BAT_WAKE_PROBE_TARGET_MV);
+        enable_input_buck();
+        enable_charge_switch();
+        /* Loads stay shed: enter_safe_mode already disabled output/USB/LED
+         * and nothing here re-enables them. Battery switch is already on. */
+        break;
+
+    case BAT_WAKE_PROBE: {
+        /* Aborts first: any extra fault (its protective action may already
+         * have cut the hardware — make the context state match), sun lost,
+         * or the panel collapsing under the probe (weak panel). */
+        if ((ctx->fault.code != FAULT_BAT_UNDERVOLT) ||
+            !ctx->flag_has_sun.value ||
+            (ctx->meas.panel_voltage < PANEL_SAFETY_MV)) {
+            bat_wake_cut_stimulus(ctx);
+            bw->last_result = BAT_WAKE_RES_ABORTED;
+            bw->phase = BAT_WAKE_RETRY_WAIT;
+            bw->phase_start_ms = now;
+            break;
+        }
+        /* Stimulus delivered (bounded charge current is flowing) or the
+         * probe window closed — either way stop driving and validate. */
+        bool current_cut = (ctx->meas.chg_current >
+                            (int16_t)BAT_WAKE_PROBE_CUT_MA);
+        bool timed_out   = (now - bw->phase_start_ms) >= BAT_WAKE_PROBE_MS;
+        if (current_cut || timed_out) {
+            bat_wake_cut_stimulus(ctx);
+            bw->phase = BAT_WAKE_SETTLE;
+            bw->phase_start_ms = now;
+        }
+        break;
+    }
+
+    case BAT_WAKE_SETTLE:
+        if ((now - bw->phase_start_ms) >= BAT_WAKE_SETTLE_MS) {
+            bw->phase = BAT_WAKE_VALIDATE;
+            bw->phase_start_ms = now;
+            bw->validate_min_mv = 0xFFFF;
+        }
+        break;
+
+    case BAT_WAKE_VALIDATE:
+        if (ctx->meas.bat_voltage < bw->validate_min_mv)
+            bw->validate_min_mv = ctx->meas.bat_voltage;
+        if ((now - bw->phase_start_ms) < BAT_WAKE_VALIDATE_MS)
+            break;
+        if (bw->validate_min_mv >= BAT_WAKE_VALID_MIN_MV) {
+            /* Off-state persistence: a real cell is connected and the
+             * measurement path is valid again. Hand off — the supervised
+             * rescue (1500..3200) or the normal fault recovery + SAFE exit
+             * (≥3200) proceed from here with no special casing. */
+            bw->last_result = BAT_WAKE_RES_VALIDATED;
+            bw->attempts = 0;
+            bw->phase = BAT_WAKE_MONITOR;
+        } else if (bw->validate_min_mv <= BAT_PROT_SIG_MAX_MV) {
+            /* Collapsed back into the signature: no battery, or the
+             * protection circuit is still open. Retry, rate-limited. */
+            bw->last_result = BAT_WAKE_RES_NO_BATTERY;
+            bw->phase = BAT_WAKE_RETRY_WAIT;
+            bw->phase_start_ms = now;
+        } else {
+            /* Persisted between the signature ceiling and the rescue
+             * floor: a real cell, genuinely below the hard safety floor.
+             * Terminal — retain the fault, no unattended charging. */
+            bw->last_result = BAT_WAKE_RES_WAKE_FAILED;
+            bw->phase = BAT_WAKE_TERMINAL;
+        }
+        break;
+
+    case BAT_WAKE_RETRY_WAIT:
+        if (bat_wake_reset_condition(ctx)) {
+            bw->attempts = 0;
+            bw->detect_ticks = 0;
+            bw->phase = BAT_WAKE_MONITOR;
+        } else if ((now - bw->phase_start_ms) >= BAT_WAKE_RETRY_MS) {
+            bw->phase = BAT_WAKE_MONITOR;       /* re-detect; budget persists */
+        }
+        break;
+
+    case BAT_WAKE_TERMINAL:
+        if (bat_wake_reset_condition(ctx)) {
+            bw->attempts = 0;
+            bw->detect_ticks = 0;
+            bw->phase = BAT_WAKE_MONITOR;
+        }
+        break;
+
+    default:
+        bw->phase = BAT_WAKE_MONITOR;
+        break;
+    }
+}
+
 void energy_mode_update(system_ctx_t *ctx)
 {
     energy_mode_state_t old_state = ctx->energy_mode;
@@ -512,6 +796,24 @@ void energy_mode_update(system_ctx_t *ctx)
         default:                 new_state = EM_IDLE;                   break;
     }
 
+    /* ── FAULT_BAT_UNDERVOLT forces SAFE_MODE ──
+     *
+     * The eval_* guards deliberately pick a state from the flags alone, and
+     * with sun present none of them selects SAFE_MODE — so an undervolt
+     * latched while has_sun was true (battery hot-unplug mid-charge, or a
+     * protection-open ≈0.8 V signature appearing with the panel already
+     * connected) left EM parked in CHARGE_ONLY: the fault's protective
+     * action had disabled all the hardware, the charger toggled PWM into a
+     * dead buck until FAULT_PRECHARGE_TIMEOUT, and neither the supervised
+     * rescue nor the wake probe could ever run because both live in
+     * SAFE_MODE. Route every undervolt latch to SAFE_MODE instead: it is
+     * the state that models the torn-down hardware, and its in-state
+     * handlers (rescue, wake probe) are the only recovery paths.
+     * docs/fault_recovery.md already documents this as the invariant.
+     * eval_safe_mode keeps EM there until V_bat genuinely recovers. */
+    if (ctx->fault.code & FAULT_BAT_UNDERVOLT)
+        new_state = EM_SAFE_MODE;
+
     /* ── No transition → handle in-state behaviour ── */
     if (new_state == old_state) {
         if (fault_just_cleared) {
@@ -525,6 +827,19 @@ void energy_mode_update(system_ctx_t *ctx)
             maybe_arm_sleep(ctx, true);
         }
         if (old_state == EM_SAFE_MODE) {
+            /* Protection wake probe first: it must see the tick's fault and
+             * measurement state before the rescue evaluates (both consult
+             * bat_wake_probe_busy(), so ordering keeps them coherent within
+             * the tick). */
+            bat_wake_tick(ctx);
+
+            /* Supervised undervolt rescue: bring the charge path up (or take
+             * it back down) per the rescue conditions, before the sleep check.
+             * While the rescue runs, BAT_UNDERVOLT is latched so maybe_arm_sleep
+             * keeps the pipeline awake — which is what a supervised trickle
+             * wants. */
+            safe_mode_rescue_tick(ctx);
+
             /* SAFE_MODE sleeps too — loads are shed, so the awake MCU is the
              * main drain on the depleted cell. Lamps are dark here (LED boost
              * shed), so only the fault gate applies. */

@@ -55,11 +55,16 @@
 
 #include "charger.h"
 #include "fault_mgr.h"
+#include "energy_mode.h"   /* safe_mode_rescue_active() — SAFE_MODE rescue gate */
 #include "SPCBoardAPI.h"
 
 /* Any of these latched faults should block the charger from running.
- * (Undervolt is excluded: by the time V_bat is that low, energy_mode
- *  is already in SAFE_MODE which deactivates the charger.) */
+ * (Undervolt is excluded on purpose: while it is latched the charger is
+ *  normally idle because energy_mode is in SAFE_MODE — but SAFE_MODE may run
+ *  the supervised rescue trickle, which needs the charger to run WITH undervolt
+ *  latched. Adding undervolt here would block that rescue. The rescue gate
+ *  itself, safe_mode_rescue_active(), only fires when undervolt is the SOLE
+ *  latched fault, so no charge-blocking fault in this mask is ever bypassed.) */
 #define CHG_FAULT_BLOCK_MASK   \
     (FAULT_OVERTEMP            \
    | FAULT_BAT_OVERVOLT        \
@@ -416,14 +421,25 @@ static void tick_precharge(system_ctx_t *ctx)
         enter_cc(ctx);
         /* Fall through to CC regulation this tick for continuity. */
     }
-    /* P2: 15-minute precharge timeout → raise fault and park.
+    /* P2: precharge timeout → raise fault and park.
      *     fault_mgr will take the protective action (buck off, charge
      *     switch off). The charger stops regulating on the next tick
-     *     because CHG_FAULT_BLOCK_MASK will match. */
-    else if ((time_now() - c->precharge_start_ms) >= BAT_PRECHARGE_TIMEOUT_MS) {
-        fault_raise(ctx, FAULT_PRECHARGE_TIMEOUT);
-        ctx->pwm = PWM_MIN_DUTY;    /* belt-and-braces: force buck off */
-        return;
+     *     because CHG_FAULT_BLOCK_MASK will match.
+     *
+     *     A supervised undervolt rescue enters PRECHARGE from a deeper start
+     *     (down to BAT_RESCUE_MIN_MV) than a normal precharge, so while
+     *     BAT_UNDERVOLT is latched it gets the longer BAT_RESCUE_TIMEOUT_MS
+     *     window before the cell is declared damaged. Either way the escalation
+     *     is the same terminal FAULT_PRECHARGE_TIMEOUT (user-assisted). */
+    else {
+        uint32_t timeout = (ctx->fault.code & FAULT_BAT_UNDERVOLT)
+                         ? BAT_RESCUE_TIMEOUT_MS
+                         : BAT_PRECHARGE_TIMEOUT_MS;
+        if ((time_now() - c->precharge_start_ms) >= timeout) {
+            fault_raise(ctx, FAULT_PRECHARGE_TIMEOUT);
+            ctx->pwm = PWM_MIN_DUTY;    /* belt-and-braces: force buck off */
+            return;
+        }
     }
 
     /* Panel safety + MPPT gate, then regulate. */
@@ -482,12 +498,19 @@ void charger_update(system_ctx_t *ctx)
 {
     charger_ctx_t *c = &ctx->charger;
 
-    /* ── Gate: is the region eligible to run at all? ── */
+    /* ── Gate: is the region eligible to run at all? ──
+     *
+     * Runs in the two charging energy modes, and additionally during a
+     * supervised undervolt rescue in SAFE_MODE (loads stay shed; power_budget
+     * keeps the intake at precharge rate). safe_mode_rescue_active() requires
+     * undervolt to be the sole latched fault, so when it is true no
+     * CHG_FAULT_BLOCK_MASK bit can be set — the two conditions never conflict. */
+    bool rescue      = safe_mode_rescue_active(ctx);
     bool em_charging = (ctx->energy_mode == EM_CHARGE_ONLY) ||
                        (ctx->energy_mode == EM_CHARGE_AND_LOAD);
     bool fault_block = (ctx->fault.code & CHG_FAULT_BLOCK_MASK) != 0;
 
-    if (!em_charging || fault_block) {
+    if ((!em_charging && !rescue) || fault_block) {
         /* energy_mode should have already deactivated on its transition,
          * but a fault might be newly latched this tick. Defensively
          * park PWM and mark INACTIVE — do not touch the GPIO switches,

@@ -30,6 +30,7 @@
  */
 
 #include "fault_mgr.h"
+#include "energy_mode.h"   /* bat_wake_probe_busy() — undervolt recovery gate */
 #include "SPCBoardAPI.h"
 
 /* =========================================================================
@@ -72,9 +73,14 @@ static void fault_take_action(uint16_t fault_bit)
             break;
 
         case FAULT_BAT_UNDERVOLT:
-            /* Battery critically low — shed everything, keep battery
-             * switch decision to energy_mode (it will exit to SAFE_MODE
-             * on bat_low anyway). */
+            /* Battery critically low — shed everything NOW (loads and the
+             * charge path), keep the battery switch decision to energy_mode
+             * (it will exit to SAFE_MODE on bat_low anyway). This immediate
+             * teardown is the safe default; the charge path is re-armed
+             * CONDITIONALLY, later, by energy_mode's supervised rescue
+             * (safe_mode_rescue_tick) once there is usable sun and V_bat is
+             * above BAT_RESCUE_MIN_MV — that is what lets this otherwise
+             * self-blocking fault reach its 3200 mV recovery threshold. */
             disable_output_switch();
             disable_usb_boost();
             disable_led_boost();
@@ -117,7 +123,19 @@ static bool fault_recovery_met(const system_ctx_t *ctx, uint16_t fault_bit)
             return (m->dsg_current < BAT_CC_MAX_MA);
 
         case FAULT_BAT_UNDERVOLT:
-            return (m->bat_voltage > BAT_UNDERVOLT_RECOVER_MV);
+            /* Aligned with the SAFE_MODE exit (both BAT_UNDERVOLT_RECOVER_MV
+             * and BAT_SAFE_RECOVER_MV are 3200 mV), so the fault and the mode
+             * recover together. Reachable only because the supervised rescue
+             * (energy_mode) can raise the cell to here; the buck-off protective
+             * action alone would strand it.
+             *
+             * Gated on the protection wake probe: while it drives the battery
+             * node (or the moving average is still flushing) V_bat can read
+             * the COMMANDED 3.65 V with no battery attached at all — clearing
+             * the latch on that phantom would re-arm the loads onto an empty
+             * connector via the fault-clear re-arm path. */
+            return !bat_wake_probe_busy(ctx) &&
+                   (m->bat_voltage > BAT_UNDERVOLT_RECOVER_MV);
 
         case FAULT_USB_OVERVOLT:
             return (m->usb1_voltage < FAULT_USB_OVERVOLT_MV) &&
