@@ -230,35 +230,39 @@ static void apply_pwm(system_ctx_t *c)
  *     full brightness; any on-level -> off.
  *   - PRESS & HOLD (held past 500 ms): dim. While the button stays down, drop
  *     one brightness level every LAMP_DIM_STEP_MS, walking full -> ... -> off
- *     (LAMP_DIM_LEVELS steps, ~5 s end to end). Release at any point keeps the
- *     level reached. Holding from off does nothing — tap to turn on first.
+ *     (LAMP_DIM_LEVELS steps, ~3.3 s end to end). Release at any point keeps
+ *     the level reached. Holding from off does nothing — tap to turn on first.
  *
  * Brightness lives in c->lamp_level[] (0 = off, LAMP_DIM_LEVELS = full),
  * mapped to an LED current by lamp_level_ma[]. c->lamp_hold_steps[] counts the
  * dim steps already applied in the current hold, so the cadence is paced off
  * pressStartTime and is independent of how often this runs.
  *
- * The shared LED boost / output switch are owned by energy_mode(), so a lamp
- * only physically lights when its level is non-zero AND the rail is up.
+ * The shared LED boost rail is driven to follow lamp state via
+ * led_boost_follow_lamps() (called from lamp_apply here and from energy_mode's
+ * entry actions): it is up iff some lamp is lit, so an all-off command sheds the
+ * rail and the lamps go fully dark rather than idling at the ~15 mA glow floor.
+ * The output switch is owned by energy_mode().
  *
  * Must run right after update_buttons() so the one-shot release edge (cleared
  * on the next poll) is still set.
  */
 
-/* Brightness ladder, indexed by lamp_level: 0 = off (LED current 0 -> the
- * ~15 mA compare-99 floor), LAMP_DIM_LEVELS = full. Intermediate currents are
- * chosen to land on output_currents_led_mA LUT bins and rise monotonically to
- * LAMP_ON_CURRENT_MA. The LUT has only ~15 distinct bins between the floor and
- * full, so with LAMP_DIM_LEVELS (20) steps a handful of adjacent levels repeat
- * a current (set_led_current snaps to the nearest bin anyway); the dups are
- * spread out so a held dim still walks down smoothly. Must have
+/* Brightness ladder, indexed by lamp_level: 0 = true off (LEDCTRL GPIO low),
+ * LAMP_DIM_LEVELS = full. Intermediate requests rise monotonically to
+ * LAMP_ON_CURRENT_MA. The 40-step ladder interpolates the former 20-step curve
+ * so existing brightness behavior is preserved while a hold can stop at finer
+ * positions. The hardware current LUT has ~15 distinct bins in this range, so
+ * set_led_current() currently maps some adjacent levels to the same output;
+ * those levels become distinct if the current LUT gains resolution. Must have
  * LAMP_DIM_LEVELS + 1 entries with index LAMP_DIM_LEVELS == LAMP_ON_CURRENT_MA. */
 static const uint16_t lamp_level_ma[LAMP_DIM_LEVELS + 1] = {
     0,
-     25,  35,  40,  50,  50,
-     60,  70,  80,  80,  90,
-    100, 105, 105, 115, 125,
-    135, 135, 145, 145, LAMP_ON_CURRENT_MA,
+     13,  25,  30,  35,  38,  40,  45,  50,  50,  50,
+     55,  60,  65,  70,  75,  80,  80,  80,  85,  90,
+     95, 100, 103, 105, 105, 105, 110, 115, 120, 125,
+    130, 135, 135, 135, 140, 145, 145, 145, 148,
+    LAMP_ON_CURRENT_MA,
 };
 
 static const LED_OUTPUT lamp_led[4] = { LED1, LED2, LED3, LED4 };
@@ -275,6 +279,11 @@ static void lamp_apply(system_ctx_t *c, uint8_t i)
 {
     uint16_t ma = lamp_level_ma[c->lamp_level[i]];
     set_led_current(ma, lamp_led[i]);
+
+    /* Reconcile the shared LED boost rail with the new lamp state: turning the
+     * last lamp off sheds the rail so "off" is fully dark (not the ~15 mA
+     * compare-99 glow), and turning any lamp on brings it back up. */
+    led_boost_follow_lamps(c);
 
     char buf[40];
     int n;

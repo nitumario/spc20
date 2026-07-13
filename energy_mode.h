@@ -44,6 +44,15 @@
 /* evaluate flags → transition energy mode → set hardware enables */
 void energy_mode_update(system_ctx_t *ctx);
 
+/* Drive the shared LED boost rail to follow lamp state: up iff at least one lamp
+ * is lit, shed when all lamps are off (which takes an "off" lamp from its faint
+ * ~15 mA current floor fully dark, as sleep does). Called from the state entry
+ * actions and from main()'s lamp button handler so a lit/off change reconciles
+ * the rail immediately, without waiting for a mode transition. Wake-on-load is
+ * sensed independently on the 3VOUT branch, so gating this rail costs no load
+ * detection; fault_mgr / SAFE_MODE still shed it directly. */
+void led_boost_follow_lamps(system_ctx_t *ctx);
+
 /* Re-apply the CURRENT state's entry actions (hardware enables) without a
  * transition. Used by system_sleep() on full wake to restore the rails it
  * tore down for STANDBY (LED boost, sense front-end) exactly as the active

@@ -63,6 +63,32 @@ const PWM_Config _pwm_outputs[6] = {
     {LEDCTRL_1_INST, DL_TIMER_CC_3_INDEX, 0},       // LED4 current ref (PA12, TIMA0 CCP3)
 };
 
+/*
+ * Per-channel GPIO descriptor for the four LEDCTRL current-reference pins,
+ * indexed by LED_OUTPUT (LED1..LED4). Used by set_led_current() for a per-lamp
+ * true 0 mA "off": the pad is flipped off its timer CCP function and driven as a
+ * static GPIO LOW. Each LED channel is an op-amp transconductance current source
+ * (LM324: IN+ = RC-filtered LEDCTRL, IN- = the 200 mR sense node), so LED current
+ * is PROPORTIONAL to the LEDCTRL average voltage — LEDCTRL = 0 V => 0 mA. LOW is
+ * the toward-zero direction and cannot run away (runaway is the HIGH/max-ref end;
+ * bench 2026-07-13 confirmed pin-HIGH = MAX current). `func` is the timer-CCP
+ * peripheral IOMUX function to restore. Each pad has its own IOMUX, so forcing one
+ * channel off does not disturb siblings that share a timer (LED1/3/4 all = TIMA0).
+ */
+typedef struct {
+    GPIO_Regs *port;
+    uint32_t   pin;
+    uint32_t   iomux;   /* IOMUX PINCM index for this pad */
+    uint32_t   func;    /* timer-CCP peripheral function to restore */
+} LedCtrlPin;
+
+static const LedCtrlPin _ledctrl_pins[4] = {
+    {GPIO_LEDCTRL_1_C1_PORT, GPIO_LEDCTRL_1_C1_PIN, GPIO_LEDCTRL_1_C1_IOMUX, GPIO_LEDCTRL_1_C1_IOMUX_FUNC}, // LED1 PA9  TIMA0 CCP1
+    {GPIO_LEDCTRL_2_C0_PORT, GPIO_LEDCTRL_2_C0_PIN, GPIO_LEDCTRL_2_C0_IOMUX, GPIO_LEDCTRL_2_C0_IOMUX_FUNC}, // LED2 PB4  TIMA1 CCP0
+    {GPIO_LEDCTRL_1_C0_PORT, GPIO_LEDCTRL_1_C0_PIN, GPIO_LEDCTRL_1_C0_IOMUX, GPIO_LEDCTRL_1_C0_IOMUX_FUNC}, // LED3 PB8  TIMA0 CCP0
+    {GPIO_LEDCTRL_1_C3_PORT, GPIO_LEDCTRL_1_C3_PIN, GPIO_LEDCTRL_1_C3_IOMUX, GPIO_LEDCTRL_1_C3_IOMUX_FUNC}, // LED4 PA12 TIMA0 CCP3
+};
+
 /* ============================================================================
  * SYSTEM INITIALIZATION
  * ============================================================================ */
@@ -1094,49 +1120,57 @@ void set_led_voltage(uint16_t voltage){
  * Sets LED output current for the selected LED channel using a current LUT.
  */
 void set_led_current(uint16_t current, LED_OUTPUT led){
-    const PWM_Config *ch = (led == LED1) ? &_pwm_outputs[2]
-                         : (led == LED2) ? &_pwm_outputs[3]
-                         : (led == LED3) ? &_pwm_outputs[4]
-                         : (led == LED4) ? &_pwm_outputs[5]
-                         : (const PWM_Config *)0;
-    if (ch == (const PWM_Config *)0) return;
+    uint8_t idx = (led == LED1) ? 0
+                : (led == LED2) ? 1
+                : (led == LED3) ? 2
+                : (led == LED4) ? 3
+                : 0xFF;
+    if (idx == 0xFF) return;
+
+    const PWM_Config *ch  = &_pwm_outputs[2 + idx];
+    const LedCtrlPin *pin = &_ledctrl_pins[idx];
 
     /*
-     * current == 0 means "lamp off". These LEDCTRL channels (TIMA0/TIMA1,
-     * edge-align, period = 100) drive a filtered current reference whose LED
-     * current FALLS as the PWM high-fraction (the compare value) rises:
-     *   compare 1   ->  1% high  -> MAX current (runaway/brightest)
-     *   compare 85  -> 85% high  -> ~150 mA
-     *   compare 99  -> 99% high  -> ~15 mA  (dimmest reliable => "off")
+     * Each LED channel is an op-amp transconductance current source (schematic
+     * sheet 8, LM324 U87A-D): IN+ = the RC-filtered LEDCTRL PWM, IN- = the
+     * 200 mR sense node, OUT drives a PBSS4250X PNP. Negative feedback holds
+     * I_LED * R_sense = V(LEDCTRL_avg), so LED current is PROPORTIONAL to the
+     * LEDCTRL average voltage. The PWM output high-fraction maps to that average,
+     * and (bench-measured, NOT the direction an earlier comment guessed):
+     *   more high-time / higher average -> MORE current
+     *   compare 1   -> nearly all-high avg -> MAX current (runaway/brightest)
+     *   compare 85  ->                     -> ~150 mA  ("on")
+     *   compare 99  -> nearly all-low  avg -> ~15 mA  (dimmest reachable by PWM)
+     *   pad static LOW (0 V ref)           -> 0 mA    (true off)
      *
-     * Valid compare range is [1, 99], exactly mirroring the buck's [1, 399]:
-     * the two period-boundary values (0 and period=100) are FORBIDDEN. The
-     * timer aliases compare == period back to the 0%-high / pin-low state,
-     * i.e. the SAME runaway as compare 0 — NOT a clean 100%-high 0 mA.
-     *
-     * History of this one line:
-     *   - Original code wrote compare 0   -> pin low -> runaway bright.
-     *   - v0.19 "fix" wrote compare 100 (= period) on the THEORY that 100%
-     *     high == 0 mA. Bench 2026-06-16 DISPROVED it: compare == period is
-     *     the forbidden endpoint and ran away exactly like compare 0 (OFF drew
-     *     ~3.9 A while ON drew ~150 mA — the reported inversion).
-     *   - Correct: compare 99, the dimmest in-range value (~15 mA faint).
-     * A truly-dark off cannot come from this PWM endpoint; it needs the pin
-     * forced high via GPIO, or gating the shared LED boost. 15 mA is the floor
-     * the current source holds without losing regulation.
-     *
-     * Written directly (not via set_pwm_duty_cycle) so scale_duty_cycle()'s
-     * buck-sized [1,399] clamp can't push this period-100 channel past 99.
+     * Valid PWM compare range is [1, 99]; both period-boundary values (0 and
+     * period=100) are FORBIDDEN — the timer aliases them to the all-high output,
+     * i.e. the MAX-current runaway (bench 2026-06-16). So the PWM alone bottoms
+     * out at ~15 mA (compare 99); a truly-dark 0 mA needs one more notch DOWN in
+     * average, i.e. a full 0 V reference. current == 0 gets that by flipping THIS
+     * pad off its timer CCP function and driving it as a static GPIO LOW. That is
+     * the toward-zero direction and CANNOT run away — runaway is the HIGH/max-ref
+     * end (bench 2026-07-13 confirmed pin-HIGH = MAX current, the opposite error).
+     * Each pad has its own IOMUX, so this leaves the sibling channels sharing the
+     * same timer untouched (LED1/3/4 = TIMA0). The shared LED boost gate
+     * (led_boost_follow_lamps) still sheds the rail on all-off as a power saver,
+     * but is no longer what makes an individual "off" lamp dark.
      */
     if (current == 0) {
-        DL_TimerG_stopCounter(ch->TIMER);
-        DL_TimerG_setCaptureCompareValue(ch->TIMER, 99, ch->CC_INDEX);
-        DL_TimerG_startCounter(ch->TIMER);
+        /* Drive DOUT low and enable the output BEFORE switching the mux, so the
+         * pad lands directly on the low (zero-reference) level, not a glitch. */
+        DL_GPIO_clearPins(pin->port, pin->pin);
+        DL_GPIO_enableOutput(pin->port, pin->pin);
+        DL_GPIO_initDigitalOutput(pin->iomux);
         return;
     }
 
     uint16_t duty_cycle_index = binary_search_closest_ascending(current, output_currents_led_mA, MAX_DUTY_CYCLES_LED);
     set_pwm_duty_cycle(ch, duty_cycles_led[duty_cycle_index]);
+
+    /* Return the pad to its timer CCP function (idempotent if it was never
+     * forced off). Compare is already set above, so the output resumes clean. */
+    DL_GPIO_initPeripheralOutputFunction(pin->iomux, pin->func);
 }
 
 /* ============================================================================

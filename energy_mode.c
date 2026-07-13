@@ -155,19 +155,43 @@ static void activate_charger_region(system_ctx_t *ctx)
 
 /* ── Per-state entry actions ── */
 
+/* Reconcile the shared LED boost rail (TPS61088) with lamp state: hold it up
+ * iff at least one lamp is lit, shed it when every lamp is off. The rail powers
+ * *only* the LED lamp strings, so with all lamps off there is nothing for it to
+ * power — and a lamp commanded "off" still sits at the ~15 mA compare-99 current
+ * floor (a faint glow, see set_led_current()), so the ONLY way to make "off"
+ * fully dark is to drop this rail, exactly as sleep does. Safe to gate here:
+ * wake-on-load is sensed on the 3VOUT branch (R432 / has_load), which is fed by
+ * the output switch + USB boost and is independent of this rail, so shedding it
+ * loses no load detection. fault_mgr and SAFE_MODE still shed the rail directly;
+ * this only governs the lit/dark choice while the rail is otherwise allowed up.
+ * main()'s lamp handler calls this too, so a button press toggles the rail
+ * without waiting for a state transition. */
+void led_boost_follow_lamps(system_ctx_t *ctx)
+{
+    for (uint8_t i = 0; i < 4; i++) {
+        if (ctx->lamp_level[i] != 0) {
+            enable_led_boost();
+            return;
+        }
+    }
+    disable_led_boost();
+}
+
 static void enter_idle(system_ctx_t *ctx)
 {
     disable_charge_switch();
     /* BATTERY_EN + OUTPUT_EN stay on so I_DISCHARGE (across R427, downstream
      * of Q46) can register a load on 3VOUT and wake us into DISCHARGE_ONLY.
-     * USB boost (MIC2876) + LED boost (TPS61088) are also held on so loads
-     * on either connector type can draw current and trip has_load. LED
-     * outputs are passive (LED string + PNP CC), so the current source must
-     * be running for any current to flow — see set_led_current() in main(). */
+     * USB boost (MIC2876) is held on so USB-connector loads can draw current
+     * and trip has_load. The LED boost follows lamp state (dark rail when all
+     * lamps are off) — LED outputs are passive (LED string + PNP CC), so the
+     * current source must be running for any current to flow, see
+     * set_led_current() in main(). */
     enable_battery_switch();
     enable_output_switch();
     enable_usb_boost();
-    enable_led_boost();
+    led_boost_follow_lamps(ctx);
     disable_input_buck();
 
     ctx->idle_start_ms = time_now();
@@ -177,12 +201,12 @@ static void enter_idle(system_ctx_t *ctx)
 static void enter_charge_only(system_ctx_t *ctx)
 {
     enable_battery_switch();
-    /* OUTPUT_EN + USB_EN + LED boost on for the same reason as in enter_idle —
-     * otherwise a load appearing mid-charge can never trip has_load and we'd
-     * never advance to CHARGE_AND_LOAD. */
+    /* OUTPUT_EN + USB_EN on for the same reason as in enter_idle — otherwise a
+     * load appearing mid-charge can never trip has_load and we'd never advance
+     * to CHARGE_AND_LOAD. LED boost follows lamp state (see led_boost_follow_lamps). */
     enable_output_switch();
     enable_usb_boost();
-    enable_led_boost();
+    led_boost_follow_lamps(ctx);
 
     activate_charger_region(ctx);
 }
@@ -192,7 +216,7 @@ static void enter_charge_and_load(system_ctx_t *ctx)
     enable_battery_switch();
     enable_output_switch();
     enable_usb_boost();
-    enable_led_boost();
+    led_boost_follow_lamps(ctx);
 
     activate_charger_region(ctx);
 }
@@ -204,7 +228,7 @@ static void enter_discharge_only(system_ctx_t *ctx)
     enable_battery_switch();
     enable_output_switch();
     enable_usb_boost();
-    enable_led_boost();
+    led_boost_follow_lamps(ctx);
 }
 
 static void enter_safe_mode(system_ctx_t *ctx)

@@ -256,16 +256,18 @@
  * toggles the lamp full-on / off; press-and-hold dims one level every
  * LAMP_DIM_STEP_MS until it reaches off. There are LAMP_DIM_LEVELS steps
  * between full and off, so a continuous hold from full goes dark in
- * LAMP_DIM_LEVELS * LAMP_DIM_STEP_MS (= 5 s). Per-level LED currents live in
+ * LAMP_DIM_LEVELS * LAMP_DIM_STEP_MS (about 3.3 s, roughly 1.5x faster than
+ * the former 20-step/5 s ramp). Per-level LED currents live in
  * lamp_level_ma[] in main.c (index LAMP_DIM_LEVELS = full = LAMP_ON_CURRENT_MA,
  * index 0 = off). The dim cadence is paced off the button's pressStartTime via
  * time_now() with a catch-up loop, so LAMP_DIM_STEP_MS need not be an exact
  * multiple of TICK_BUTTON_MS (steps just land on the nearest button poll).
  * Note: the LED current LUT (output_currents_led_mA) has only ~15 usable bins
- * between the off-floor and LAMP_ON_CURRENT_MA, so a few adjacent levels share
- * a current — the hold still dims smoothly over the full 5 s. */
-#define LAMP_DIM_LEVELS           20
-#define LAMP_DIM_STEP_MS          250
+ * between the off-floor and LAMP_ON_CURRENT_MA, so adjacent logical levels can
+ * share a current. The 40-step ladder still gives the UI finer positioning and
+ * leaves room for a higher-resolution current LUT later. */
+#define LAMP_DIM_LEVELS           40
+#define LAMP_DIM_STEP_MS          83
 
 /* =========================================================================
  * 4. LOAD DETECTION
