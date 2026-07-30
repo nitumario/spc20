@@ -438,11 +438,14 @@ void mppt_update(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
     const bool has_sun  = ctx->flag_has_sun.value;
-    const bool charging = (ctx->charger.state != CHG_INACTIVE) ||
-                          (ctx->energy_mode == EM_CHARGE_ONLY) ||
-                          (ctx->energy_mode == EM_CHARGE_AND_LOAD);
+    const bool charging = (ctx->charger.state == CHG_PRECHARGE) ||
+                          (ctx->charger.state == CHG_CC) ||
+                          (ctx->charger.state == CHG_CV);
 
-    /* Charger region inactive → nothing to optimise. */
+    /* Nothing to optimise until Q49 is connected. CHG_BUCK_SETTLE runs the
+     * buck intentionally unloaded and owns PWM acquisition; starting a P&O
+     * dwell there would measure zero charge current, pollute its baseline,
+     * and report MPPT tracking before charging has actually begun. */
     if (!charging) {
         if (m->state != MPPT_DISABLED) enter_disabled(ctx);
         return;
@@ -766,12 +769,12 @@ void mppt_update(system_ctx_t *ctx)
     mppt_ctx_t *m = &ctx->mppt;
     const bool has_sun       = ctx->flag_has_sun.value;
     const bool panel_limited = ctx->panel_limited;
-    const bool charging      = (ctx->charger.state != CHG_INACTIVE) ||
-                               (ctx->energy_mode == EM_CHARGE_ONLY) ||
-                               (ctx->energy_mode == EM_CHARGE_AND_LOAD);
+    const bool charging      = (ctx->charger.state == CHG_PRECHARGE) ||
+                               (ctx->charger.state == CHG_CC) ||
+                               (ctx->charger.state == CHG_CV);
 
-    /* If the charger region is not active, MPPT has no role. Ensure
-     * we're DISABLED and the panel constraint is released. */
+    /* CHG_BUCK_SETTLE owns PWM while Q49 is open. Treat it like an inactive
+     * charger here so MPPT cannot perturb the unloaded acquisition rail. */
     if (!charging) {
         if (m->state != MPPT_DISABLED) enter_disabled(ctx);
         return;

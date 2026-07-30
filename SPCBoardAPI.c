@@ -45,6 +45,17 @@
 #define MAX_DUTY_CYCLES_BOOST 35
 #define CPU_CLK 32000000UL
 
+/* PWM periods configured in SPC_20.syscfg. The LED-current timers deliberately
+ * use eight times the period of the original calibration so set_led_current()
+ * can interpolate eight sub-counts between measured LUT entries. At the 4 MHz
+ * timer clock this is 5 kHz, still far above the roughly 72 Hz cutoff of the
+ * 1 kOhm/2.2 uF LEDCTRL filters on schematic sheet 8. */
+#define BUCK_PWM_PERIOD             400U
+#define AUX_PWM_PERIOD              100U
+#define LED_CURRENT_PWM_PERIOD      800U
+#define LED_CURRENT_LUT_PERIOD      100U
+#define LED_CURRENT_DUTY_SCALE      (LED_CURRENT_PWM_PERIOD / LED_CURRENT_LUT_PERIOD)
+
 /* ============================================================================
  * GLOBAL STATE
  * ============================================================================ */
@@ -798,6 +809,17 @@ uint16_t get_discharge_current_now(void){
     return (uint16_t)(v_idischarge/OUT_CUR_GAIN/CHG_CUR_RES);
 }
 
+uint16_t get_charge_voltage_now(void){
+    return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc0Result[9]/(ADC.max_adc0_value)/VCHGM_DIV_RATIO);
+}
+
+int16_t get_charge_current_now(void){
+    if(!System_Status.charger_switch) return 0;
+
+    float v_icharge = ((ADC.VREF*(float)ADC.Adc0Result[4])/(ADC.max_adc0_value)) - 1260.0;
+    return (int16_t)(v_icharge/CHG_CUR_GAIN/CHG_CUR_RES);
+}
+
 uint16_t get_led_transistor_voltage(LED_OUTPUT led){
     switch(led){
         case LED1:
@@ -1049,14 +1071,14 @@ uint16_t binary_search_closest_descending(uint16_t value, const uint16_t * LUT, 
  * Scales duty cycle to compensate for VDD variation.
  * This helps maintain consistent output behavior when MCU supply drifts.
  */
-uint16_t scale_duty_cycle(uint16_t duty_cycle){
+static uint16_t scale_duty_cycle(uint16_t duty_cycle, uint16_t period){
     uint16_t vdd_actual = get_vdd();
     float scale = 3300.0 / (float)vdd_actual;
     float pwm_res_float = scale * (float)duty_cycle;
     uint16_t pwm_res = (uint16_t)ceil((double)pwm_res_float);
 
-    // Sanity clamp to valid PWM range
-    if(pwm_res >= 399) pwm_res = 399;
+    /* Both timer boundary values are invalid for these PWM outputs. */
+    if(pwm_res >= period) pwm_res = period - 1U;
     if(pwm_res <= 1) pwm_res = 1;
 
     return pwm_res;
@@ -1065,19 +1087,22 @@ uint16_t scale_duty_cycle(uint16_t duty_cycle){
 /*
  * Applies duty cycle to the selected PWM channel.
  * NOTE:
- * - Channel 0 uses a different PWM base (period 400) than others (period 100).
+ * - Buck uses period 400, LED boost 100, and LED-current channels 800.
  * - The value is inverted (period - duty) due to timer output polarity.
  */
 void set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle){
-    uint16_t _duty_cycle = scale_duty_cycle(duty_cycle);
+    uint16_t period = (pwm_channel == &_pwm_outputs[1])
+                    ? AUX_PWM_PERIOD
+                    : (pwm_channel == &_pwm_outputs[0])
+                    ? BUCK_PWM_PERIOD
+                    : LED_CURRENT_PWM_PERIOD;
+    uint16_t _duty_cycle = scale_duty_cycle(duty_cycle, period);
 
     DL_TimerG_stopCounter(pwm_channel->TIMER);
 
-    if(pwm_channel == &_pwm_outputs[0]){
-        DL_TimerG_setCaptureCompareValue(pwm_channel->TIMER, 400 - _duty_cycle, pwm_channel->CC_INDEX);
-    } else {
-        DL_TimerG_setCaptureCompareValue(pwm_channel->TIMER, 100 - _duty_cycle, pwm_channel->CC_INDEX);
-    }
+    DL_TimerG_setCaptureCompareValue(pwm_channel->TIMER,
+                                     period - _duty_cycle,
+                                     pwm_channel->CC_INDEX);
 
     DL_TimerG_startCounter(pwm_channel->TIMER);
     return;
@@ -1116,9 +1141,49 @@ void set_led_voltage(uint16_t voltage){
     set_pwm_duty_cycle(&_pwm_outputs[1], duty_cycle);
 }
 
-/*
- * Sets LED output current for the selected LED channel using a current LUT.
+/* Convert a requested LED current into a duty count on the 800-count timer.
+ *
+ * output_currents_led_mA[] was measured on the original 100-count PWM grid.
+ * Each measured duty is therefore multiplied by eight, then requests between
+ * two measured currents are linearly interpolated (rounded to nearest). This
+ * preserves the board calibration while exposing the timer's finer resolution.
  */
+static uint16_t led_lut_duty(uint16_t index)
+{
+    uint16_t duty = duty_cycles_led[index];
+
+    /* SPC51's (0 mA, duty 0) entry is a mathematical interpolation origin;
+     * an actual 0 mA command still takes the GPIO-low path below. Older LUT
+     * variants record a non-zero current at duty 0 because the legacy timer
+     * clamped it to duty 1, so retain that calibration when applicable. */
+    if (duty == 0U && output_currents_led_mA[index] != 0U) duty = 1U;
+    return duty * LED_CURRENT_DUTY_SCALE;
+}
+
+static uint16_t led_current_to_duty(uint16_t current)
+{
+    if (current <= output_currents_led_mA[0])
+        return led_lut_duty(0);
+
+    for (uint16_t hi = 1; hi < MAX_DUTY_CYCLES_LED; hi++) {
+        if (current <= output_currents_led_mA[hi]) {
+            uint16_t lo = hi - 1U;
+            uint16_t current_lo = output_currents_led_mA[lo];
+            uint16_t current_span = output_currents_led_mA[hi] - current_lo;
+            uint16_t duty_lo = led_lut_duty(lo);
+            uint16_t duty_span = led_lut_duty(hi) - duty_lo;
+            uint32_t numerator = (uint32_t)duty_span * (current - current_lo);
+
+            return duty_lo + (uint16_t)((numerator + current_span / 2U) /
+                                        current_span);
+        }
+    }
+
+    return led_lut_duty(MAX_DUTY_CYCLES_LED - 1U);
+}
+
+/* Sets LED output current for the selected LED channel using the interpolated
+ * high-resolution calibration above. */
 void set_led_current(uint16_t current, LED_OUTPUT led){
     uint8_t idx = (led == LED1) ? 0
                 : (led == LED2) ? 1
@@ -1143,11 +1208,13 @@ void set_led_current(uint16_t current, LED_OUTPUT led){
      *   compare 99  -> nearly all-low  avg -> ~15 mA  (dimmest reachable by PWM)
      *   pad static LOW (0 V ref)           -> 0 mA    (true off)
      *
-     * Valid PWM compare range is [1, 99]; both period-boundary values (0 and
-     * period=100) are FORBIDDEN — the timer aliases them to the all-high output,
-     * i.e. the MAX-current runaway (bench 2026-06-16). So the PWM alone bottoms
-     * out at ~15 mA (compare 99); a truly-dark 0 mA needs one more notch DOWN in
-     * average, i.e. a full 0 V reference. current == 0 gets that by flipping THIS
+     * The original 100-count calibration observed compare 85 at ~150 mA and
+     * compare 99 at ~15 mA. Runtime uses an 800-count timer and interpolates the
+     * active LUT from its 0 mA origin, which also provides safe sub-1%-duty
+     * near-off levels. Both timer-boundary values (0 and period) remain
+     * FORBIDDEN: the timer aliases them to the all-high/MAX-current output
+     * (bench 2026-06-16). A truly-dark 0 mA still needs a full 0 V reference;
+     * current == 0 gets that by flipping THIS
      * pad off its timer CCP function and driving it as a static GPIO LOW. That is
      * the toward-zero direction and CANNOT run away — runaway is the HIGH/max-ref
      * end (bench 2026-07-13 confirmed pin-HIGH = MAX current, the opposite error).
@@ -1165,8 +1232,7 @@ void set_led_current(uint16_t current, LED_OUTPUT led){
         return;
     }
 
-    uint16_t duty_cycle_index = binary_search_closest_ascending(current, output_currents_led_mA, MAX_DUTY_CYCLES_LED);
-    set_pwm_duty_cycle(ch, duty_cycles_led[duty_cycle_index]);
+    set_pwm_duty_cycle(ch, led_current_to_duty(current));
 
     /* Return the pad to its timer CCP function (idempotent if it was never
      * forced off). Compare is already set above, so the output resumes clean. */

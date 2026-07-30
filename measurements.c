@@ -203,8 +203,10 @@ void flags_update(system_ctx_t *ctx)
      * HAS_SUN_RELOCK_MS — re-probe ~once a minute rather than oscillate.
      */
     uint32_t now = time_now();
-    bool charging = (ctx->energy_mode == EM_CHARGE_ONLY ||
-                     ctx->energy_mode == EM_CHARGE_AND_LOAD);
+    bool charge_path_connected =
+        (ctx->charger.state == CHG_PRECHARGE) ||
+        (ctx->charger.state == CHG_CC) ||
+        (ctx->charger.state == CHG_CV);
 
     /* Path 1 — voltage collapse / sunset (the original debounce). A dark or
      * loaded-into-the-knee panel reads below PANEL_MIN_CLEAR_MV. This counter
@@ -230,7 +232,7 @@ void flags_update(system_ctx_t *ctx)
      * that event advances path 1, not this one — the two can't compound.
      * Clearing here arms the re-set lockout, since the unloaded panel floats
      * straight back above PANEL_MIN_MV (re-probe ~once a minute, not instantly). */
-    bool panel_dead = ctx->flag_has_sun.value && charging &&
+    bool panel_dead = ctx->flag_has_sun.value && charge_path_connected &&
                       (m->panel_voltage > PANEL_MIN_MV) &&
                       (m->panel_power   < PANEL_USABLE_MIN_MW);
     if (panel_dead) {

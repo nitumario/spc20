@@ -52,4 +52,8 @@ void fault_mgr_update(system_ctx_t *ctx);
  */
 void fault_raise(system_ctx_t *ctx, uint16_t fault_bit);
 
+/* Clear a fault after a caller has independently validated its recovery.
+ * This does not re-enable hardware; energy_mode observes the falling edge. */
+void fault_clear(system_ctx_t *ctx, uint16_t fault_bit);
+
 #endif /* FAULT_MGR_H */

@@ -1,3 +1,95 @@
+# [v0.25] - 30.07.26
+## Staged charger activation (CHG_BUCK_SETTLE), wake-probe hardening, high-resolution lamp dimming
+
+Changed files: `charger.c`, `charger.h`, `energy_mode.c`, `energy_mode.h`, `fault_mgr.c`, `fault_mgr.h`, `hw_config.h`, `main.c`, `measurements.c`, `mppt.c`, `mppt.h`, `system_types.h`, `SPCBoardAPI.c`, `SPCBoardAPI.h`, `SPC_20.syscfg`, `docs/charger_states.csv`, `docs/transition_table.csv`, `docs/MPPT_states.csv`, `docs/MPPT_transition_table.csv`, `docs/fault_recovery.md`
+
+### Charger: activation staged through a new CHG_BUCK_SETTLE state
+`energy_mode` now owns the whole activation: it opens Q49, pre-positions the
+buck from the voltage LUT, and enters `CHG_BUCK_SETTLE` (`SETL` in the logs);
+the charger no longer self-activates from INACTIVE. `SETL` holds Q49 open until
+the **instantaneous** VCHG reading is at least `CHG_BUCK_READY_MARGIN_MV`
+(20 mV) above both the activation-time and live V_bat — so a failed or weak
+buck start can never connect a below-Vbat rail and reverse-pump the input
+(TPS564247 FCCM). Because the LUT's unloaded result can land ~300 mV low
+(which used to strand `SETL` forever), the state walks PWM down 2 counts/tick
+under raw VCHG feedback until ready, then closes Q49 and picks
+PRECHARGE/CC/CV from V_bat. Deactivation now opens Q49 *before* stopping the
+buck, for the same reverse-pump reason. MPPT and the `has_sun` dusk power-clear
+are keyed on the *connected* charge path (PRECHARGE/CC/CV) so neither runs
+against the intentionally unloaded `SETL` rail.
+
+### Charger: foreground reverse-current guard — and its false trip on activation under load
+New `charger_fast_guard()` runs every super-loop pass on the latest 10 ms ADC
+conversion and raises `FAULT_OVERCURRENT_CHG` (reusing its containment/retry
+path) on reverse current while connected. As first written it judged
+`chg_current` alone — but chg (R440) is **net cell current**
+(`I_cell = I_buck − I_load`), and an activation under load closes Q49 with the
+buck at ~zero delivery, so the net legitimately reads −I_load until CC walks
+the delivery up. Bench 2026-07-29 (panel replug with lamps on, ~600 mA): every
+activation latched `fault:0004` within one tick of `SETL → CC`, then looped
+through the 10 s fault retry. Fixed by judging the buck branch,
+`I_buck = chg_now + dsg_now`, against `−CHG_REVERSE_CURRENT_MA` — genuine
+reverse pumping still trips at the same sensitivity, load current cancels out.
+
+### Wake probe v2 (bat_wake, energy_mode.c)
+- **Collapsed-signature lockout detected**: bench 2026-07-29 — with the panel
+  absent and the bus fully discharged, the protection-open node reads a hard
+  0 mV (below the 500 mV disconnected-cell guard), so no fault ever latched and
+  no recovery path armed. `V_bat ≤ BAT_PROT_SIG_COLLAPSED_MAX_MV` (300 mV) is
+  now treated as the same lockout; `energy_mode_update()` forces SAFE_MODE on a
+  suspected lockout so the probe (SAFE_MODE in-state) can actually run.
+- **Staged probe targets**: first attempt at 3.0 V (gentler into a genuinely
+  depleted pack), later attempts at the full 3.65 V CV target needed to release
+  a healthy protection-open pack. Both fixed, never derived from the invalid
+  reading.
+- **Probe staged through its own BUCK_SETTLE** with the same Q49/VCHG-ready
+  interlock, plus `bat_wake_fast_guard()`: foreground cut at
+  `BAT_WAKE_PROBE_CUT_MA` delivered or on reverse current.
+- **Validation split**: off-state minimum ≥ 2000 mV → VALIDATED with direct
+  handoff to normal charging (`fault_clear()` + `EM_CHARGE_ONLY`, PRECHARGE
+  below 3 V); 1500–1999 mV → VALIDATED but kept on the supervised rescue.
+- **Sleep gate**: STANDBY is blocked while a wake sequence (probe, handoff, or
+  retry wait) is in flight — the collapsed case latches no fault, so the
+  existing fault gate didn't cover it, and the 60 s retry cadence outlasts the
+  2 min idle-sleep timeout.
+
+### Fault manager
+- `fault_clear()` exported for the validated-probe handoff; it only clears the
+  bit — hardware re-arm still rides energy_mode's falling-edge handshake.
+- Raising a fault now re-anchors the recovery dwell (`last_recovery_ms`), so a
+  fault raised after a long quiet interval can't satisfy the recovery cadence
+  in the same tick and hide its falling edge from energy_mode.
+- Deep-discharge precharge timeout (30 min `BAT_RESCUE_TIMEOUT_MS`) is now
+  selected on `fault.history`, not the live code: the wake probe clears the
+  undervolt latch before the rescued cell reaches PRECHARGE, and the live-code
+  test handed it the short 15 min window — declaring a normally recovering
+  cell dead (bench 2026-07-29: probe rescued to 2.65 V, then timed out).
+
+### SAFE_MODE: fault-free low cell with sun now charges
+A cell between `BAT_UNDERVOLT_MV` and the 3.2 V recovery threshold with no
+latched fault and usable sun exits SAFE_MODE into CHARGE_ONLY (staged
+activation, PRECHARGE below 3 V) instead of being stranded with the charger
+off. The 3.2 V threshold still gates restoring loads without sun.
+
+### Lamps: 8× LED-current PWM resolution, hold-to-dim floor
+The four LED-current timers move from a 100- to an 800-count period
+(`SPC_20.syscfg`), and `set_led_current()` linearly interpolates the measured
+100-count calibration LUT onto the finer grid — every one of the 40 dim levels
+now maps to a distinct current reference. Press-and-hold dimming stops at
+`LAMP_DIM_MIN_LEVEL` (dimmest ON level) instead of walking through off: a hold
+only changes brightness; off stays tap-only.
+
+### Bench validation needed
+(1) Lamps-on panel replug: `SETL → CC` holds, `Ichg` climbs from ≈ −600 mA to
+positive over a few 400 ms steps, no `fault:0004`. (2) Staged activation on
+both panels: no reverse pump at Q49 close, no `SETL` strand (LUT-low case).
+(3) Collapsed-signature lockout (dead bus, no panel → plug panel): probe runs,
+staged 3.0 V then 3.65 V targets, TERMINAL after 3 attempts with no battery.
+(4) Rescued deep cell precharges on the 30 min window. (5) Hold-to-dim parks at
+the floor; per-level brightness is visibly monotonic on the 800-count grid.
+
+---
+
 # [v0.24] - 13.07.26
 ## Keep absent-source LED bars dark
 

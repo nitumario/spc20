@@ -6,9 +6,8 @@
  *   1. Decide whether the charger should run at all. It runs only when
  *      energy_mode has activated the region (EM_CHARGE_ONLY or
  *      EM_CHARGE_AND_LOAD) AND no charge-blocking fault is latched.
- *   2. From CHG_INACTIVE, self-activate into PRECHARGE (if V_bat < 3000
- *      mV) or CC (otherwise) — this is the "activated" transition from
- *      charger_states.csv.
+ *   2. Hold CHG_BUCK_SETTLE until instantaneous VCHG is above V_bat, then
+ *      close Q49 and enter PRECHARGE, CC, or CV from the battery voltage.
  *   3. Evaluate in-state transition guards (V_bat thresholds, taper
  *      completion, precharge timeout).
  *   4. Regulate ctx->pwm:
@@ -28,11 +27,9 @@
  *
  * PWM continuity
  * --------------
- * Per the README/charger_states note, "PWM is not reset on state entry,
- * it is saved from previous state." On first activation, pwm was reset
- * to PWM_MIN_DUTY by energy_mode's deactivate_charger_region() — the
- * first few ticks ramp it down gradually. That's intentional: a slow
- * start-up limits inrush current.
+ * PWM is retained between PRECHARGE, CC, and CV. On first activation,
+ * energy_mode pre-positions it from the voltage LUT while Q49 is open;
+ * CHG_BUCK_SETTLE verifies the resulting rail before connecting the cell.
  *
  * Sign convention
  * ---------------
@@ -86,6 +83,36 @@ static inline uint16_t pwm_clamp(int32_t p)
 static inline void pwm_step(system_ctx_t *ctx, int32_t delta)
 {
     ctx->pwm = pwm_clamp((int32_t)ctx->pwm + delta);
+}
+
+void charger_fast_guard(system_ctx_t *ctx)
+{
+    charger_state_t state = ctx->charger.state;
+    bool connected = (state == CHG_PRECHARGE) ||
+                     (state == CHG_CC) ||
+                     (state == CHG_CV);
+
+    if (!connected)
+        return;
+
+    /* chg_current (R440) is NET cell current: I_cell = I_buck − I_load. An
+     * activation under load connects Q49 with the buck at ~zero delivery, so
+     * I_cell legitimately reads −I_load until cc_regulate walks the delivery
+     * up — judging chg alone here latched this fault on every lamps-on
+     * activation (bench 2026-07-29, panel replug). Genuine reverse pumping
+     * means the BUCK branch is negative, so judge I_buck = I_cell + I_dsg.
+     * The dsg sensor's ~45 mA zero-offset only biases this check away from
+     * tripping, well inside the threshold. */
+    int32_t i_buck_now = (int32_t)get_charge_current_now() +
+                         (int32_t)get_discharge_current_now();
+
+    if (i_buck_now < -(int32_t)CHG_REVERSE_CURRENT_MA) {
+        /* Reuse the charge-current fault's containment/retry path. Its action
+         * opens Q49 before disabling the buck; energy_mode's fault-clear rearm
+         * subsequently starts from CHG_BUCK_SETTLE, never directly connected. */
+        fault_raise(ctx, FAULT_OVERCURRENT_CHG);
+        ctx->pwm = PWM_MIN_DUTY;
+    }
 }
 
 /* =========================================================================
@@ -412,6 +439,57 @@ static void cv_taper_track(system_ctx_t *ctx)
  * PER-STATE TICK LOGIC
  * ========================================================================= */
 
+static void tick_buck_settle(system_ctx_t *ctx)
+{
+    charger_ctx_t *c = &ctx->charger;
+    uint32_t now = time_now();
+
+    if ((now - c->active_start_ms) < CHG_BUCK_SETTLE_MS)
+        return;
+
+    /* Use the latest ADC conversion, not the 64-sample moving average: the
+     * averaged VCHG still contains the buck-off history. Q49 remains open for
+     * as long as necessary, so a failed or weak buck start cannot connect a
+     * below-Vbat rail and reverse-pump the input. Re-check instantaneous Vbat
+     * as well as the activation snapshot so battery movement during a long
+     * acquisition cannot invalidate the interlock. */
+    uint16_t live_ready_mv =
+        get_battery_voltage_now() + CHG_BUCK_READY_MARGIN_MV;
+    uint16_t ready_mv = (live_ready_mv > c->activation_ready_mv)
+                      ? live_ready_mv
+                      : c->activation_ready_mv;
+    if (get_charge_voltage_now() < ready_mv) {
+        /*
+         * The calibrated LUT is only the acquisition starting point. Bench
+         * traces show its unloaded result can be about 300 mV low, which used
+         * to strand the charger in SETL forever. Walk toward more buck output
+         * under raw VCHG feedback while Q49 is still open. The small paced step
+         * bounds overshoot at the eventual connection; a failed rail simply
+         * saturates at PWM_MAX_DUTY without ever exposing the battery.
+         */
+        if (ctx->meas.panel_voltage >= PANEL_SAFETY_MV &&
+            (now - c->cc_last_downstep_ms) >=
+                CHG_BUCK_SETTLE_RAMP_MS) {
+            c->cc_last_downstep_ms = now;
+            pwm_step(ctx, -CHG_BUCK_SETTLE_PWM_STEP);
+        }
+        return;
+    }
+
+    enable_charge_switch();
+    c->cc_last_downstep_ms = now;
+
+    if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV)
+        enter_precharge(ctx);
+    else if (ctx->meas.bat_voltage < BAT_CV_VOLTAGE_MV)
+        enter_cc(ctx);
+    else
+        enter_cv(ctx);
+
+    /* Do not regulate on the switch-close tick. The current sample still
+     * describes the open-switch interval. */
+}
+
 static void tick_precharge(system_ctx_t *ctx)
 {
     charger_ctx_t *c = &ctx->charger;
@@ -426,13 +504,25 @@ static void tick_precharge(system_ctx_t *ctx)
      *     switch off). The charger stops regulating on the next tick
      *     because CHG_FAULT_BLOCK_MASK will match.
      *
-     *     A supervised undervolt rescue enters PRECHARGE from a deeper start
-     *     (down to BAT_RESCUE_MIN_MV) than a normal precharge, so while
-     *     BAT_UNDERVOLT is latched it gets the longer BAT_RESCUE_TIMEOUT_MS
-     *     window before the cell is declared damaged. Either way the escalation
-     *     is the same terminal FAULT_PRECHARGE_TIMEOUT (user-assisted). */
+     *     A cell that hit BAT_UNDERVOLT this boot enters PRECHARGE from a much
+     *     deeper start (down to BAT_RESCUE_MIN_MV) than a normal precharge, so
+     *     it gets the longer BAT_RESCUE_TIMEOUT_MS window before being declared
+     *     damaged. Either way the escalation is the same terminal
+     *     FAULT_PRECHARGE_TIMEOUT (user-assisted).
+     *
+     *     Keyed on fault.history, not fault.code: the SAFE_MODE wake probe
+     *     clears the BAT_UNDERVOLT latch as soon as it validates the cell is
+     *     really present (energy_mode.c, fault_clear), so by the time the
+     *     rescued cell reaches PRECHARGE the live code is already 0. Reading
+     *     fault.code there handed a just-rescued battery the short 15 min
+     *     window — only ~50 mAh at BAT_PRECHARGE_MAX_MA — and would latch
+     *     PRECHARGE_TIMEOUT on a cell that was recovering normally (bench log
+     *     2026-07-29: probe rescued to 2.65 V, then precharged on the short
+     *     timeout). history is sticky for the boot, which is the intent: once
+     *     this cell has been that deep, every precharge until reset is a
+     *     deep-discharge recovery. */
     else {
-        uint32_t timeout = (ctx->fault.code & FAULT_BAT_UNDERVOLT)
+        uint32_t timeout = (ctx->fault.history & FAULT_BAT_UNDERVOLT)
                          ? BAT_RESCUE_TIMEOUT_MS
                          : BAT_PRECHARGE_TIMEOUT_MS;
         if ((time_now() - c->precharge_start_ms) >= timeout) {
@@ -525,26 +615,19 @@ void charger_update(system_ctx_t *ctx)
         return;
     }
 
-    /* ── Self-activation from INACTIVE ──
-     *
-     * energy_mode has enabled buck + charge switch and left state at
-     * INACTIVE. Choose PRECHARGE or CC based on V_bat, then fall
-     * through to run the first regulation tick in the new state. */
+    /* energy_mode owns activation and always stages it through BUCK_SETTLE.
+     * An eligible-but-INACTIVE state therefore means no entry action has
+     * armed the hardware yet; do not bypass the reverse-pump interlock. */
     if (c->state == CHG_INACTIVE) {
-        c->active_start_ms = time_now();
-        c->cc_last_downstep_ms = time_now();   /* arm the descent throttle */
-        if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV) {
-            enter_precharge(ctx);
-        } else {
-            enter_cc(ctx);
-        }
+        return;
     }
 
     /* ── Per-state tick ── */
     switch (c->state) {
-        case CHG_PRECHARGE: tick_precharge(ctx); break;
-        case CHG_CC:        tick_cc(ctx);        break;
-        case CHG_CV:        tick_cv(ctx);        break;
+        case CHG_BUCK_SETTLE: tick_buck_settle(ctx); break;
+        case CHG_PRECHARGE:   tick_precharge(ctx);   break;
+        case CHG_CC:          tick_cc(ctx);          break;
+        case CHG_CV:          tick_cv(ctx);          break;
 
         /* Should not happen — handled by the gate above. */
         case CHG_INACTIVE:

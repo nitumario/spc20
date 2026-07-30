@@ -20,8 +20,10 @@ PRIORITY,FROM,GUARD,TO,NOTES
 4,DISCHARGE_ONLY,has_sun AND !has_load,CHARGE_ONLY,sun appeared without load
 5,DISCHARGE_ONLY,!has_load,IDLE,load removed
 6,DISCHARGE_ONLY,<default>,DISCHARGE_ONLY,stay
-1,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND has_load AND !bat_full,CHARGE_AND_LOAD,recovered with sun and load
-2,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND !has_load,CHARGE_ONLY,recovered with sun only
-3,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND has_load,DISCHARGE_ONLY,"FIXED: was missing — battery recovered overnight (no sun) but load still present; battery can supply load"
-4,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND !has_load,IDLE,recovered and nothing connected
-5,SAFE_MODE,<default>,SAFE_MODE,"FIXED: removed '!has_load → IDLE' to prevent oscillation after load shedding. Recovery requires V_bat > SAFE_RECOVER_MV (3200mV). Loads stay shed until battery recovers."
+1,SAFE_MODE,protection probe validated off-state V_bat >= BAT_UNDERVOLT_MV AND has_sun,CHARGE_ONLY,clear synthetic undervolt latch and hand off to normal staged PRECHARGE
+2,SAFE_MODE,fault = NONE AND has_sun AND !bat_full AND V_bat >= BAT_UNDERVOLT_MV,CHARGE_ONLY,"fault-free low battery: start the normal staged charger; PRECHARGE is selected below 3000mV"
+3,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND has_load AND !bat_full,CHARGE_AND_LOAD,recovered with sun and load
+4,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND has_sun AND !has_load,CHARGE_ONLY,recovered with sun only
+5,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND has_load,DISCHARGE_ONLY,"FIXED: was missing — battery recovered overnight (no sun) but load still present; battery can supply load"
+6,SAFE_MODE,V_bat > SAFE_RECOVER_MV AND !has_sun AND !has_load,IDLE,recovered and nothing connected
+7,SAFE_MODE,<default>,SAFE_MODE,"Unvalidated batteries and real cells below BAT_UNDERVOLT_MV stay safe. Without usable sun ordinary load recovery still requires V_bat > SAFE_RECOVER_MV (3200mV)."

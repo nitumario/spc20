@@ -28,7 +28,7 @@
  *     │    Sleep entered from EM_IDLE / EM_SAFE_MODE on timeout │
  *     │                                                         │
  *     │  [region 2: CHARGER]                                    │
- *     │    CHG_INACTIVE → CHG_PRECHARGE → CHG_CC → CHG_CV      │
+ *     │ CHG_INACTIVE → BUCK_SETTLE → PRECHARGE → CC → CV       │
  *     │    Controls: buck PWM (when MPPT is not tracking)       │
  *     │    Reads: allowed_chg from power budget                 │
  *     │                                                         │
@@ -131,13 +131,15 @@ typedef enum {
  * Activated/deactivated by energy mode. When inactive, the charger
  * does nothing and the buck is disabled.
  *
- *   CHG_INACTIVE   — charger region not running (deactivated by energy mode)
- *   CHG_PRECHARGE  — V_bat < 3.0V, trickle charge at ≤200 mA
- *   CHG_CC         — constant current, target = allowed_chg from power budget
- *   CHG_CV         — constant voltage at 3.65V, current tapers until bat_full
+ *   CHG_INACTIVE    — charger region not running (deactivated by energy mode)
+ *   CHG_BUCK_SETTLE — buck running, charge switch open until VCHG is above Vbat
+ *   CHG_PRECHARGE   — V_bat < 3.0V, trickle charge at ≤200 mA
+ *   CHG_CC          — constant current, target = allowed_chg from power budget
+ *   CHG_CV          — constant voltage at 3.65V, current tapers until bat_full
  */
 typedef enum {
     CHG_INACTIVE,
+    CHG_BUCK_SETTLE,
     CHG_PRECHARGE,
     CHG_CC,
     CHG_CV
@@ -245,7 +247,8 @@ typedef struct {
  * 4. CHARGER CONTEXT
  * =========================================================================
  *
- * Internal state for the CHG_INACTIVE → PRECHARGE → CC → CV machine.
+ * Internal state for the CHG_INACTIVE → BUCK_SETTLE → PRECHARGE → CC → CV
+ * machine.
  * Only meaningful when state != CHG_INACTIVE.
  *
  * The charger does not know about loads. It receives allowed_chg
@@ -264,10 +267,15 @@ typedef struct {
      * regulate down from PWM_MIN_DUTY. */
     uint32_t active_start_ms;
 
-    /* Last tick CC issued a pwm DOWN step (more current). Used by
-     * cc_regulate to throttle descent to CC_DOWNSTEP_INTERVAL_MS so
-     * the regulator does not outrun the chg_current ADC moving
-     * average. */
+    /* Minimum instantaneous VCHG required before closing the charge switch.
+     * Captured from V_bat at activation so the FCCM buck can never start with
+     * its output below the battery and reverse-pump the panel input. */
+    uint16_t activation_ready_mv;
+
+    /* Last tick the startup acquisition or CC loop issued a pwm DOWN step
+     * (more buck output/current). Used to pace raw-VCHG acquisition in
+     * CHG_BUCK_SETTLE and then to keep CC from outrunning the charge-current
+     * moving average. */
     uint32_t cc_last_downstep_ms;
 
     /* CV taper detection:
@@ -448,12 +456,14 @@ typedef struct {
  * docs/bug_battery_hotplug_800mv_lockout.md.
  */
 typedef enum {
-    BAT_WAKE_MONITOR = 0,   /* watching for the protection-open signature   */
-    BAT_WAKE_PROBE,         /* buck driving the fixed probe target          */
-    BAT_WAKE_SETTLE,        /* buck off, ADC moving average flushing        */
-    BAT_WAKE_VALIDATE,      /* observing off-state V_bat persistence        */
-    BAT_WAKE_RETRY_WAIT,    /* rate-limit window before the next attempt    */
-    BAT_WAKE_TERMINAL       /* gave up — holds until panel/fault state changes */
+    BAT_WAKE_MONITOR = 0,    /* watching for the protection-open signature    */
+    BAT_WAKE_BUCK_SETTLE,    /* buck at fixed target, charge switch still open */
+    BAT_WAKE_PROBE,          /* buck driving the fixed probe target            */
+    BAT_WAKE_SETTLE,         /* buck off, ADC moving average flushing          */
+    BAT_WAKE_VALIDATE,       /* observing off-state V_bat persistence          */
+    BAT_WAKE_HANDOFF,        /* validated cell waiting for normal charge mode  */
+    BAT_WAKE_RETRY_WAIT,     /* rate-limit window before the next attempt      */
+    BAT_WAKE_TERMINAL        /* gave up until panel/fault state changes         */
 } bat_wake_phase_t;
 
 typedef enum {
@@ -471,6 +481,8 @@ typedef struct {
     uint8_t  attempts;               /* probes since the budget last reset   */
     uint32_t phase_start_ms;         /* entry time of the current phase      */
     uint16_t validate_min_mv;        /* min V_bat seen in the validate window*/
+    uint16_t probe_target_mv;        /* fixed target selected for this try   */
+    bool     probe_cut_requested;    /* fast raw guard already cut stimulus  */
 } bat_wake_ctx_t;
 
 typedef struct {
@@ -675,10 +687,10 @@ static inline void ctx_init(system_ctx_t *ctx)
     /* Assume temperature OK until first measurement */
     ctx->temp_charge_ok = true;
 
-    /* All four lamps default to full brightness, mirroring the boot LED-current
-     * arming in main(). A tap toggles full/off; press-and-hold dims to off. */
+    /* All four lamps default to off, mirroring the boot LED-current arming in
+     * main(). A tap toggles full/off; press-and-hold dims to off. */
     for (uint8_t i = 0; i < 4; i++)
-        ctx->lamp_level[i] = LAMP_DIM_LEVELS;
+        ctx->lamp_level[i] = 0;
     ctx->lamp_hold_steps[0] = 0;
     ctx->lamp_hold_steps[1] = 0;
 }
@@ -721,11 +733,12 @@ static inline const char* em_state_name(energy_mode_state_t s)
 static inline const char* chg_state_name(charger_state_t s)
 {
     switch (s) {
-        case CHG_INACTIVE:  return "OFF";
-        case CHG_PRECHARGE: return "PRE";
-        case CHG_CC:        return "CC";
-        case CHG_CV:        return "CV";
-        default:            return "???";
+        case CHG_INACTIVE:    return "OFF";
+        case CHG_BUCK_SETTLE: return "SETL";
+        case CHG_PRECHARGE:   return "PRE";
+        case CHG_CC:          return "CC";
+        case CHG_CV:          return "CV";
+        default:              return "???";
     }
 }
 
@@ -743,9 +756,11 @@ static inline const char* bat_wake_phase_name(bat_wake_phase_t s)
 {
     switch (s) {
         case BAT_WAKE_MONITOR:    return "MON";
+        case BAT_WAKE_BUCK_SETTLE: return "BUCK_SETTLE";
         case BAT_WAKE_PROBE:      return "WAKE_PROBE";
         case BAT_WAKE_SETTLE:     return "SETTLE";
         case BAT_WAKE_VALIDATE:   return "VALIDATE";
+        case BAT_WAKE_HANDOFF:    return "HANDOFF";
         case BAT_WAKE_RETRY_WAIT: return "RETRY_WAIT";
         case BAT_WAKE_TERMINAL:   return "TERMINAL";
         default:                  return "???";

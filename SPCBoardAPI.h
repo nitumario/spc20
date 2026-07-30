@@ -159,6 +159,8 @@ int32_t  get_power_into_battery(void);     /* mW */
 uint16_t get_input_voltage_now(void);      /* V_panel, mV */
 uint16_t get_battery_voltage_now(void);    /* V_bat,   mV */
 uint16_t get_discharge_current_now(void);  /* I_dsg,   mA */
+uint16_t get_charge_voltage_now(void);     /* V_chg,   mV */
+int16_t  get_charge_current_now(void);     /* I_chg,   mA, signed */
 
 /* ============================================================================
  * PWM MODULE

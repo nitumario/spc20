@@ -82,7 +82,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.24\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.25\r\n"
                 "==============================================\r\n");
 }
 
@@ -248,10 +248,13 @@ static void apply_pwm(system_ctx_t *c)
  *
  *   - SHORT TAP (released before the 500 ms hold threshold): toggle. Off ->
  *     full brightness; any on-level -> off.
- *   - PRESS & HOLD (held past 500 ms): dim. While the button stays down, drop
- *     one brightness level every LAMP_DIM_STEP_MS, walking full -> ... -> off
- *     (LAMP_DIM_LEVELS steps, ~3.3 s end to end). Release at any point keeps
- *     the level reached. Holding from off does nothing — tap to turn on first.
+ *   - PRESS & HOLD (held past 500 ms): dim, brightness only. While the button
+ *     stays down, drop one brightness level every LAMP_DIM_STEP_MS, walking
+ *     full -> ... -> LAMP_DIM_MIN_LEVEL (the dimmest still-lit level, ~3.2 s
+ *     end to end) and STOPPING there — a hold never switches the lamp off, it
+ *     just parks at minimum for as long as it is held. Release at any point
+ *     keeps the level reached; turning off is the tap gesture. Holding from off
+ *     does nothing — tap to turn on first.
  *
  * Brightness lives in c->lamp_level[] (0 = off, LAMP_DIM_LEVELS = full),
  * mapped to an LED current by lamp_level_ma[]. c->lamp_hold_steps[] counts the
@@ -269,19 +272,20 @@ static void apply_pwm(system_ctx_t *c)
  */
 
 /* Brightness ladder, indexed by lamp_level: 0 = true off (LEDCTRL GPIO low),
- * LAMP_DIM_LEVELS = full. Intermediate requests rise monotonically to
- * LAMP_ON_CURRENT_MA. The 40-step ladder interpolates the former 20-step curve
- * so existing brightness behavior is preserved while a hold can stop at finer
- * positions. The hardware current LUT has ~15 distinct bins in this range, so
- * set_led_current() currently maps some adjacent levels to the same output;
- * those levels become distinct if the current LUT gains resolution. Must have
+ * LAMP_DIM_LEVELS = full. The 40 non-zero requests follow a gentle perceptual
+ * curve starting at a barely-on 2 mA: more stops are allocated to the near-off
+ * and dim/mid ranges, while current gaps widen toward full brightness. This
+ * avoids both a jump from off and a cluster of nearly-full-looking levels.
+ * set_led_current() interpolates the calibrated current LUT on the
+ * 800-count LED-current timers, so each entry maps to a distinct PWM compare
+ * value. Must have
  * LAMP_DIM_LEVELS + 1 entries with index LAMP_DIM_LEVELS == LAMP_ON_CURRENT_MA. */
 static const uint16_t lamp_level_ma[LAMP_DIM_LEVELS + 1] = {
     0,
-     13,  25,  30,  35,  38,  40,  45,  50,  50,  50,
-     55,  60,  65,  70,  75,  80,  80,  80,  85,  90,
-     95, 100, 103, 105, 105, 105, 110, 115, 120, 125,
-    130, 135, 135, 135, 140, 145, 145, 145, 148,
+      2,   3,   4,   5,   7,   9,  11,  13,  16,  18,
+     21,  24,  27,  30,  34,  37,  41,  45,  48,  52,
+     56,  60,  65,  69,  73,  78,  83,  87,  92,  97,
+    102, 107, 112, 117, 122, 128, 133, 139, 144,
     LAMP_ON_CURRENT_MA,
 };
 
@@ -332,12 +336,13 @@ static void lamp_buttons_update(system_ctx_t *c)
         if (btn->state == 0) {
             uint32_t held = time_now() - btn->pressStartTime;
             uint8_t due = (uint8_t)(held / LAMP_DIM_STEP_MS);
-            if (due > LAMP_DIM_LEVELS) due = LAMP_DIM_LEVELS;
+            if (due > LAMP_DIM_LEVELS - LAMP_DIM_MIN_LEVEL)
+                due = LAMP_DIM_LEVELS - LAMP_DIM_MIN_LEVEL;
             while (c->lamp_hold_steps[b] < due) {
                 c->lamp_hold_steps[b]++;
                 for (uint8_t k = 0; k < 2; k++) {
                     uint8_t i = grp[k];
-                    if (c->lamp_level[i] > 0) {
+                    if (c->lamp_level[i] > LAMP_DIM_MIN_LEVEL) {
                         c->lamp_level[i]--;
                         lamp_apply(c, i);
                     }
@@ -860,6 +865,7 @@ int main(void)
      * current through the inductor to collapse a connected solar panel
      * (observed: 10 V OC → 4.2 V under buck loading, MCU stuck in EM_IDLE).
      */
+    disable_charge_switch();
     disable_input_buck();
 
     timer_init();      /* SysTick @ 1 ms */
@@ -903,7 +909,7 @@ int main(void)
     }
 
     set_led_voltage(LED_BOOST_TARGET_MV);
-    /* Arm each controllable lamp to its boot brightness (all four full by
+    /* Arm each controllable lamp to its boot brightness (all four off by
      * default — see ctx_init). The buttons tap-toggle / hold-dim these at
      * runtime via lamp_buttons_update(): BTN1 -> lamps 1&2, BTN2 -> lamps 3&4. */
     for (uint8_t i = 0; i < 4; i++)
@@ -946,6 +952,13 @@ int main(void)
      * ──────────────────────────────────────────────────────────────────── */
     while (1       ) {
         uint32_t now = time_now();
+
+        /* The protection wake stimulus can hit its current limit between
+         * 50 ms pipeline ticks. Poll the latest 10 ms ADC conversion in the
+         * foreground and isolate Q49 immediately; bat_wake_tick records the
+         * corresponding FSM transition on the next pipeline tick. */
+        bat_wake_fast_guard(&ctx);
+        charger_fast_guard(&ctx);
 
         /* ── 20 ms tick: button polling ──
          * Runs at TICK_BUTTON_MS. update_buttons() updates internal

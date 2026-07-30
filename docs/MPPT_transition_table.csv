@@ -1,5 +1,5 @@
 PRIORITY,FROM,GUARD,TO,NOTES
-1,DISABLED,charging AND has_sun,TRACKING,"activation: learn Voc (running max), seed FOCV at first settled dwell, climb"
+1,DISABLED,Q49 connected (charger PRECHARGE/CC/CV) AND has_sun,TRACKING,"post-settle activation: learn Voc (running max), seed FOCV at first settled dwell, climb"
 2,DISABLED,<default>,DISABLED,stay
 1,TRACKING,!has_sun,DISABLED,safety first — sun lost kills tracking immediately
 2,TRACKING,charger in CV,HOLD,cv_regulate ignores the setpoint — freeze it for a later CC return

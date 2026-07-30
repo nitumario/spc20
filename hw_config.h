@@ -78,13 +78,17 @@
  * disconnected-cell sense guard, so 500..1500 mV is the hard-latched band. */
 #define BAT_RESCUE_MIN_MV         1500
 
-/* Rescue precharge timeout (ms). The rescue enters the charger's PRECHARGE
- * state (V_bat < 3000 on entry) and reuses its timeout plumbing, but from a
- * deeper start than a normal precharge — so it gets a longer window before
+/* Deep-discharge precharge timeout (ms). A cell that hit BAT_UNDERVOLT this
+ * boot enters the charger's PRECHARGE state (V_bat < 3000 on entry) from a much
+ * deeper start than a normal precharge — whether via the supervised rescue or
+ * after the wake probe cleared the latch — so it gets a longer window before
  * the cell is declared damaged. Expiry escalates to FAULT_PRECHARGE_TIMEOUT
  * (the correct terminal, user-assisted "cell is dead" state) exactly like a
  * normal precharge timeout. 30 min at the 200 mA trickle is gentle enough
- * for a genuinely deep cell yet still gives up on one that won't climb. */
+ * for a genuinely deep cell yet still gives up on one that won't climb.
+ *
+ * Selected on fault.history (not the live fault.code) in tick_precharge — see
+ * the rationale there. */
 #define BAT_RESCUE_TIMEOUT_MS     1800000UL
 
 /* ── Battery protection wake probe (see bat_wake_tick in energy_mode.c) ──
@@ -114,6 +118,22 @@
 #define BAT_PROT_SIG_MIN_MV       600
 #define BAT_PROT_SIG_MAX_MV       1100
 
+/* Collapsed variant of the same signature (mV). Bench 2026-07-29: with the
+ * panel absent and the bus fully discharged (board running on XDS110 power
+ * alone), the protection-open node has nothing biasing it and reads a hard
+ * 0 mV instead of the 744–896 mV above — V_BATM 0 while the cell itself sat
+ * at 2.7 V. That reading is BELOW fault_mgr's 500 mV disconnected-cell sense
+ * guard, so FAULT_BAT_UNDERVOLT never latches and every recovery path keyed
+ * on that fault stays disarmed. Treat it as the same lockout.
+ *
+ * The gap between this ceiling and BAT_PROT_SIG_MIN_MV is deliberate: a node
+ * persistently sitting in 300..600 mV is neither bias-node signature nor a
+ * plausible cell, and gets no probe. Like the window above, this cannot
+ * distinguish "protection open" from "battery absent" — only the off-state
+ * persistence test in BAT_WAKE_VALIDATE can, and it treats both identically
+ * (BAT_WAKE_RES_NO_BATTERY, bounded retries, then TERMINAL). */
+#define BAT_PROT_SIG_COLLAPSED_MAX_MV 300
+
 /* Consecutive 50 ms ticks the candidate condition must hold before a probe
  * (2 s). Outlasts the 640 ms V_bat moving-average window with margin, so a
  * cell sliding through the window during removal can't start a probe. */
@@ -124,13 +144,29 @@
  * quiescent lockout state. */
 #define BAT_WAKE_OUT_COLLAPSED_MV 1000
 
-/* Fixed probe target (mV): the LiFePO4 CV limit. Must exceed any healthy
+/* First probe target: enough to release a genuinely overdischarged S-8240
+ * pack while reducing the voltage step into the low cell. If that does not
+ * release a healthy protection-open pack, later attempts use the full CV
+ * target below. Both targets are fixed, never derived from the invalid
+ * protection-open V_bat reading. */
+#define BAT_WAKE_LOW_PROBE_TARGET_MV  BAT_PRECHARGE_MV
+
+/* Full probe target (mV): the LiFePO4 CV limit. Must exceed any healthy
  * cell's resting voltage (≤ ~3.4 V full) so the S-8240's VM pin sees a
  * charger-connection differential and releases; capped at the CV limit so
  * the driven node can never exceed normal charge voltage. NEVER derived
  * from the measured V_bat, which is invalid in the protection-open state
  * (V_bat + headroom would command ≈2.79 V, below the cell — no release). */
 #define BAT_WAKE_PROBE_TARGET_MV  BAT_CV_VOLTAGE_MV
+
+/* The charge switch stays open while the buck soft-starts. Require both a
+ * minimum delay and an instantaneous VCHG reading close to the selected
+ * target before connecting the battery. The timeout converts a failed buck
+ * start into a rate-limited retry without ever exposing the battery to a
+ * below-Vbat FCCM rail. */
+#define BAT_WAKE_BUCK_SETTLE_MS       50UL
+#define BAT_WAKE_BUCK_SETTLE_MAX_MS   1000UL
+#define BAT_WAKE_BUCK_READY_TOL_MV    75U
 
 /* Probe stimulus duration cap (ms). A protection IC that merely needs
  * charger detection releases promptly; this is NOT a charging window. */
@@ -358,20 +394,22 @@
 
 /* Lamp press/hold brightness UI (lamp_buttons_update() in main.c). A short tap
  * toggles the lamp full-on / off; press-and-hold dims one level every
- * LAMP_DIM_STEP_MS until it reaches off. There are LAMP_DIM_LEVELS steps
- * between full and off, so a continuous hold from full goes dark in
- * LAMP_DIM_LEVELS * LAMP_DIM_STEP_MS (about 3.3 s, roughly 1.5x faster than
- * the former 20-step/5 s ramp). Per-level LED currents live in
- * lamp_level_ma[] in main.c (index LAMP_DIM_LEVELS = full = LAMP_ON_CURRENT_MA,
- * index 0 = off). The dim cadence is paced off the button's pressStartTime via
- * time_now() with a catch-up loop, so LAMP_DIM_STEP_MS need not be an exact
- * multiple of TICK_BUTTON_MS (steps just land on the nearest button poll).
- * Note: the LED current LUT (output_currents_led_mA) has only ~15 usable bins
- * between the off-floor and LAMP_ON_CURRENT_MA, so adjacent logical levels can
- * share a current. The 40-step ladder still gives the UI finer positioning and
- * leaves room for a higher-resolution current LUT later. */
+ * LAMP_DIM_STEP_MS and STOPS at LAMP_DIM_MIN_LEVEL — a hold only ever changes
+ * brightness, it never switches the lamp off (holding past the floor just parks
+ * at the dimmest on-level; use a tap to turn the lamp off). There are
+ * LAMP_DIM_LEVELS - LAMP_DIM_MIN_LEVEL steps between full and the floor, so a
+ * continuous hold from full reaches minimum in about 3.2 s. Per-level LED
+ * currents live in lamp_level_ma[] in main.c (index LAMP_DIM_LEVELS = full =
+ * LAMP_ON_CURRENT_MA, index 0 = off, reachable by tap only). The dim cadence is
+ * paced off the button's pressStartTime via time_now() with a catch-up loop, so
+ * LAMP_DIM_STEP_MS need not be an exact multiple of TICK_BUTTON_MS (steps just
+ * land on the nearest button poll).
+ * The LED-current timers use an 800-count period. set_led_current() linearly
+ * interpolates the existing 100-count calibration LUT onto that finer PWM grid,
+ * giving every one of these 40 levels a distinct current-reference duty. */
 #define LAMP_DIM_LEVELS           40
 #define LAMP_DIM_STEP_MS          83
+#define LAMP_DIM_MIN_LEVEL         1
 
 /* =========================================================================
  * 4. LOAD DETECTION
@@ -421,6 +459,19 @@
  * recovers that on a small panel, and on a stiff source it is simply a
  * gentle starting current for the loop to ramp from. */
 #define CHG_ACTIVATION_HEADROOM_MV 50U
+
+/* Staged normal activation. The buck runs unloaded with Q49 open until its
+ * instantaneous VCHG reading is at least this far above both the activation-
+ * time and live instantaneous V_bat readings. The LUT is only a starting
+ * estimate: VDD, board, and load-condition error can move the actual rail by
+ * hundreds of millivolts. While Q49 is open, trim toward readiness slowly
+ * using raw VCHG feedback. Two PWM counts are about 6 mV around the battery
+ * range, so the final step cannot turn the readiness margin into a large
+ * connection-current command. */
+#define CHG_BUCK_READY_MARGIN_MV    20U
+#define CHG_BUCK_SETTLE_MS          50UL
+#define CHG_BUCK_SETTLE_RAMP_MS     TICK_MAIN_MS
+#define CHG_BUCK_SETTLE_PWM_STEP    2
 
 /* CC down-step rate limit. The chg_current ADC uses a 64-sample moving
  * average at 10 ms tick → ~320 ms group delay. If CC steps pwm DOWN

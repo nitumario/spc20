@@ -49,8 +49,8 @@ static void fault_take_action(uint16_t fault_bit)
     switch (fault_bit) {
         case FAULT_OVERTEMP:
             /* Thermal event — shut the whole power path down. */
-            disable_input_buck();
             disable_charge_switch();
+            disable_input_buck();
             disable_output_switch();
             disable_usb_boost();
             disable_led_boost();
@@ -61,8 +61,8 @@ static void fault_take_action(uint16_t fault_bit)
         case FAULT_PRECHARGE_TIMEOUT:
         case FAULT_TEMP_CHARGE_BLOCK:
             /* Charge-side faults — stop pushing current into the battery. */
-            disable_input_buck();
             disable_charge_switch();
+            disable_input_buck();
             break;
 
         case FAULT_OVERCURRENT_DSG:
@@ -84,8 +84,8 @@ static void fault_take_action(uint16_t fault_bit)
             disable_output_switch();
             disable_usb_boost();
             disable_led_boost();
-            disable_input_buck();
             disable_charge_switch();
+            disable_input_buck();
             break;
 
         case FAULT_USB_OVERVOLT:
@@ -173,8 +173,19 @@ void fault_raise(system_ctx_t *ctx, uint16_t fault_bit)
     }
 
     ctx->fault.code |= fault_bit;
+    /* Start the recovery dwell when the fault is first latched. Without this,
+     * a fault raised after a long quiet interval can satisfy the global
+     * recovery cadence in the same pipeline tick, hiding the falling edge
+     * from energy_mode and leaving the hardware disabled. */
+    ctx->fault.last_recovery_ms = time_now();
     fault_refresh_active(&ctx->fault);
     fault_take_action(fault_bit);
+}
+
+void fault_clear(system_ctx_t *ctx, uint16_t fault_bit)
+{
+    ctx->fault.code &= (uint16_t)~fault_bit;
+    fault_refresh_active(&ctx->fault);
 }
 
 /* =========================================================================

@@ -13,6 +13,8 @@
  *   CHG_INACTIVE   — region not running; energy_mode is not in a
  *                    charging state, or a charge-blocking fault is
  *                    latched. Does nothing.
+ *   CHG_BUCK_SETTLE— buck enabled with the charge switch open until VCHG is
+ *                    confirmed above Vbat, preventing FCCM reverse pumping.
  *   CHG_PRECHARGE  — V_bat was < 3000 mV on activation. Regulates at
  *                    allowed_chg (power_budget already clamps this to
  *                    ≤ 200 mA). 15-minute timeout raises
@@ -31,9 +33,9 @@
  *     deactivate_charger_region() in energy_mode.c), which sets
  *     ctx->charger.state = CHG_INACTIVE. The charger does not need
  *     a separate deactivate entry point.
- *   - energy_mode handles re-activation by enabling the buck/charge
- *     hardware and leaving state = INACTIVE. The charger's first
- *     post-activation tick chooses PRECHARGE or CC based on V_bat.
+ *   - energy_mode handles re-activation by opening the charge switch,
+ *     pre-positioning and enabling the buck, and entering BUCK_SETTLE.
+ *     The charger closes the switch only after VCHG is ready.
  *   - Legacy only (CHARGER_INPUT_VREG=0): while MPPT is TRACKING the
  *     charger skips PWM regulation (MPPT owns PWM). Under =1 the charger
  *     owns PWM at all times and realises each MPPT setpoint probe.
@@ -61,5 +63,9 @@
 
 /* Step 7: run the charger state machine and regulate ctx->pwm. */
 void charger_update(system_ctx_t *ctx);
+
+/* Foreground fast trip for reverse current. The normal regulator uses filtered
+ * data; this guard cuts the power path from the latest 10 ms ADC conversion. */
+void charger_fast_guard(system_ctx_t *ctx);
 
 #endif /* CHARGER_H */

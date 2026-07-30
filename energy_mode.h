@@ -80,4 +80,8 @@ bool safe_mode_rescue_active(const system_ctx_t *ctx);
  * safe_mode_rescue_active (keeps the rescue from starting mid-probe). */
 bool bat_wake_probe_busy(const system_ctx_t *ctx);
 
+/* Foreground fast guard for the wake stimulus. Uses instantaneous ADC values
+ * and cuts hardware immediately; the 50 ms FSM tick performs the transition. */
+void bat_wake_fast_guard(system_ctx_t *ctx);
+
 #endif /* ENERGY_MODE_H */

@@ -40,15 +40,19 @@ ever redefining 0.8 V as a safe cell voltage:
 1. **Candidate** (`BATWAKE: MON -> WAKE_PROBE` on UART): `V_bat` stable inside
    `BAT_PROT_SIG_MIN/MAX_MV` (600–1100 mV) for 2 s, undervolt the *sole* fault,
    usable sun, no load, output rail collapsed. Candidacy clears nothing.
-2. **Wake probe** (≤ 3 s): buck + charge switch up at the *fixed* 3650 mV LUT
-   target (never `V_bat + headroom` — the measurement is the thing that is
-   wrong). Loads stay shed; cut early at 200 mA delivered current; abort on sun
-   loss, panel collapse, or any additional fault.
+2. **Staged wake probe** (≤ 3 s): Q49 stays open while the buck reaches its
+   fixed target; only then is the battery connected. The first attempt uses
+   3000 mV for a genuinely depleted pack and later attempts use 3650 mV for a
+   healthy protection-open pack. A foreground raw-current guard cuts at
+   200 mA or on reverse current; abort on sun loss, panel collapse, or any
+   additional fault.
 3. **Off-state validation** (1.5 s settle + 1 s observe, buck OFF): an on-state
    voltage proves nothing (the buck drives an empty connector to the commanded
    voltage). The off-state minimum decides: **VALIDATED** (≥ 1500 mV — the
-   measurement is real again; the rescue or the normal 3200 mV recoveries take
-   over), **NO_BATTERY** (collapsed back to the signature — rate-limited retry,
+   measurement is real again; at/above 2000 mV it clears the synthetic
+   undervoltage latch and hands off to normal staged PRECHARGE, while
+   1500–1999 mV retains the supervised SAFE rescue), **NO_BATTERY** (collapsed
+   back to the signature — rate-limited retry,
    max 3 attempts / 60 s apart, then terminal), or **WAKE_FAILED** (persisted
    below the rescue floor — a genuinely deep cell; fault retained, no
    unattended charging).
