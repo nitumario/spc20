@@ -66,6 +66,7 @@
     (FAULT_OVERTEMP            \
    | FAULT_BAT_OVERVOLT        \
    | FAULT_OVERCURRENT_CHG     \
+   | FAULT_REVERSE_PUMP        \
    | FAULT_PRECHARGE_TIMEOUT   \
    | FAULT_TEMP_CHARGE_BLOCK)
 
@@ -85,14 +86,203 @@ static inline void pwm_step(system_ctx_t *ctx, int32_t delta)
     ctx->pwm = pwm_clamp((int32_t)ctx->pwm + delta);
 }
 
-void charger_fast_guard(system_ctx_t *ctx)
+/*
+ * pwm_draw_more — step toward higher current, but not past the learned
+ * ceiling (mppt.cliff_pwm_min, raised by every collapse — see
+ * learn_cliff_pwm in mppt.c and CHG_CLIFF_PWM_MARGIN in hw_config.h).
+ *
+ * Only the regulator's two "draw more" branches go through here. The
+ * reverse-current escape, panel_safety_backoff and the CHG_BUCK_SETTLE
+ * acquisition ramp keep using pwm_step directly: the ceiling exists to bound
+ * current on a panel that already fell over once, and blocking an escape or
+ * an interlock ramp with it would turn a current limit into a lockup (a
+ * fenced SETL ramp is exactly the "stranded in SETL forever" failure the
+ * ramp was added to fix).
+ *
+ * Already below the ceiling — a resume that entered under it, or a relax
+ * that moved it up — is left alone rather than snapped up: the fence stops
+ * the loop from walking DOWN into the knee, it is not a setpoint.
+ */
+static inline void pwm_draw_more(system_ctx_t *ctx, int32_t step)
+{
+    uint16_t floor_pwm = ctx->mppt.cliff_pwm_min;
+    if (floor_pwm != 0 && ctx->pwm <= floor_pwm)
+        return;
+
+    uint16_t next = pwm_clamp((int32_t)ctx->pwm - step);
+    if (floor_pwm != 0 && next < floor_pwm)
+        next = floor_pwm;
+    ctx->pwm = next;
+}
+
+/* Is the battery physically tied to the buck rail right now? Both foreground
+ * guards are meaningless outside these states: in CHG_BUCK_SETTLE Q49 is still
+ * open (and VCHG is legitimately below V_bat while the rail ramps), and in
+ * CHG_INACTIVE there is nothing to protect. */
+static inline bool charger_connected(const system_ctx_t *ctx)
 {
     charger_state_t state = ctx->charger.state;
-    bool connected = (state == CHG_PRECHARGE) ||
-                     (state == CHG_CC) ||
-                     (state == CHG_CV);
+    return (state == CHG_PRECHARGE) ||
+           (state == CHG_CC) ||
+           (state == CHG_CV);
+}
 
-    if (!connected)
+/*
+ * charger_input_present — can the source still hold the buck rail above the
+ * battery? Instantaneous conversions only; see CHG_INPUT_LOST_MARGIN_MV in
+ * hw_config.h for why this is judged on V_panel rather than VCHG.
+ */
+static inline bool charger_input_present(void)
+{
+    return (uint32_t)get_input_voltage_now() >
+           ((uint32_t)get_battery_voltage_now() + CHG_INPUT_LOST_MARGIN_MV);
+}
+
+/*
+ * charger_input_stand_down — the input went away under a running charger.
+ *
+ * This is an ordinary event (PSU switched off, panel unplugged, connector
+ * glitch), NOT a fault: nothing has misbehaved, the energy source simply
+ * left. Isolate the hardware here in the foreground, but leave the FSM
+ * transition and the log line to the next 50 ms tick — see the
+ * input_lost_pending comment in system_types.h.
+ *
+ * Q49 opens FIRST: with the switch open there is no path from the cell to the
+ * collapsing rail at all. The trip point sits just above the V_panel ≈ V_bat
+ * crossover where back-feeding begins (it cannot sit higher without colliding
+ * with panel_safety_backoff's sag regime — see CHG_INPUT_LOST_MARGIN_MV), so
+ * this pre-empts the reversal when it can and otherwise bounds it to a single
+ * 10 ms sample.
+ */
+static void charger_input_stand_down(system_ctx_t *ctx)
+{
+    charger_ctx_t *c = &ctx->charger;
+    /* charger_fast_guard reaches here without a snapshot; take one so the
+     * log gets a trace for every stand-down, whichever guard called it. */
+    if (!c->input_trace_pending) {
+        adc_panel_trace_mv(c->input_trace_mv);
+        c->input_trace_pwm_from = ctx->pwm;
+        c->input_trace_pending  = true;
+    }
+    c->input_trace_result = INPUT_TRACE_STOOD_DOWN;
+
+    disable_charge_switch();
+    disable_input_buck();
+    ctx->pwm = PWM_MIN_DUTY;
+    c->input_trace_pwm_to  = ctx->pwm;
+    c->input_lost_pending  = true;
+    c->input_lost_count    = 0;   /* next connection starts clean */
+}
+
+/*
+ * charger_input_guard — input collapse: back off first, stand down last.
+ *
+ * Runs from the free-running super loop, so it sees the latest raw conversion
+ * within ~10 ms of it landing. A reading under V_bat + CHG_INPUT_LOST_MARGIN_MV
+ * used to mean "source removed" and got an immediate stand-down. Every such
+ * reading the bench has ever captured (18 INTRACE dumps, 10.09.26) was a
+ * LIVE panel pushed over its knee — pinned at V_bat + ~190 mV pushing Isc
+ * through the buck in dropout, back at Voc 400 ms after the stand-down. That
+ * state is forward current, not reverse pumping, and it recovers the moment
+ * the draw drops under Isc. So:
+ *
+ *   sample 1  snapshot the raw trace, cut pwm by CHG_INPUT_RECOVER_STEP
+ *   sample 2  still under → cut again
+ *   sample 3  still under → charger_input_stand_down (a removed source)
+ *   any       back over the margin → RECOVERED: keep charging where we are,
+ *             count it (input_dip_events; MPPT learns the level from that)
+ *
+ * The backoff is the one place other than apply_pwm that writes the timer,
+ * through the same clamp; it is a reduction only (pwm up), so it can never
+ * command more current than the pipeline already had.
+ *
+ * ⚠️ The counter is gated on adc_sample_seq(), NOT on calls. This function is
+ * invoked thousands of times per second against a value that is refreshed
+ * every TICK_ADC_MS (10 ms) from SysTick, so a plain `if (++count >= N)`
+ * reaches N within microseconds off a single stale sample.
+ *
+ * Exposure on a genuine removal moves from "usually pre-empted at the
+ * crossover" to "caught by charger_fast_guard on the first reverse-current
+ * sample" — the path v0.26 already handles as a clean stand-down. See
+ * CHG_INPUT_LOST_SAMPLES.
+ */
+void charger_input_guard(system_ctx_t *ctx)
+{
+    charger_ctx_t *c = &ctx->charger;
+
+    if (!charger_connected(ctx) || c->input_lost_pending) {
+        c->input_lost_count = 0;
+        return;
+    }
+
+    if (charger_input_present()) {
+        if (c->input_lost_count != 0) {
+            /* Came back inside the window: a live source that had been pushed
+             * over its knee. Stay connected at the backed-off point —
+             * cc_regulate walks it back down, MPPT raises its floor. */
+            c->input_lost_count = 0;
+            if (c->input_dip_events < UINT16_MAX)
+                c->input_dip_events++;
+            if (c->input_trace_result == INPUT_TRACE_PENDING)
+                c->input_trace_result = INPUT_TRACE_RECOVERED;
+        }
+        return;
+    }
+
+    /* Under the margin. Count it once per conversion. */
+    uint32_t seq = adc_sample_seq();
+    if (seq == c->input_lost_seq)
+        return;
+    c->input_lost_seq = seq;
+
+    if (c->input_lost_count == 0) {
+        /* First sight of it: snapshot before anything moves. Taking the
+         * copy here rather than at print time keeps the descent near the
+         * young end of the window instead of 50 ms of newer samples having
+         * pushed it out. */
+        adc_panel_trace_mv(c->input_trace_mv);
+        c->input_trace_pwm_from = ctx->pwm;
+        c->input_trace_result   = INPUT_TRACE_PENDING;
+        c->input_trace_pending  = true;
+    }
+    c->input_lost_count++;
+    c->input_rescue_ms = time_now();   /* opens the fast-guard blank window */
+
+    if (c->input_lost_count >= CHG_INPUT_LOST_SAMPLES) {
+        charger_input_stand_down(ctx);
+        return;
+    }
+
+    /* Cut the draw and give the source one conversion to come back.
+     *
+     * ⚠️ This backoff MUST be allowed to command a target below V_bat, and
+     * v0.34 learned that the hard way by forbidding it. Once the input has
+     * collapsed the buck is in dropout — high side on, V_panel shorted to the
+     * cell — and in dropout the FB target has NO authority over duty. The
+     * only thing that breaks dropout is commanding a target the output is
+     * already ABOVE, i.e. below V_bat. Clamping the backoff at the zero-draw
+     * point (v0.34) capped it at 9 counts, and every collapse that v0.33 had
+     * rescued at 20 counts became a stand-down instead: bench 10.09.26,
+     * `INTRACE … RECOVERED pwm:95->115` became `PENDING pwm:97->106` followed
+     * by `STANDDOWN pwm:106->399`.
+     *
+     * So "relieve the panel" and "briefly sink" are the same command on this
+     * hardware. That is a property of the FCCM part, not a bug to tune away:
+     * the reverse current it implies is bounded to the guard's 3 conversions
+     * (~30 ms) and charger_fast_guard yields to us for that window rather than
+     * latching (CHG_REVERSE_BLANK_MS). */
+    ctx->pwm = pwm_clamp((int32_t)ctx->pwm + (int32_t)CHG_INPUT_RECOVER_STEP);
+    set_buck_pwm(ctx->pwm);
+    c->input_trace_pwm_to = ctx->pwm;
+}
+
+void charger_fast_guard(system_ctx_t *ctx)
+{
+    charger_ctx_t *c = &ctx->charger;
+
+    /* A stand-down already isolated the path this tick; nothing left to judge
+     * (and chg_current reads 0 with Q49 open anyway). */
+    if (!charger_connected(ctx) || c->input_lost_pending)
         return;
 
     /* chg_current (R440) is NET cell current: I_cell = I_buck − I_load. An
@@ -107,10 +297,55 @@ void charger_fast_guard(system_ctx_t *ctx)
                          (int32_t)get_discharge_current_now();
 
     if (i_buck_now < -(int32_t)CHG_REVERSE_CURRENT_MA) {
-        /* Reuse the charge-current fault's containment/retry path. Its action
-         * opens Q49 before disabling the buck; energy_mode's fault-clear rearm
-         * subsequently starts from CHG_BUCK_SETTLE, never directly connected. */
-        fault_raise(ctx, FAULT_OVERCURRENT_CHG);
+        /* Classify before latching. Reverse current with the input already
+         * DEAD is a disconnect whose voltage signature charger_input_guard
+         * narrowly lost the race to — the input node can fall past the
+         * crossover inside one 10 ms conversion interval. Stand down cleanly;
+         * latching there is what made every source removal look like a charge
+         * over-current (bench 2026-07-30).
+         *
+         * Reverse current with the input still LIVE is the real failure: the
+         * cell is being pushed back into a working panel, which can drive
+         * V_panel above open circuit toward the TPS564247's input ceiling
+         * (May bench trace: −1010 mA at V_panel 14.1 V on a 13 V panel). That
+         * latches. FAULT_REVERSE_PUMP's action opens Q49 before disabling the
+         * buck; energy_mode's fault-clear re-arm subsequently restarts from
+         * CHG_BUCK_SETTLE, never directly connected. */
+        if (!charger_input_present()) {
+            charger_input_stand_down(ctx);
+            return;
+        }
+
+        /* Live input, reverse current — but is this the pathology, or the
+         * tail of a collapse charger_input_guard is still rescuing?
+         *
+         * Within CHG_REVERSE_BLANK_MS of the guard's last action the two are
+         * indistinguishable by sign alone: the panel recovers to full voltage
+         * in a few milliseconds while the buck is still carrying the backed-off
+         * target, so "reverse current with a live input" is exactly what a
+         * successful rescue looks like on its way back. v0.32 read it as the
+         * pathology and latched 0x0100 on all four collapses of the 10.09.26
+         * bench session — every one of them next to its own INTRACE RECOVERED.
+         *
+         * So inside the window, correct the cause first: lift the target back
+         * to the zero-draw point (which cannot sink) and give it one
+         * conversion. Still reversing on the next one means it was not the
+         * rescue — stand down cleanly rather than latch, the same call v0.26
+         * made for a dead input. Exposure stays bounded at one 10 ms sample. */
+        bool rescuing = (c->input_rescue_ms != 0) &&
+                        ((time_now() - c->input_rescue_ms) < CHG_REVERSE_BLANK_MS);
+
+        if (rescuing) {
+            /* Yield: charger_input_guard owns this event and resolves it
+             * within CHG_INPUT_LOST_SAMPLES conversions (~30 ms) either way.
+             * Do NOT try to correct the target here — the backoff commanding
+             * below V_bat is what breaks dropout, so "helping" by lifting it
+             * back cancels the rescue (v0.34). Do not latch either: reverse
+             * current IS the expected signature while the guard works. */
+            return;
+        }
+
+        fault_raise(ctx, FAULT_REVERSE_PUMP);
         ctx->pwm = PWM_MIN_DUTY;
     }
 }
@@ -318,15 +553,20 @@ static void cc_regulate(system_ctx_t *ctx)
 
     /* Clamp 2: regulate the panel to the MPP setpoint. The target is the
      * LIVE per-panel value owned by the outer MPPT loop (seeded from
-     * 0.76·Voc at activation, then hill-climbed — see mppt.c), NOT the
-     * static PANEL_VREG_SETPOINT_MV, which is only its cold-boot seed. */
+     * MPPT_SP_FRACTION_PCT·Voc on a fresh activation, then hill-climbed —
+     * see mppt.c), NOT the static PANEL_VREG_SETPOINT_MV, which is only its
+     * cold-boot seed. */
     int32_t v_sp = (int32_t)ctx->mppt.vreg_setpoint_mv;
     if (v_panel < v_sp - (int32_t)PANEL_VREG_DEADBAND_MV) {
         /* Sagging below MPP → drawing too much → DRAW LESS (pwm UP) → V recovers. */
         pwm_step(ctx, +PANEL_VREG_STEP);
     } else if (v_panel > v_sp + (int32_t)PANEL_VREG_DEADBAND_MV) {
-        /* Above MPP with current-headroom (clamp 1 didn't fire) → DRAW MORE (pwm DOWN) → V falls. */
-        pwm_step(ctx, -PANEL_VREG_STEP);
+        /* Above MPP with current-headroom (clamp 1 didn't fire) → DRAW MORE (pwm DOWN) → V falls.
+         * Fenced by the learned PWM ceiling: this branch is what walked the
+         * panel off its knee in the first two teardowns of the 10.09.26
+         * session (V_panel 1.5 V above the band, one step per interval,
+         * straight into the collapse). */
+        pwm_draw_more(ctx, PANEL_VREG_STEP);
     } else if (i_chg < (int32_t)LOAD_REACQUIRE_MA) {
         /* Clamp 3: in-band but delivering ~nothing → RE-ACQUIRE (pwm DOWN).
          * This is the tail of a panel_safety_backoff overshoot: the emergency
@@ -341,8 +581,10 @@ static void cc_regulate(system_ctx_t *ctx)
          * voltage-path has_sun clear fires. cc_regulate only runs in
          * PRECHARGE/CC (CV uses cv_regulate), so there is no CV interaction, and
          * clamps 0/1 already returned for reverse / over-current, so this can
-         * only fire in the genuine near-open-circuit dead zone. */
-        pwm_step(ctx, -PANEL_VREG_STEP);
+         * only fire in the genuine near-open-circuit dead zone. Fenced too —
+         * re-acquiring is still drawing more, and a re-acquire that walks
+         * back to the count that just collapsed re-collapses. */
+        pwm_draw_more(ctx, PANEL_VREG_STEP);
     }
     /* Within the deadband and delivering current → stable, hold PWM. */
 }
@@ -395,8 +637,12 @@ static void cv_regulate(system_ctx_t *ctx)
     uint16_t v_bat = ctx->meas.bat_voltage;
 
     if (v_bat < BAT_CV_VOLTAGE_MV) {
-        /* Below target — need more current to pull voltage up. */
-        pwm_step(ctx, -CV_PWM_STEP);
+        /* Below target — need more current to pull voltage up. Fenced by the
+         * learned PWM ceiling like CC's draw-more branches: the knee does not
+         * care which state asked. It can only bind if CV wants more current
+         * than the count that already collapsed the panel, in which case the
+         * unfenced alternative is another teardown, not a faster taper. */
+        pwm_draw_more(ctx, CV_PWM_STEP);
     } else if (v_bat > (BAT_CV_VOLTAGE_MV + CV_DEADBAND_MV)) {
         /* Above target — reduce current, voltage will drift down. */
         pwm_step(ctx, +CV_PWM_STEP);
@@ -478,6 +724,21 @@ static void tick_buck_settle(system_ctx_t *ctx)
 
     enable_charge_switch();
     c->cc_last_downstep_ms = now;
+
+    /* Re-assert the learned ceiling at the handoff. The acquisition ramp above
+     * is deliberately unfenced — fencing it is how a current limit becomes a
+     * "stranded in SETL forever" lockup — but it steps every 50 ms while the
+     * rail is merely still SLEWING, so it routinely walks 6-16 counts past
+     * wherever it started. Bench 10.09.26 (v0.33): resume entered at the
+     * ceiling (113), SETL ramped straight through it to 107, and CC then held
+     * 107 for 156 s until the panel fell over there again — pwm_draw_more
+     * cannot pull it back, since below the fence it is a no-op by design.
+     * Q49 has just closed and this only ever REDUCES current, so it is safe
+     * here in a way it is not inside the ramp. */
+    if (ctx->mppt.cliff_pwm_min != 0 && ctx->pwm < ctx->mppt.cliff_pwm_min) {
+        ctx->pwm = pwm_clamp((int32_t)ctx->mppt.cliff_pwm_min);
+        set_buck_pwm(ctx->pwm);
+    }
 
     if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV)
         enter_precharge(ctx);

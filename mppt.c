@@ -45,6 +45,12 @@
  *   circuit and parks just under the band TOP (setpoint + deadband), so
  *   the realised operating voltage ≈ setpoint + deadband ≈ k·Voc.
  *
+ *   Seeding is for a FRESH start only. A resumption after an input-loss
+ *   bounce keeps the converged setpoint and Voc (enter_tracking_reprobe);
+ *   re-seeding on every bounce is what turned a 2 s stand-down into a
+ *   ~12 s outage and fed the teardown burst. MPPT_RESEED_GAP_MS and
+ *   has_sun decide which path an activation takes.
+ *
  * Convergence: a probe that measures within ±MPPT_SP_MIN_DELTA_MA of
  * the baseline counts as a reversal (don't walk on noise / on a flat
  * power top / when the allowed_chg clamp, not the panel, bounds the
@@ -90,9 +96,15 @@
 /*
  * sp_clamp — bound a candidate setpoint to the legal probe range.
  *
- * Floor: MPPT_SP_MIN_MV keeps the regulation band's low edge above the
- * PANEL_SAFETY_MV emergency floor (preserves the band ordering the
- * backoff design assumes).
+ * Floor, highest of three:
+ *   - MPPT_SP_MIN_MV keeps the regulation band's low edge above the
+ *     PANEL_SAFETY_MV emergency floor (preserves the band ordering the
+ *     backoff design assumes);
+ *   - MPPT_SP_FLOOR_PCT of the learned Voc — no real MPP lives below it,
+ *     so probing there only walks the panel over the knee (bench
+ *     10.09.26: the tracker reached 6500 on a panel whose MPP is 11850);
+ *   - the learned cliff (sp_session_floor_mv), raised by every collapse /
+ *     dip correction and by an input-loss teardown.
  *
  * Ceiling: learned Voc minus MPPT_SP_VOC_GUARD_MV, so the band top
  * stays below open circuit — otherwise the inner loop could "park"
@@ -102,6 +114,11 @@
 static uint16_t sp_clamp(const mppt_ctx_t *m, int32_t sp)
 {
     int32_t lo = (int32_t)MPPT_SP_MIN_MV;
+    if (m->panel_voc_mv >= PANEL_MIN_MV) {
+        int32_t voc_lo = ((int32_t)m->panel_voc_mv * MPPT_SP_FLOOR_PCT) / 100
+                       - (int32_t)PANEL_VREG_DEADBAND_MV;
+        if (voc_lo > lo) lo = voc_lo;
+    }
     if ((int32_t)m->sp_session_floor_mv > lo)
         lo = (int32_t)m->sp_session_floor_mv;   /* don't re-test the cliff */
     if (sp < lo) return (uint16_t)lo;
@@ -142,9 +159,10 @@ static void start_dwell(system_ctx_t *ctx)
  * Deliberately does NOT count toward convergence: pushes are an escape
  * ramp out of unparkable territory, not oscillation around an optimum —
  * counting them could converge HOLD inside a whipsaw. Instead the
- * session floor rises to the post-push level, so down-probes can never
- * re-test the cliff this session; they clamp against the floor and the
- * resulting boundary flips (sp_probe_step) drive convergence.
+ * learned floor rises to the post-push level, so down-probes can never
+ * re-test the cliff while this panel is trusted; they clamp against the
+ * floor and the resulting boundary flips (sp_probe_step) drive
+ * convergence.
  */
 static void sp_push_up(system_ctx_t *ctx)
 {
@@ -201,12 +219,122 @@ static void sp_probe_step(system_ctx_t *ctx)
     m->vreg_setpoint_mv = next;
 }
 
+/*
+ * sp_learn_cliff — the panel fell over at the operating point the tracker
+ * had it at: either the guard rescued it (v0.32, input_dip_events ticked)
+ * or the region was torn down (rearm_block_ms stamped). Nothing else
+ * in this file can see that event — the collapse reaches V_bat in
+ * 10-20 ms and charger_input_guard stands the region down ~40 ms in, so
+ * the 640 ms average never crosses PANEL_SAFETY_MV and neither the
+ * collapse branch nor the dip classifier fires. Until v0.30 the tracker
+ * resumed with no memory of it and probed straight back down (bench
+ * 10.09.26: 13 of 15 teardowns within 6 s of a downward probe).
+ *
+ * Learn the cliff from the plant, not the setpoint: with a ±1200 mV band
+ * the setpoint says little about where the plant actually sat, but the
+ * last clean averaged V_panel does. Put the band top MPPT_SP_CLIFF_MARGIN_MV
+ * above it and make that the floor — same shape as sp_push_up, sourced
+ * from a measurement instead of a step. Capped at the Voc ceiling: a
+ * collapse from up there (sun dimmed under a parked point) is not a
+ * setpoint problem, and a floor above the ceiling would park the loop
+ * at open circuit drawing nothing.
+ *
+ * The floor persists through the bounce and through HOLD; only a fresh
+ * entry (new Voc: sun lost, or MPPT_RESEED_GAP_MS) releases it. Known
+ * trade-off: after a light cloud lowers the knee, the tracker is fenced
+ * a few hundred mV above the new MPP until the next fresh seed. That
+ * costs a few percent under a cloud; the alternative cost 12 s of full
+ * sun per teardown.
+ */
+/*
+ * learn_cliff_pwm — the same cliff, recorded in the domain that can act on it.
+ *
+ * sp_learn_cliff below teaches the setpoint, which only produces a backoff
+ * once V_panel falls more than PANEL_VREG_DEADBAND_MV under it. On a panel
+ * whose MPP has walked up near Voc — every low-irradiance panel, so every
+ * late afternoon — the setpoint is fenced MPPT_SP_VOC_GUARD_MV below Voc and
+ * V_panel sits INSIDE the band, so no reachable setpoint commands anything.
+ * Bench 10.09.26: three consecutive teardowns at pwm 106 with the setpoint
+ * already pinned at its ceiling, nothing left to learn, nothing to change.
+ *
+ * The PWM that fell over is not ambiguous the way the setpoint is: it is the
+ * exact draw the panel could not hold. Fence one margin above it. The
+ * ratchet is what tracks a fading Isc — the voltage loop cannot, because at
+ * a near-Voc operating point the collapse is a current event with no
+ * precursor in V_panel (the trace before every teardown is flat to within
+ * 50 mV, then one sample of descent).
+ *
+ * Called before sp_learn_cliff's early returns: those guard the setpoint
+ * estimate (needs a credible V_panel, and gives up once the floor is at its
+ * ceiling) and neither condition says anything about the PWM.
+ */
+static void learn_cliff_pwm(system_ctx_t *ctx)
+{
+    mppt_ctx_t *m = &ctx->mppt;
+
+    /* input_trace_pwm_from is the count in force when the guard first saw
+     * the input under margin — before its own backoff moved it, and before
+     * a stand-down parked it at PWM_MIN_DUTY. */
+    uint32_t fell_at = (uint32_t)ctx->charger.input_trace_pwm_from;
+    if (fell_at == 0 || fell_at >= PWM_MIN_DUTY)
+        return;                    /* no trace, or it fell over while off */
+
+    uint32_t floor_pwm = fell_at + CHG_CLIFF_PWM_MARGIN;
+    if (floor_pwm > PWM_MIN_DUTY)
+        floor_pwm = PWM_MIN_DUTY;  /* a ceiling at "off" is still a ceiling */
+
+    if (floor_pwm <= (uint32_t)m->cliff_pwm_min)
+        return;                    /* already fenced at or above this draw */
+
+    m->cliff_pwm_min      = (uint16_t)floor_pwm;
+    m->cliff_pwm_relax_ms = time_now();
+}
+
+static void sp_learn_cliff(system_ctx_t *ctx)
+{
+    mppt_ctx_t *m = &ctx->mppt;
+
+    learn_cliff_pwm(ctx);
+
+    if (m->last_good_vpanel_mv < PANEL_MIN_MV)
+        return;                                  /* nothing credible learned */
+
+    int32_t floor_sp = (int32_t)m->last_good_vpanel_mv
+                     - (int32_t)PANEL_VREG_DEADBAND_MV
+                     + (int32_t)MPPT_SP_CLIFF_MARGIN_MV;
+    if (m->panel_voc_mv >= PANEL_MIN_MV) {
+        int32_t hi = (int32_t)m->panel_voc_mv - (int32_t)MPPT_SP_VOC_GUARD_MV;
+        if (floor_sp > hi) floor_sp = hi;
+    }
+    if (floor_sp <= (int32_t)m->sp_session_floor_mv)
+        return;                                  /* already know this cliff */
+
+    m->sp_session_floor_mv = (uint16_t)floor_sp;
+    /* Resume above the cliff, probing away from it. */
+    uint16_t up = sp_clamp(m, (int32_t)m->vreg_setpoint_mv);
+    m->vreg_setpoint_mv = up;
+    m->prev_sp_mv       = up;
+    m->sp_direction     = +1;
+    /* Called mid-session for a RECOVERED collapse (v0.32): the setpoint
+     * just moved under a running dwell, so its measurement is garbage —
+     * restart it with a fresh baseline. HOLD has no dwell to restart; the
+     * lifted setpoint takes effect in cc_regulate on the same tick. */
+    if (m->state == MPPT_TRACKING) {
+        m->prev_avg_valid = false;
+        start_dwell(ctx);
+    }
+}
+
 /* =========================================================================
  * STATE ENTRY ACTIONS
  * ========================================================================= */
 
 /* Shared TRACKING entry: fresh session counters + first (baseline) dwell
- * at the current setpoint. */
+ * at the current setpoint. The learned floor (sp_session_floor_mv) is
+ * deliberately NOT reset here — it belongs to the learned panel, not to
+ * the session, and enter_tracking_fresh is the one place that clears it.
+ * (Until v0.30 every entry reset it, so a teardown erased the cliff the
+ * moment it was learned.) */
 static void tracking_common(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
@@ -215,7 +343,7 @@ static void tracking_common(system_ctx_t *ctx)
     m->sp_direction        = +1;    /* first probe toward Voc — away from the knee */
     m->sp_step_mv          = MPPT_SP_STEP_MV;
     m->prev_avg_valid      = false; /* dwell 1 establishes the baseline */
-    m->sp_session_floor_mv = MPPT_SP_MIN_MV;  /* each session may retest the cliff once */
+    m->seen_dip_events     = ctx->charger.input_dip_events;
     m->tracking_start_ms   = time_now();
     start_dwell(ctx);
 }
@@ -235,16 +363,21 @@ static void tracking_common(system_ctx_t *ctx)
  */
 static void enter_tracking_fresh(system_ctx_t *ctx)
 {
-    ctx->mppt.voc_pending  = true;
-    ctx->mppt.panel_voc_mv = 0;   /* maybe a different panel — relearn Voc
-                                   * from scratch via the running max     */
+    ctx->mppt.voc_pending         = true;
+    ctx->mppt.panel_voc_mv        = 0;   /* maybe a different panel — relearn
+                                          * Voc from scratch via the running
+                                          * max                            */
+    ctx->mppt.sp_session_floor_mv = MPPT_SP_MIN_MV;  /* ...and its cliff  */
+    ctx->mppt.cliff_pwm_min       = 0;               /* ...in both domains */
+    ctx->mppt.last_good_vpanel_mv = 0;
     tracking_common(ctx);
 }
 
 /*
- * Enter TRACKING from HOLD — periodic re-probe. Keep the held setpoint
- * (and the Voc captured at activation; the panel is loaded now, so a
- * re-capture would read low); the baseline dwell re-measures the held
+ * Enter TRACKING from HOLD (periodic re-probe) or from DISABLED after an
+ * input-loss bounce (v0.28). Keep the setpoint, the learned floor and
+ * the Voc captured at activation (the panel is loaded now, so a
+ * re-capture would read low); the baseline dwell re-measures the kept
  * point first so the comparison is against CURRENT conditions, not
  * against a minute-old number.
  */
@@ -276,12 +409,18 @@ static void enter_hold(system_ctx_t *ctx)
  * captured Voc are PRESERVED (same rationale as mppt_limit_ma in the
  * legacy path): a brief EM bounce must not forget the learned MPP, and
  * cc_regulate keeps consuming the setpoint the moment charging resumes.
- * A real re-activation re-seeds from a fresh Voc in
- * enter_tracking_fresh anyway.
+ *
+ * Until v0.28 that preservation was pointless, because the resume path
+ * went through enter_tracking_fresh() unconditionally and wiped both.
+ * Now the gap is timed instead: the learned point stays trusted until
+ * has_sun drops or MPPT_RESEED_GAP_MS elapses (see mppt_update), and
+ * only then does the next activation re-seed from FOCV.
  */
 static void enter_disabled(system_ctx_t *ctx)
 {
-    ctx->mppt.state = MPPT_DISABLED;
+    ctx->mppt.state             = MPPT_DISABLED;
+    ctx->mppt.disabled_since_ms = time_now();
+    ctx->mppt.seed_invalidated  = false;
 }
 
 /* =========================================================================
@@ -447,7 +586,33 @@ void mppt_update(system_ctx_t *ctx)
      * dwell there would measure zero charge current, pollute its baseline,
      * and report MPPT tracking before charging has actually begun. */
     if (!charging) {
-        if (m->state != MPPT_DISABLED) enter_disabled(ctx);
+        if (m->state != MPPT_DISABLED) {
+            /* Why did the region go down? energy_mode (step 5, this same
+             * tick) stamps rearm_block_ms only for an input-loss stand-
+             * down, so a block still in the future means the panel just
+             * collapsed under us: learn the level before forgetting the
+             * session. Any other exit (CV, fault, sun lost) teaches
+             * nothing about the knee. */
+            if ((int32_t)(ctx->charger.rearm_block_ms - time_now()) > 0)
+                sp_learn_cliff(ctx);
+            enter_disabled(ctx);
+        }
+
+        /* While the region is down, decide whether the learned Voc and
+         * setpoint survive the gap. Both signals mean "this may not be the
+         * same panel, or not the same day":
+         *   - has_sun cleared: the debounced source-present flag went away,
+         *     which is what a GENUINE disconnect trips (1.5 s) and what an
+         *     input-loss bounce never manages (it re-arms in 2 s with the
+         *     averaged panel voltage still sitting at 11 V).
+         *   - the gap ran past MPPT_RESEED_GAP_MS: a long stand-down, a
+         *     fault round-trip, or an overnight idle.
+         * Latched, never cleared here — enter_disabled() re-arms it on the
+         * next teardown and the MPPT_DISABLED entry path consumes it. */
+        if (!has_sun ||
+            (time_now() - m->disabled_since_ms) >= MPPT_RESEED_GAP_MS)
+            m->seed_invalidated = true;
+
         return;
     }
 
@@ -462,16 +627,73 @@ void mppt_update(system_ctx_t *ctx)
         ctx->meas.panel_voltage > m->panel_voc_mv)
         m->panel_voc_mv = ctx->meas.panel_voltage;
 
+    /* A collapse the guard rescued (charger_input_guard backed the draw off
+     * and the panel came back) is a cliff sighting exactly like a teardown,
+     * minus the teardown. Learn it BEFORE this tick's V_panel is recorded
+     * below — the reading that matters is the one from before the dip. */
+    if (m->state != MPPT_DISABLED &&
+        ctx->charger.input_dip_events != m->seen_dip_events) {
+        m->seen_dip_events = ctx->charger.input_dip_events;
+        sp_learn_cliff(ctx);
+    }
+
+    /* Relax the learned PWM ceiling while nothing is falling over. The
+     * ratchet above only ever fences MORE conservatively, so a haze that
+     * lifts without ever dropping has_sun (no fresh seed, no release) would
+     * otherwise keep the draw capped at the level the haze imposed. One
+     * count per CHG_CLIFF_PWM_RELAX_MS, and only while actually charging —
+     * an inactive region proves nothing about the knee. The stamp is shared
+     * with the ratchet, so a fresh collapse also restarts the clock. */
+    if (m->cliff_pwm_min != 0 &&
+        (time_now() - m->cliff_pwm_relax_ms) >= CHG_CLIFF_PWM_RELAX_MS) {
+        m->cliff_pwm_relax_ms = time_now();
+        m->cliff_pwm_min--;
+        if (m->cliff_pwm_min <= PWM_MAX_DUTY)
+            m->cliff_pwm_min = 0;   /* down to the hardware limit: no fence */
+    }
+
+    /* Cliff memory for sp_learn_cliff: the last averaged V_panel that was
+     * not already dragged down by a collapse. A collapsed 10 ms sample
+     * costs the 64-deep average ~125-190 mV; honest regulation near the
+     * knee moves it ~50 mV per tick. Reject the sharp falls, keep the
+     * rest (rises are always clean — nothing collapses upward). */
+    if (m->state != MPPT_DISABLED &&
+        ctx->meas.panel_voltage >= PANEL_SAFETY_MV &&
+        ((int32_t)ctx->meas.panel_voltage + (int32_t)MPPT_SP_VPANEL_DROP_MV
+            >= (int32_t)m->last_good_vpanel_mv))
+        m->last_good_vpanel_mv = ctx->meas.panel_voltage;
+
     switch (m->state) {
 
     case MPPT_DISABLED:
         /* Charger just activated (this very tick — energy_mode runs at
          * step 5, we run at step 6, so the panel reading is still the
-         * unloaded IDLE value): capture Voc, seed, start climbing. No
-         * settle gate needed — the first dwell's 2 s settle phase
-         * absorbs the activation transient. */
-        if (has_sun)
-            enter_tracking_fresh(ctx);
+         * unloaded IDLE value). Two ways in:
+         *
+         * FRESH (cold boot, new panel, long gap): capture Voc and seed
+         * from FOCV, then start climbing. No settle gate needed — the
+         * first dwell's 2 s settle phase absorbs the activation
+         * transient.
+         *
+         * RE-PROBE (input-loss bounce): the learned point is still good,
+         * so resume from it at the fine step instead of throwing it away.
+         * Re-seeding here was the dominant cost of a teardown — bench
+         * 10.09.26 measured a median 12.4 s to climb back to full current
+         * against the 2 s the re-arm block itself costs, and the freshly
+         * seeded setpoint sat below the knee in the meantime, walking the
+         * panel off the cliff again (the teardowns arrived in bursts).
+         * See MPPT_RESEED_GAP_MS.
+         *
+         * The panel_voc_mv guard is not optional: it stops a stale
+         * seed_invalidated from routing a boot with no credible Voc into
+         * the re-probe path, which would have neither a real setpoint nor
+         * a setpoint ceiling. */
+        if (has_sun) {
+            if (m->seed_invalidated || m->panel_voc_mv < PANEL_MIN_MV)
+                enter_tracking_fresh(ctx);
+            else
+                enter_tracking_reprobe(ctx);
+        }
         break;
 
     case MPPT_TRACKING:

@@ -124,7 +124,12 @@ The firmware uses **UART0 at 115200 8N1** (from `SPC_20.syscfg`):
 - `PA11` — RX (probe → target; not driven by app today)
 
 `SPCBoardAPI.c::printToUART()` is the blocking transmit helper; the main
-loop pushes log lines on the 1 s tick (`TICK_LOG_MS` in `hw_config.h`),
+loop pushes log lines at the rate `ctx.log_mode` selects (`LOG_MODE_OFF` /
+`LOG_MODE_1HZ` / `LOG_MODE_FAST` in `hw_config.h`; default FAST = 200 ms, ~300
+chars a line, about 14 % of the 115200 baud link). `log_mode` is `volatile` and
+re-read every loop pass, so you can change the rate live from a CCS breakpoint
+via Expressions -> `ctx.log_mode` — 0 silences the port entirely (state
+transitions included; the boot banner and HardFault dump always print),
 plus the boot banner / fault history added in the diagnostics commit.
 
 ### 5a. Wire the backchannel UART to PA10/PA11

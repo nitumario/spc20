@@ -1,0 +1,1162 @@
+<title>SPC_20 Telemetry Scope</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  color-scheme: light;
+  --ground:      #f1f3ee;
+  --surface:     #fbfcf9;
+  --surface-2:   #e9ece3;
+  --hairline:    #dfe3d8;
+  --hairline-2:  #eceee7;
+  --ink:         #12140f;
+  --ink-2:       #565a4e;
+  --ink-3:       #8b8f80;
+  --focus:       #1c5cab;
+
+  --s-1: #2a78d6;   /* blue    */
+  --s-2: #eb6834;   /* orange  */
+  --s-3: #1baf7a;   /* aqua    */
+  --s-4: #eda100;   /* yellow  */
+  --s-7: #4a3aa7;   /* violet  */
+  --critical: #e34948;
+  --critical-bg: #f9dedd;
+
+  --font-ui:   "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --ground:     #101208;
+    --surface:    #1a1d15;
+    --surface-2:  #262a1f;
+    --hairline:   #333828;
+    --hairline-2: #23271b;
+    --ink:        #f0f3e6;
+    --ink-2:      #a9ae99;
+    --ink-3:      #767b68;
+    --focus:      #86b6ef;
+
+    --s-1: #3987e5;
+    --s-2: #d95926;
+    --s-3: #199e70;
+    --s-4: #c98500;
+    --s-7: #9085e9;
+    --critical: #e66767;
+    --critical-bg: #43201f;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ground:     #101208;
+  --surface:    #1a1d15;
+  --surface-2:  #262a1f;
+  --hairline:   #333828;
+  --hairline-2: #23271b;
+  --ink:        #f0f3e6;
+  --ink-2:      #a9ae99;
+  --ink-3:      #767b68;
+  --focus:      #86b6ef;
+
+  --s-1: #3987e5;
+  --s-2: #d95926;
+  --s-3: #199e70;
+  --s-4: #c98500;
+  --s-7: #9085e9;
+  --critical: #e66767;
+  --critical-bg: #43201f;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* ---------------------------------------------------------------- chrome */
+.bar {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 18px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface);
+}
+.bar h1 {
+  margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em;
+}
+.bar .meta {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.bar .spacer { flex: 1 1 auto; }
+.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+button, select, .filebtn {
+  font-family: var(--font-ui); font-size: 12px; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 3px; padding: 4px 10px; cursor: pointer;
+}
+button:hover, select:hover, .filebtn:hover { background: var(--surface-2); }
+button[disabled] { opacity: 0.4; cursor: default; }
+button.on { background: var(--surface-2); border-color: var(--ink-3); }
+input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+
+/* ------------------------------------------------------------- workspace */
+.wrap {
+  display: grid; grid-template-columns: minmax(0, 1fr) 310px;
+  gap: 1px; background: var(--hairline);
+  min-height: calc(100vh - 53px);
+}
+.charts { background: var(--ground); padding: 10px 16px 20px; min-width: 0; }
+.rail   { background: var(--surface); padding: 12px 16px 24px; }
+
+.plotcol { position: relative; }
+.panel { position: relative; }
+.panel + .panel { margin-top: 2px; }
+.panel canvas { display: block; width: 100%; }
+
+.legend {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  padding: 6px 0 2px 62px;
+  font-size: 11px; color: var(--ink-2);
+}
+.legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.legend i { width: 13px; height: 2px; border-radius: 1px; display: inline-block; }
+
+/* crosshair overlay */
+.hair, .anchor {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  pointer-events: none; z-index: 3;
+}
+.hair   { background: var(--ink); opacity: 0.55; }
+.anchor { background: var(--s-7); opacity: 0.75; }
+.hair.pinned { opacity: 0.9; width: 1.5px; }
+.hair .chip, .anchor .chip {
+  position: absolute; top: 0; transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 10.5px; font-variant-numeric: tabular-nums;
+  padding: 1px 5px; border-radius: 2px; white-space: nowrap;
+}
+.hair .chip   { background: var(--ink); color: var(--ground); }
+.anchor .chip { background: var(--s-7); color: #fff; }
+.sel {
+  position: absolute; top: 0; bottom: 0; z-index: 2;
+  background: var(--ink); opacity: 0.08; pointer-events: none;
+}
+.hidden { display: none !important; }
+
+/* overview / timeline brush */
+.ov { position: relative; margin-top: 10px; touch-action: none; }
+.ov canvas { display: block; width: 100%; cursor: crosshair; }
+.ov .shade {
+  position: absolute; top: 0; bottom: 0;
+  background: var(--ground); opacity: 0.66; pointer-events: none;
+}
+.ovwin {
+  position: absolute; top: 0; bottom: 0;
+  border-left: 1.5px solid var(--focus); border-right: 1.5px solid var(--focus);
+  background: color-mix(in srgb, var(--focus) 8%, transparent);
+  cursor: grab;
+}
+.ovwin.grabbing { cursor: grabbing; }
+.ovwin .h { position: absolute; top: 0; bottom: 0; width: 9px; cursor: ew-resize; }
+.ovwin .h.l { left: -5px; } .ovwin .h.r { right: -5px; }
+.ovlabel {
+  padding: 3px 0 0 62px; font-family: var(--font-mono); font-size: 10px;
+  color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
+
+/* ----------------------------------------------------------------- rail */
+.rail h2 {
+  margin: 0 0 2px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3);
+}
+.rail .now {
+  font-family: var(--font-mono); font-size: 22px; font-weight: 500;
+  font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+  margin: 0 0 1px;
+}
+.rail .sub {
+  font-family: var(--font-mono); font-size: 11px; color: var(--ink-2);
+  font-variant-numeric: tabular-nums; margin-bottom: 14px;
+}
+.grp { margin-bottom: 13px; }
+.grp h3 {
+  margin: 0 0 4px; font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.09em; color: var(--ink-3);
+  border-bottom: 1px solid var(--hairline-2); padding-bottom: 3px;
+}
+.row {
+  display: grid; grid-template-columns: 12px 1fr auto auto;
+  align-items: baseline; gap: 7px;
+  padding: 1.5px 0;
+  font-family: var(--font-mono); font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.row .key { width: 12px; height: 2px; border-radius: 1px; align-self: center; }
+.row .name { color: var(--ink-2); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; }
+.row .val  { color: var(--ink); font-weight: 500; }
+.row .unit { color: var(--ink-3); font-size: 10.5px; min-width: 22px; text-align: left; }
+.row .dlt  { color: var(--s-7); font-size: 11px; }
+.row.bad .val { color: var(--critical); }
+.row.off .val { color: var(--ink-3); }
+
+.faultbox {
+  margin-top: 2px; padding: 6px 8px; border-radius: 3px;
+  background: var(--critical-bg); color: var(--critical);
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.35;
+}
+.faultbox.clear { background: var(--surface-2); color: var(--ink-2); }
+
+.hint {
+  margin-top: 16px; padding-top: 10px; border-top: 1px solid var(--hairline-2);
+  font-size: 11px; line-height: 1.6; color: var(--ink-3);
+}
+.hint kbd {
+  font-family: var(--font-mono); font-size: 10.5px;
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: 2px; padding: 0 4px;
+}
+
+/* --------------------------------------------------------------- states */
+.drop {
+  position: fixed; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--ground) 88%, transparent);
+  border: 2px dashed var(--focus); font-size: 15px; color: var(--ink);
+}
+.empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 80px 20px; text-align: center; color: var(--ink-2);
+}
+.empty strong { color: var(--ink); font-size: 16px; font-weight: 600; }
+
+@media (max-width: 900px) {
+  .wrap { grid-template-columns: minmax(0, 1fr); }
+  .rail { order: -1; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="bar">
+  <h1 id="fname">SPC_20 Telemetry Scope</h1>
+  <div class="meta" id="fmeta">no capture loaded</div>
+  <div class="spacer"></div>
+  <div class="controls">
+    <select id="session" aria-label="Session"></select>
+    <button id="fit" type="button">Fit</button>
+    <button id="pin" type="button" aria-pressed="false">Pin cursor</button>
+    <button id="copy" type="button">Copy sample</button>
+    <label class="filebtn" for="file">Open log…</label>
+    <input type="file" id="file" accept=".log,.txt,text/plain">
+  </div>
+</div>
+
+<div class="wrap">
+  <div class="charts" id="charts">
+    <div class="empty" id="empty">
+      <strong>Drop a UART capture here</strong>
+      <span>Any <code>serial_*.log</code> from the bench — the key:value telemetry lines are parsed, NULs and partial lines skipped.</span>
+    </div>
+    <div class="plotcol hidden" id="plotcol"></div>
+  </div>
+
+  <aside class="rail" id="rail">
+    <h2>Readout</h2>
+    <p class="now" id="now">—</p>
+    <p class="sub" id="nowsub">move the pointer over a chart</p>
+    <div id="groups"></div>
+    <div class="hint">
+      <kbd>←</kbd><kbd>→</kbd> step sample · <kbd>Shift</kbd>+arrows ×10<br>
+      Click pins the cursor · <kbd>Shift</kbd>+click drops a Δ anchor<br>
+      Drag on a chart to zoom · double-click resets · wheel zooms
+    </div>
+  </aside>
+</div>
+
+<div class="drop hidden" id="dropmask">Release to load capture</div>
+
+<script id="log-data" type="application/json">null</script>
+<script>
+"use strict";
+
+/* ===================================================================== data
+ * The firmware prints one space-separated key:value line per second from
+ * log_measurements() in main.c. Raw captures also carry NUL bytes, banner
+ * lines and half-written lines from resets, so keep only what carries an
+ * ms: token and a plausible Vbat:.
+ */
+const TOKEN = /([A-Za-z_][A-Za-z0-9_+]*):(-?[0-9A-Za-z_+]+)/g;
+
+const NUMERIC = ["ms","Vbat","Vchg","Vout","Vpanel","Vusb1","Vusb2","Ipanel","Ichg",
+  "Idsg","Ppanel","Ibat_net","Tbat","Tboard","bat_low","has_sun","has_load","temp_ok",
+  "p_limited","bat_full","i_buck_max","allowed_chg","pwm","sp"];
+const STATES  = ["EM","CHG","MPPT"];
+const HEX     = ["fault","flt_hist"];
+
+/* fault_ctx_t bits, in bit order (system_types.h) */
+const FAULT_BITS = ["OVERTEMP","BAT_OVERVOLT","OVERCURRENT_CHG","OVERCURRENT_DSG",
+  "BAT_UNDERVOLT","USB_OVERVOLT","PRECHARGE_TIMEOUT","TEMP_CHARGE_BLOCK","REVERSE_PUMP"];
+
+function parseLog(text) {
+  const rows = [];
+  for (const line of text.replace(/\0/g, "").split(/\r?\n/)) {
+    if (line.indexOf("ms:") < 0) continue;
+    const rec = {};
+    TOKEN.lastIndex = 0;
+    let m;
+    while ((m = TOKEN.exec(line)) !== null) rec[m[1]] = m[2];
+    if (rec.ms === undefined || rec.Vbat === undefined) continue;
+    const r = {};
+    for (const k of NUMERIC) r[k] = rec[k] === undefined ? NaN : Number(rec[k]);
+    for (const k of STATES)  r[k] = rec[k] === undefined ? "" : rec[k];
+    for (const k of HEX)     r[k] = /^[0-9A-Fa-f]{1,4}$/.test(rec[k] || "") ? parseInt(rec[k], 16) : 0;
+    if (!Number.isFinite(r.ms)) continue;
+    rows.push(r);
+  }
+  return rows;
+}
+
+/* A reboot restarts time_now() at 0 — split the capture there. */
+function splitSessions(rows) {
+  const out = [];
+  let cur = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (i && rows[i].ms < rows[i - 1].ms) { out.push(cur); cur = []; }
+    cur.push(rows[i]);
+  }
+  if (cur.length) out.push(cur);
+  return out.map(rs => {
+    const t0 = rs[0].ms;
+    rs.forEach(r => { r.t = (r.ms - t0) / 1000; });
+    return rs;
+  });
+}
+
+function faultNames(code) {
+  if (!code) return "";
+  return FAULT_BITS.filter((_, i) => code & (1 << i)).join(" + ");
+}
+
+/* =================================================================== panels
+ * Grouped so each panel shares one scale — the panel-voltage loop chasing its
+ * setpoint is one story, the battery bus another. Never two y-axes on one plot.
+ */
+const PANELS = [
+  { label: "panel",       unit: "V",  scale: 1e-3, h: 116, series: ["Vpanel", "sp"] },
+  { label: "battery bus", unit: "V",  scale: 1e-3, h: 116, series: ["Vbat", "Vchg", "Vout"] },
+  { label: "current",     unit: "mA", scale: 1,    h: 140, series: ["Ichg", "Idsg", "Ipanel", "allowed_chg"], zero: true },
+  { label: "panel power", unit: "mW", scale: 1,    h: 92,  series: ["Ppanel"] },
+  { label: "pwm",         unit: "",   scale: 1,    h: 92,  series: ["pwm"], invert: true },
+  { label: "temperature", unit: "°C", scale: 1,    h: 84,  series: ["Tbat", "Tboard"] },
+];
+
+/* Colour follows the entity, never its rank: a field keeps its hue everywhere. */
+const HUE = {
+  Vpanel: "--s-1", sp: "--s-4",
+  Vbat: "--s-1", Vchg: "--s-2", Vout: "--s-3",
+  Ichg: "--s-1", Idsg: "--s-2", Ipanel: "--s-3", allowed_chg: "--s-4",
+  Ppanel: "--s-1", pwm: "--s-7",
+  Tbat: "--s-1", Tboard: "--s-2",
+};
+
+const RIBBON = [
+  { key: "EM",   kind: "state" }, { key: "CHG", kind: "state" }, { key: "MPPT", kind: "state" },
+  { key: "has_sun", kind: "flag" }, { key: "has_load", kind: "flag" },
+  { key: "p_limited", kind: "flag" }, { key: "bat_full", kind: "flag" },
+  { key: "bat_low", kind: "flag" }, { key: "fault", kind: "fault" },
+];
+
+/* The rail lists every field the firmware prints, grouped the way the
+ * pipeline produces them. */
+const GROUPS = [
+  { title: "Panel",   fields: [["Vpanel","mV"],["Ipanel","mA"],["Ppanel","mW"],["sp","mV"]] },
+  { title: "Battery", fields: [["Vbat","mV"],["Ichg","mA"],["Ibat_net","mA"],["Vchg","mV"]] },
+  { title: "Output",  fields: [["Vout","mV"],["Idsg","mA"],["Vusb1","mV"],["Vusb2","mV"]] },
+  { title: "Budget",  fields: [["allowed_chg","mA"],["i_buck_max","mA"],["pwm",""]] },
+  { title: "Temps",   fields: [["Tbat","°C"],["Tboard","°C"]] },
+  { title: "State",   fields: [["EM",""],["CHG",""],["MPPT",""]] },
+  { title: "Flags",   fields: [["has_sun",""],["has_load",""],["p_limited",""],
+                               ["bat_full",""],["bat_low",""],["temp_ok",""]] },
+];
+
+const PAD_L = 62, PAD_R = 84, PAD_T = 8, PAD_B = 6;
+const RIBBON_ROW = 17;
+
+/* ==================================================================== state */
+const S = {
+  name: "", rows: [], sessions: [], si: 0,
+  t0: 0, t1: 1, cursor: -1, anchor: -1, pinned: false,
+  panels: [], ribbonCv: null, axisCv: null, ovCv: null,
+};
+
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function fmt(v, digits) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return digits ? v.toFixed(digits) : String(Math.round(v));
+}
+
+/* ================================================================= building */
+function build() {
+  const col = $("plotcol");
+  col.textContent = "";
+  S.panels = [];
+
+  for (const p of PANELS) {
+    const wrap = document.createElement("div");
+    wrap.className = "panel";
+
+    const lg = document.createElement("div");
+    lg.className = "legend";
+    if (p.series.length >= 2) {
+      for (const f of p.series) {
+        const s = document.createElement("span");
+        const i = document.createElement("i");
+        i.style.background = css(HUE[f]);
+        s.appendChild(i);
+        s.appendChild(document.createTextNode(f));   // names are data: textContent
+        lg.appendChild(s);
+      }
+    }
+    const cv = document.createElement("canvas");
+    wrap.appendChild(lg);
+    wrap.appendChild(cv);
+    col.appendChild(wrap);
+    S.panels.push({ cfg: p, cv });
+  }
+
+  const rwrap = document.createElement("div");
+  rwrap.className = "panel";
+  S.ribbonCv = document.createElement("canvas");
+  rwrap.appendChild(S.ribbonCv);
+  col.appendChild(rwrap);
+
+  const awrap = document.createElement("div");
+  awrap.className = "panel";
+  S.axisCv = document.createElement("canvas");
+  awrap.appendChild(S.axisCv);
+  col.appendChild(awrap);
+
+  const sel = document.createElement("div"); sel.className = "sel hidden"; sel.id = "sel";
+
+  const anc = document.createElement("div"); anc.className = "anchor hidden"; anc.id = "anc";
+  anc.innerHTML = '<span class="chip"></span>';
+  const hair = document.createElement("div"); hair.className = "hair hidden"; hair.id = "hair";
+  hair.innerHTML = '<span class="chip"></span>';
+  col.append(sel, anc, hair);
+
+  // Overview strip: the whole session at once, with a draggable window showing
+  // which slice the panels above are zoomed to.
+  const old = document.getElementById("ov");
+  if (old) old.remove();
+  const ov = document.createElement("div");
+  ov.className = "ov"; ov.id = "ov";
+  S.ovCv = document.createElement("canvas");
+  const shL = document.createElement("div"); shL.className = "shade"; shL.id = "shl";
+  const shR = document.createElement("div"); shR.className = "shade"; shR.id = "shr";
+  const win = document.createElement("div"); win.className = "ovwin"; win.id = "ovwin";
+  win.innerHTML = '<span class="h l"></span><span class="h r"></span>';
+  ov.append(S.ovCv, shL, shR, win);
+  const lab = document.createElement("div");
+  lab.className = "ovlabel"; lab.id = "ovlabel";
+  col.parentElement.append(ov, lab);
+  wireOverview();
+
+  buildRail();
+}
+
+function buildRail() {
+  const host = $("groups");
+  host.textContent = "";
+  for (const g of GROUPS) {
+    const box = document.createElement("div");
+    box.className = "grp";
+    const h = document.createElement("h3");
+    h.textContent = g.title;
+    box.appendChild(h);
+    for (const [field, unit] of g.fields) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.dataset.field = field;
+      const key = document.createElement("i");
+      key.className = "key";
+      if (HUE[field]) key.style.background = css(HUE[field]);
+      const name = document.createElement("span");
+      name.className = "name"; name.textContent = field;
+      const val = document.createElement("span"); val.className = "val"; val.textContent = "—";
+      const u = document.createElement("span"); u.className = "unit"; u.textContent = unit;
+      row.append(key, name, val, u);
+      box.appendChild(row);
+    }
+    host.appendChild(box);
+  }
+  const fb = document.createElement("div");
+  fb.className = "grp";
+  const fh = document.createElement("h3"); fh.textContent = "Faults";
+  const fbox = document.createElement("div"); fbox.className = "faultbox clear"; fbox.id = "faultbox";
+  fbox.textContent = "—";
+  fb.append(fh, fbox);
+  host.appendChild(fb);
+}
+
+/* ================================================================== drawing */
+function sizeCanvas(cv, h) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.parentElement.clientWidth;
+  cv.width = Math.max(1, Math.round(w * dpr));
+  cv.height = Math.round(h * dpr);
+  cv.style.height = h + "px";
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function view() {
+  const rs = S.sessions[S.si] || [];
+  let a = 0, b = rs.length - 1;
+  while (a < b && rs[a].t < S.t0) a++;
+  while (b > a && rs[b].t > S.t1) b--;
+  return { rs, a: Math.max(0, a - 1), b: Math.min(rs.length - 1, b + 1) };
+}
+
+function xOf(t, w) {
+  return PAD_L + (t - S.t0) / (S.t1 - S.t0 || 1) * (w - PAD_L - PAD_R);
+}
+
+function ticks(lo, hi, want) {
+  const span = hi - lo;
+  if (!(span > 0)) return [lo];
+  const raw = span / want;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(s => s * mag).find(s => s >= raw) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-6; v += step) out.push(v);
+  return out;
+}
+
+function drawPanel(p) {
+  const { ctx, w, h } = sizeCanvas(p.cv, p.cfg.h);
+  const { rs, a, b } = view();
+  const inkGrid = css("--hairline-2"), ink3 = css("--ink-3"), surf = css("--surface");
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = surf;
+  ctx.fillRect(PAD_L, 0, w - PAD_L - PAD_R, h);
+
+  // y range across every series in the panel
+  let lo = Infinity, hi = -Infinity;
+  for (const f of p.cfg.series) {
+    for (let i = a; i <= b; i++) {
+      const v = rs[i][f] * p.cfg.scale;
+      if (Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    }
+  }
+  if (!Number.isFinite(lo)) { lo = 0; hi = 1; }
+  if (p.cfg.zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  if (hi - lo < 1e-9) { hi = lo + 1; }
+  const pad = (hi - lo) * 0.08;
+  lo -= pad; hi += pad;
+  const yOf = v => {
+    const f = (v - lo) / (hi - lo);
+    return PAD_T + (p.cfg.invert ? f : 1 - f) * (h - PAD_T - PAD_B);
+  };
+
+  // grid + y labels
+  ctx.font = '10px ' + css("--font-mono").replace(/"/g, "'");
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (const tk of ticks(lo, hi, 4)) {
+    const y = Math.round(yOf(tk)) + 0.5;
+    ctx.strokeStyle = inkGrid; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(w - PAD_R, y); ctx.stroke();
+    ctx.fillStyle = ink3;
+    ctx.fillText(fmt(tk, Math.abs(hi - lo) < 20 ? 1 : 0), PAD_L - 6, y);
+  }
+  // x grid, shared with the axis strip
+  for (const tk of ticks(S.t0, S.t1, Math.max(3, Math.round((w - PAD_L - PAD_R) / 90)))) {
+    const x = Math.round(xOf(tk, w)) + 0.5;
+    ctx.strokeStyle = inkGrid;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  if (p.cfg.zero && lo < 0 && hi > 0) {
+    const y = Math.round(yOf(0)) + 0.5;
+    ctx.strokeStyle = css("--hairline");
+    ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(w - PAD_R, y); ctx.stroke();
+  }
+
+  // panel caption, rotated into the gutter: tick labels own the horizontal room
+  ctx.save();
+  ctx.translate(12, h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = ink3;
+  ctx.font = '10px ' + css("--font-ui").replace(/"/g, "'");
+  let cap = p.cfg.label + (p.cfg.unit ? "  " + p.cfg.unit : "");
+  if (p.cfg.invert) {
+    // The caption runs along the panel's height — only add the note if it fits.
+    const note = "   ↑ more current";
+    if (ctx.measureText(cap + note).width < h - 10) cap += note;
+    else if (ctx.measureText(cap + "  ↑more I").width < h - 10) cap += "  ↑more I";
+  }
+  ctx.fillText(cap, 0, 0);
+  ctx.restore();
+
+  // traces, min/max decimated so a per-sample limit cycle survives
+  const plotW = w - PAD_L - PAD_R;
+  const perPx = (b - a + 1) / plotW;
+  const labels = [];
+  for (const f of p.cfg.series) {
+    ctx.strokeStyle = css(HUE[f]);
+    ctx.lineWidth = 1.4; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath();
+    if (perPx > 1.6) {
+      for (let px = 0; px < plotW; px++) {
+        const i0 = a + Math.floor(px * perPx), i1 = Math.min(b, a + Math.floor((px + 1) * perPx));
+        let mn = Infinity, mx = -Infinity;
+        for (let i = i0; i <= i1; i++) {
+          const v = rs[i][f] * p.cfg.scale;
+          if (Number.isFinite(v)) { if (v < mn) mn = v; if (v > mx) mx = v; }
+        }
+        if (!Number.isFinite(mn)) continue;
+        const x = PAD_L + px + 0.5;
+        ctx.moveTo(x, yOf(mx)); ctx.lineTo(x, yOf(mn));
+      }
+    } else {
+      let started = false;
+      for (let i = a; i <= b; i++) {
+        const v = rs[i][f] * p.cfg.scale;
+        if (!Number.isFinite(v)) { started = false; continue; }
+        const x = xOf(rs[i].t, w), y = yOf(v);
+        if (started) ctx.lineTo(x, y); else { ctx.moveTo(x, y); started = true; }
+      }
+    }
+    ctx.stroke();
+
+    let last = NaN;
+    for (let i = b; i >= a; i--) { const v = rs[i][f] * p.cfg.scale; if (Number.isFinite(v)) { last = v; break; } }
+    if (Number.isFinite(last)) labels.push({ f, y: yOf(last) });
+  }
+
+  // Direct labels at the right edge, pushed apart so they never overlap.
+  labels.sort((u, v) => u.y - v.y);
+  const minSep = 11;
+  for (let i = 1; i < labels.length; i++) {
+    if (labels[i].y - labels[i - 1].y < minSep) labels[i].y = labels[i - 1].y + minSep;
+  }
+  const over = labels.length ? Math.max(0, labels[labels.length - 1].y - (h - 4)) : 0;
+  ctx.font = '10px ' + css("--font-mono").replace(/"/g, "'");
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  for (const L of labels) {
+    ctx.fillStyle = css(HUE[L.f]);
+    ctx.fillText(L.f, w - PAD_R + 5, Math.max(5, L.y - over));
+  }
+}
+
+function drawRibbon() {
+  const h = RIBBON.length * RIBBON_ROW + 6;
+  const { ctx, w } = sizeCanvas(S.ribbonCv, h);
+  const { rs, a, b } = view();
+  ctx.clearRect(0, 0, w, h);
+  const seg = css("--surface-2"), line = css("--hairline"), ink2 = css("--ink-2"),
+        ink3 = css("--ink-3"), crit = css("--critical"), critBg = css("--critical-bg");
+  const monoF = '10px ' + css("--font-mono").replace(/"/g, "'");
+
+  RIBBON.forEach((r, ri) => {
+    const y = 3 + ri * RIBBON_ROW, rh = RIBBON_ROW - 4;
+    ctx.font = '10px ' + css("--font-ui").replace(/"/g, "'");
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillStyle = ink3;
+    ctx.fillText(r.key, PAD_L - 6, y + rh / 2);
+
+    const valOf = i => {
+      const v = rs[i][r.key];
+      if (r.kind === "state") return v || "";
+      if (r.kind === "fault") return faultNames(v);
+      return v === 1 ? "on" : "";
+    };
+    let i = a;
+    const seen = [];
+    let labelled = false;
+    while (i <= b) {
+      const v = valOf(i);
+      let j = i;
+      while (j + 1 <= b && valOf(j + 1) === v) j++;
+      if (v) {
+        if (!seen.includes(v)) seen.push(v);
+        const x0 = xOf(rs[i].t, w), x1 = xOf(rs[Math.min(j + 1, b)].t, w);
+        const isF = r.kind === "fault";
+        ctx.fillStyle = isF ? critBg : seg;
+        ctx.fillRect(x0, y, Math.max(1.5, x1 - x0), rh);
+        ctx.strokeStyle = isF ? crit : line;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x0 + 0.5, y + 0.5, Math.max(1.5, x1 - x0) - 1, rh - 1);
+        if (x1 - x0 > v.length * 6 + 8) {
+          ctx.fillStyle = isF ? crit : ink2;
+          ctx.font = monoF; ctx.textAlign = "center";
+          ctx.fillText(v, (x0 + x1) / 2, y + rh / 2);
+          labelled = true;
+        }
+      }
+      i = j + 1;
+    }
+    if (!labelled && seen.length) {     // too narrow to write in — name at the edge
+      ctx.fillStyle = r.kind === "fault" ? crit : ink3;
+      ctx.font = monoF; ctx.textAlign = "left";
+      ctx.fillText(seen.slice(0, 3).join("/").slice(0, 13), w - PAD_R + 5, y + rh / 2);
+    }
+  });
+}
+
+function drawAxis() {
+  const { ctx, w } = sizeCanvas(S.axisCv, 22);
+  ctx.clearRect(0, 0, w, 22);
+  ctx.font = '10px ' + css("--font-mono").replace(/"/g, "'");
+  ctx.fillStyle = css("--ink-3");
+  ctx.textBaseline = "top";
+  for (const tk of ticks(S.t0, S.t1, Math.max(3, Math.round((w - PAD_L - PAD_R) / 90)))) {
+    const x = xOf(tk, w);
+    ctx.textAlign = "center";
+    ctx.fillText(fmt(tk, (S.t1 - S.t0) < 20 ? 1 : 0), x, 3);
+  }
+  ctx.textAlign = "right";
+  ctx.fillText("seconds", PAD_L - 6, 3);
+}
+
+function draw() {
+  for (const p of S.panels) drawPanel(p);
+  drawRibbon();
+  drawAxis();
+  drawOverview();
+  positionOverview();
+  placeMarkers();
+}
+
+/* ================================================================= overview
+ * The whole session, always at full extent, so a zoomed view never loses its
+ * place. Panel power is the trace: it carries the daylight envelope and every
+ * teardown at a glance.
+ */
+function drawOverview() {
+  if (!S.ovCv) return;
+  const { ctx, w, h } = sizeCanvas(S.ovCv, 46);
+  const rs = S.sessions[S.si] || [];
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = css("--surface");
+  ctx.fillRect(PAD_L, 0, w - PAD_L - PAD_R, h);
+  if (rs.length < 2) return;
+
+  const T0 = rs[0].t, T1 = rs[rs.length - 1].t;
+  const plotW = w - PAD_L - PAD_R;
+  const X = t => PAD_L + (t - T0) / (T1 - T0 || 1) * plotW;
+
+  let hi = 0;
+  for (const r of rs) if (Number.isFinite(r.Ppanel) && r.Ppanel > hi) hi = r.Ppanel;
+  if (hi <= 0) hi = 1;
+  const Y = v => h - 3 - (v / hi) * (h - 8);
+
+  const perPx = rs.length / plotW;
+  ctx.beginPath();
+  ctx.moveTo(PAD_L, h - 3);
+  for (let px = 0; px < plotW; px++) {
+    const i0 = Math.floor(px * perPx), i1 = Math.min(rs.length - 1, Math.floor((px + 1) * perPx));
+    let mx = 0;
+    for (let i = i0; i <= i1; i++) if (Number.isFinite(rs[i].Ppanel) && rs[i].Ppanel > mx) mx = rs[i].Ppanel;
+    ctx.lineTo(PAD_L + px + 0.5, Y(mx));
+  }
+  ctx.lineTo(w - PAD_R, h - 3);
+  ctx.closePath();
+  ctx.fillStyle = css("--s-1");
+  ctx.globalAlpha = 0.30; ctx.fill(); ctx.globalAlpha = 1;
+  ctx.strokeStyle = css("--s-1"); ctx.lineWidth = 1; ctx.stroke();
+
+  // fault ticks, so a latched fault is findable without hunting
+  ctx.fillStyle = css("--critical");
+  for (let i = 0; i < rs.length; i++) {
+    if (rs[i].fault) ctx.fillRect(X(rs[i].t), h - 3, Math.max(1, plotW / rs.length), 3);
+  }
+
+  ctx.font = '10px ' + css("--font-ui").replace(/"/g, "'");
+  ctx.fillStyle = css("--ink-3");
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  ctx.fillText("session", PAD_L - 6, h / 2);
+}
+
+function positionOverview() {
+  const ov = $("ov");
+  if (!ov || !S.ovCv) return;
+  const rs = S.sessions[S.si] || [];
+  if (rs.length < 2) return;
+  const w = ov.clientWidth, T0 = rs[0].t, T1 = rs[rs.length - 1].t;
+  const plotW = w - PAD_L - PAD_R;
+  const X = t => PAD_L + (t - T0) / (T1 - T0 || 1) * plotW;
+  const x0 = Math.max(PAD_L, X(S.t0)), x1 = Math.min(w - PAD_R, X(S.t1));
+
+  $("shl").style.left = PAD_L + "px";
+  $("shl").style.width = Math.max(0, x0 - PAD_L) + "px";
+  $("shr").style.left = x1 + "px";
+  $("shr").style.width = Math.max(0, (w - PAD_R) - x1) + "px";
+  const win = $("ovwin");
+  win.style.left = x0 + "px";
+  win.style.width = Math.max(3, x1 - x0) + "px";
+  const h = S.ovCv.style.height;
+  $("shl").style.height = h; $("shr").style.height = h; win.style.height = h;
+
+  $("ovlabel").textContent =
+    "view " + fmt(S.t0, 1) + "–" + fmt(S.t1, 1) + " s  (" + fmt(S.t1 - S.t0, 1) + " s of " +
+    fmt(T1 - T0, 0) + " s)";
+}
+
+function wireOverview() {
+  const ov = $("ov"), win = $("ovwin");
+  let mode = null, grabT = 0, span = 0;
+
+  const tAtOv = clientX => {
+    const rs = S.sessions[S.si] || [];
+    if (rs.length < 2) return 0;
+    const box = ov.getBoundingClientRect(), w = ov.clientWidth;
+    const T0 = rs[0].t, T1 = rs[rs.length - 1].t;
+    const x = Math.min(Math.max(clientX - box.left, PAD_L), w - PAD_R);
+    return T0 + (x - PAD_L) / (w - PAD_L - PAD_R) * (T1 - T0);
+  };
+  const clampView = () => {
+    const rs = S.sessions[S.si] || [];
+    const T0 = rs[0].t, T1 = rs[rs.length - 1].t;
+    if (S.t1 - S.t0 > T1 - T0) { S.t0 = T0; S.t1 = T1; return; }
+    if (S.t0 < T0) { S.t1 += T0 - S.t0; S.t0 = T0; }
+    if (S.t1 > T1) { S.t0 -= S.t1 - T1; S.t1 = T1; }
+  };
+
+  ov.addEventListener("pointerdown", e => {
+    const t = tAtOv(e.clientX);
+    if (e.target.classList.contains("h")) {
+      mode = e.target.classList.contains("l") ? "left" : "right";
+    } else if (e.target === win) {
+      mode = "pan"; grabT = t; span = S.t1 - S.t0;
+      win.classList.add("grabbing");
+    } else {
+      // click on the strip: centre the current window there
+      span = S.t1 - S.t0;
+      S.t0 = t - span / 2; S.t1 = t + span / 2;
+      clampView(); draw(); readout();
+      mode = "pan"; grabT = t;
+      win.classList.add("grabbing");
+    }
+    ov.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+
+  ov.addEventListener("pointermove", e => {
+    if (!mode) return;
+    const t = tAtOv(e.clientX);
+    if (mode === "pan") { const d = t - grabT; S.t0 += d; S.t1 += d; grabT = t; clampView(); }
+    else if (mode === "left")  S.t0 = Math.min(t, S.t1 - 0.5);
+    else                       S.t1 = Math.max(t, S.t0 + 0.5);
+    draw(); readout();
+  });
+
+  const end = () => { mode = null; win.classList.remove("grabbing"); };
+  ov.addEventListener("pointerup", end);
+  ov.addEventListener("pointercancel", end);
+}
+
+/* ================================================================ crosshair */
+function nearestIndex(t) {
+  const rs = S.sessions[S.si] || [];
+  if (!rs.length) return -1;
+  let lo = 0, hi = rs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (rs[mid].t < t) lo = mid + 1; else hi = mid;
+  }
+  if (lo > 0 && Math.abs(rs[lo - 1].t - t) < Math.abs(rs[lo].t - t)) lo--;
+  return lo;
+}
+
+function placeMarkers() {
+  const col = $("plotcol"), w = col.clientWidth;
+  const rs = S.sessions[S.si] || [];
+  const put = (el, idx, cls) => {
+    if (idx < 0 || idx >= rs.length || rs[idx].t < S.t0 || rs[idx].t > S.t1) {
+      el.classList.add("hidden"); return;
+    }
+    el.classList.remove("hidden");
+    el.style.left = xOf(rs[idx].t, w) + "px";
+    el.querySelector(".chip").textContent = fmt(rs[idx].t, (S.t1 - S.t0) < 20 ? 2 : 0) + " s";
+  };
+  put($("hair"), S.cursor);
+  put($("anc"), S.anchor);
+  $("hair").classList.toggle("pinned", S.pinned);
+}
+
+function readout() {
+  const rs = S.sessions[S.si] || [];
+  const r = rs[S.cursor], an = S.anchor >= 0 ? rs[S.anchor] : null;
+  const now = $("now"), sub = $("nowsub");
+
+  if (!r) {
+    now.textContent = "—";
+    sub.textContent = "move the pointer over a chart";
+    document.querySelectorAll(".row").forEach(el => {
+      el.querySelector(".val").textContent = "—";
+      el.classList.remove("bad", "off");
+      const d = el.querySelector(".dlt"); if (d) d.remove();
+    });
+    const fb = $("faultbox"); fb.textContent = "—"; fb.className = "faultbox clear";
+    return;
+  }
+
+  now.textContent = fmt(r.t, 2) + " s";
+  sub.textContent = "ms:" + r.ms + (an ? "   Δt " + fmt(r.t - an.t, 2) + " s" : "") +
+                    (S.pinned ? "   pinned" : "");
+
+  for (const el of document.querySelectorAll(".row")) {
+    const f = el.dataset.field;
+    const v = r[f];
+    const valEl = el.querySelector(".val");
+    let d = el.querySelector(".dlt");
+    el.classList.remove("bad", "off");
+
+    if (typeof v === "string") {
+      valEl.textContent = v || "—";
+      if (v === "OFF" || v === "IDLE") el.classList.add("off");
+      if (d) { d.remove(); d = null; }
+      continue;
+    }
+    if (!Number.isFinite(v)) { valEl.textContent = "—"; continue; }
+
+    if (f === "has_sun" || f === "has_load" || f === "p_limited" ||
+        f === "bat_full" || f === "bat_low" || f === "temp_ok") {
+      valEl.textContent = v ? "yes" : "no";
+      if (!v) el.classList.add("off");
+      if ((f === "bat_low" && v) || (f === "temp_ok" && !v)) el.classList.add("bad");
+      if (d) { d.remove(); d = null; }
+      continue;
+    }
+    valEl.textContent = v.toLocaleString("en-US");
+
+    if (an && Number.isFinite(an[f])) {
+      const dv = v - an[f];
+      if (!d) {
+        d = document.createElement("span");
+        d.className = "dlt";
+        el.appendChild(d);
+        el.style.gridTemplateColumns = "12px 1fr auto auto auto";
+      }
+      d.textContent = (dv > 0 ? "+" : "") + Math.round(dv);
+    } else if (d) {
+      d.remove();
+      el.style.gridTemplateColumns = "";
+    }
+  }
+
+  const fb = $("faultbox");
+  const names = faultNames(r.fault), hist = faultNames(r.flt_hist);
+  if (names) {
+    fb.className = "faultbox";
+    fb.textContent = "0x" + r.fault.toString(16).padStart(4, "0").toUpperCase() + "  " + names;
+  } else {
+    fb.className = "faultbox clear";
+    fb.textContent = "0x0000  none latched" + (hist ? "  ·  seen this boot: " + hist : "");
+  }
+}
+
+/* ================================================================== pointer */
+let dragFrom = null;
+
+function tAt(clientX) {
+  const col = $("plotcol"), box = col.getBoundingClientRect();
+  const w = col.clientWidth;
+  const x = Math.min(Math.max(clientX - box.left, PAD_L), w - PAD_R);
+  return S.t0 + (x - PAD_L) / (w - PAD_L - PAD_R) * (S.t1 - S.t0);
+}
+
+function wire() {
+  const col = $("plotcol");
+
+  col.addEventListener("pointermove", e => {
+    const t = tAt(e.clientX);
+    if (dragFrom !== null) {
+      const w = col.clientWidth;
+      const x0 = xOf(Math.min(dragFrom, t), w), x1 = xOf(Math.max(dragFrom, t), w);
+      const sel = $("sel");
+      sel.classList.remove("hidden");
+      sel.style.left = x0 + "px";
+      sel.style.width = Math.max(1, x1 - x0) + "px";
+      return;
+    }
+    if (S.pinned) return;
+    S.cursor = nearestIndex(t);
+    placeMarkers(); readout();
+  });
+
+  col.addEventListener("pointerdown", e => {
+    if (e.shiftKey) {
+      S.anchor = S.anchor === S.cursor ? -1 : S.cursor;
+      placeMarkers(); readout();
+      return;
+    }
+    dragFrom = tAt(e.clientX);
+    col.setPointerCapture(e.pointerId);
+  });
+
+  col.addEventListener("pointerup", e => {
+    const sel = $("sel");
+    sel.classList.add("hidden");
+    if (dragFrom === null) return;
+    const t = tAt(e.clientX);
+    const moved = Math.abs(xOf(t, col.clientWidth) - xOf(dragFrom, col.clientWidth));
+    if (moved > 6) {
+      S.t0 = Math.min(dragFrom, t); S.t1 = Math.max(dragFrom, t);
+      draw(); readout();
+    } else {
+      S.pinned = !S.pinned;
+      $("pin").classList.toggle("on", S.pinned);
+      $("pin").setAttribute("aria-pressed", String(S.pinned));
+      placeMarkers(); readout();
+    }
+    dragFrom = null;
+  });
+
+  col.addEventListener("pointerleave", () => {
+    if (!S.pinned) { S.cursor = -1; placeMarkers(); readout(); }
+  });
+
+  col.addEventListener("dblclick", fit);
+
+  col.addEventListener("wheel", e => {
+    e.preventDefault();
+    const rs = S.sessions[S.si] || [];
+    if (rs.length < 2) return;
+    // Scale with how far the wheel actually moved, so a trackpad flick and a
+    // mouse notch both land somewhere sensible — and cap one event's effect.
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+    const d = Math.max(-160, Math.min(160, e.deltaY * unit));
+    const k = Math.exp(d * 0.0011);
+    const t = tAt(e.clientX);
+    const T0 = rs[0].t, T1 = rs[rs.length - 1].t;
+    let a = t - (t - S.t0) * k, b = t + (S.t1 - t) * k;
+    if (b - a > T1 - T0) { a = T0; b = T1; }
+    if (b - a < 0.25) return;
+    S.t0 = Math.max(T0, a); S.t1 = Math.min(T1, b);
+    draw(); readout();
+  }, { passive: false });
+
+  document.addEventListener("keydown", e => {
+    if (!S.sessions.length) return;
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const rs = S.sessions[S.si];
+    const step = (e.shiftKey ? 10 : 1) * (e.key === "ArrowRight" ? 1 : -1);
+    S.pinned = true;
+    $("pin").classList.add("on");
+    $("pin").setAttribute("aria-pressed", "true");
+    S.cursor = Math.min(rs.length - 1, Math.max(0, (S.cursor < 0 ? 0 : S.cursor) + step));
+    const t = rs[S.cursor].t;
+    if (t < S.t0 || t > S.t1) { const span = S.t1 - S.t0; S.t0 = t - span / 2; S.t1 = t + span / 2; draw(); }
+    placeMarkers(); readout();
+  });
+
+  $("pin").addEventListener("click", () => {
+    S.pinned = !S.pinned;
+    $("pin").classList.toggle("on", S.pinned);
+    $("pin").setAttribute("aria-pressed", String(S.pinned));
+    readout();
+  });
+
+  $("fit").addEventListener("click", fit);
+
+  $("copy").addEventListener("click", async () => {
+    const rs = S.sessions[S.si] || [], r = rs[S.cursor];
+    if (!r) return;
+    const keys = NUMERIC.concat(STATES, HEX);
+    const text = keys.join("\t") + "\n" + keys.map(k => r[k]).join("\t");
+    try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; }
+    catch { $("copy").textContent = "Copy failed"; }
+    setTimeout(() => { $("copy").textContent = "Copy sample"; }, 1200);
+  });
+
+  $("session").addEventListener("change", e => { S.si = Number(e.target.value); fit(); });
+
+  $("file").addEventListener("change", e => {
+    const f = e.target.files && e.target.files[0];
+    if (f) f.text().then(txt => load(f.name, txt));
+  });
+
+  ["dragenter", "dragover"].forEach(t => document.addEventListener(t, e => {
+    e.preventDefault(); $("dropmask").classList.remove("hidden");
+  }));
+  ["dragleave", "drop"].forEach(t => document.addEventListener(t, e => {
+    if (t === "dragleave" && e.relatedTarget) return;
+    $("dropmask").classList.add("hidden");
+  }));
+  document.addEventListener("drop", e => {
+    e.preventDefault();
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) f.text().then(txt => load(f.name, txt));
+  });
+
+  let rt;
+  window.addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { draw(); }, 90); });
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  mq.addEventListener("change", () => { build(); draw(); readout(); });
+}
+
+function fit() {
+  const rs = S.sessions[S.si] || [];
+  if (!rs.length) return;
+  S.t0 = rs[0].t; S.t1 = rs[rs.length - 1].t;
+  draw(); readout();
+}
+
+/* ==================================================================== load */
+function load(name, text) {
+  const rows = parseLog(text);
+  if (!rows.length) {
+    $("fmeta").textContent = "no telemetry lines found in " + name;
+    return;
+  }
+  S.name = name;
+  S.sessions = splitSessions(rows);
+  // A capture usually holds one real run plus short pre-reset fragments.
+  S.si = S.sessions.reduce((best, s, i) => s.length > S.sessions[best].length ? i : best, 0);
+  S.cursor = -1; S.anchor = -1; S.pinned = false;
+
+  $("fname").textContent = name;
+  const sel = $("session");
+  sel.textContent = "";
+  S.sessions.forEach((s, i) => {
+    const o = document.createElement("option");
+    o.value = String(i);
+    o.textContent = "session " + i + " · " + s.length + " samples · " +
+                    Math.round(s[s.length - 1].t) + " s";
+    sel.appendChild(o);
+  });
+  sel.value = String(S.si);
+  sel.style.display = S.sessions.length > 1 ? "" : "none";
+
+  $("empty").classList.add("hidden");
+  $("plotcol").classList.remove("hidden");
+  build();
+  fit();
+  // Open on a real sample so the rail shows what the page does; the first
+  // pointer move takes over.
+  S.cursor = Math.floor(S.sessions[S.si].length / 2);
+  placeMarkers(); readout();
+
+  const s = S.sessions[S.si];
+  const hist = s.reduce((m, r) => m | r.flt_hist, 0);
+  $("fmeta").textContent = s.length + " samples · " + Math.round(s[s.length - 1].t) + " s · " +
+    "Vbat " + Math.min(...s.map(r => r.Vbat)) + "–" + Math.max(...s.map(r => r.Vbat)) + " mV · " +
+    (hist ? "faults seen: " + faultNames(hist) : "no faults");
+}
+
+wire();
+const embedded = JSON.parse($("log-data").textContent || "null");
+if (embedded && embedded.text) load(embedded.name, embedded.text);
+</script>

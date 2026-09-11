@@ -134,9 +134,41 @@ void measurements_update(system_ctx_t *ctx)
      */
     m->i_bat_net = (int32_t)m->chg_current;
 
-    /* ── Temperature (°C) ── */
-    m->bat_temp   = get_temperature(TEMP1);
-    m->board_temp = get_temperature(TEMP3);
+    /* ── Temperature (°C) ──
+     *
+     * get_temperature() returns TEMP_INVALID_C when the averaged ADC count
+     * says the divider is not looking at a thermistor (shorted or open NTC).
+     * Converting that anyway would report the extreme end of the lookup table
+     * as a genuine reading — a shorted pack NTC would look like a runaway
+     * cell and latch OVERTEMP permanently, which shuts down the lamps, USB
+     * and charging with no way back.
+     *
+     * So: hold the last good value (thermal state does not teleport, and a
+     * stale reading is far better than a fabricated extreme one), and count
+     * consecutive failures. Only after TEMP_SENSOR_FAIL_TICKS (3 s) is the
+     * sensor declared dead via temp_sensor_ok, which blocks *charging* only.
+     * Deliberately asymmetric: charging a cell whose temperature is unknown
+     * is the genuinely unsafe act, whereas cutting someone's light because a
+     * 10 K resistor failed is just a worse product.
+     */
+    int16_t t_bat   = get_temperature(TEMP1);
+    int16_t t_board = get_temperature(TEMP3);
+
+    if (t_bat != (int16_t)TEMP_INVALID_C) {
+        m->bat_temp = t_bat;
+    }
+    if (t_board != (int16_t)TEMP_INVALID_C) {
+        m->board_temp = t_board;
+    }
+
+    if ((t_bat != (int16_t)TEMP_INVALID_C) && (t_board != (int16_t)TEMP_INVALID_C)) {
+        ctx->temp_invalid_count = 0;
+        ctx->temp_sensor_ok     = true;
+    } else if (ctx->temp_invalid_count < TEMP_SENSOR_FAIL_TICKS) {
+        ctx->temp_invalid_count++;
+    } else {
+        ctx->temp_sensor_ok = false;
+    }
 }
 
 /* =========================================================================
@@ -294,23 +326,33 @@ void flags_update(system_ctx_t *ctx)
      *   Block if temp leaves the 0–45°C window.
      *
      * When currently blocked:
-     *   Resume only after temp recovers by TEMP_HYSTERESIS_C (10°C):
-     *     - Cold: blocked at 0°C, resume at 10°C
-     *     - Hot:  blocked at 45°C, resume at 35°C
+     *   Resume only after temp recovers, by an ASYMMETRIC margin:
+     *     - Cold: blocked at 0°C,  resume at 10°C (TEMP_HYSTERESIS_C)
+     *     - Hot:  blocked at 45°C, resume at 40°C (TEMP_HYSTERESIS_HOT_C)
      *
-     * Why 10°C hysteresis: prevents rapid on/off cycling of the charger
+     * Why hysteresis at all: prevents rapid on/off cycling of the charger
      * when temperature hovers near the limit. The charger itself generates
-     * heat, so without hysteresis: charge → heats up → blocks → cools →
-     * charge → repeat.
+     * heat, so without it: charge → heats up → blocks → cools → charge.
+     *
+     * Why the hot side is narrower: the old symmetric 10°C meant a single
+     * 46°C sample locked charging out until the pack fell to 35°C, which in
+     * an enclosure on a sunny day is the rest of the day — a whole afternoon
+     * of harvest thrown away to protect against a 1°C excursion. See
+     * TEMP_HYSTERESIS_HOT_C in hw_config.h.
+     *
+     * A failed sensor (temp_sensor_ok false) blocks unconditionally.
      */
-    if (ctx->temp_charge_ok) {
+    if (!ctx->temp_sensor_ok) {
+        /* Unknown pack temperature — never charge into that. */
+        ctx->temp_charge_ok = false;
+    } else if (ctx->temp_charge_ok) {
         ctx->temp_charge_ok =
             (m->bat_temp >= BAT_TEMP_MIN_CHARGE_C) &&
             (m->bat_temp <= BAT_TEMP_MAX_CHARGE_C);
     } else {
         ctx->temp_charge_ok =
             (m->bat_temp >= BAT_TEMP_MIN_CHARGE_C + TEMP_HYSTERESIS_C) &&
-            (m->bat_temp <= BAT_TEMP_MAX_CHARGE_C - TEMP_HYSTERESIS_C);
+            (m->bat_temp <= BAT_TEMP_MAX_CHARGE_C - TEMP_HYSTERESIS_HOT_C);
     }
 
     /*

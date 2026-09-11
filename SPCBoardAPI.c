@@ -1,4 +1,5 @@
 #include "SPCBoardAPI.h"
+#include "hw_config.h"
 #include "stdlib.h"
 #include "ti/devices/msp/m0p/mspm0g350x.h"
 #include "ti/driverlib/dl_rtc_common.h"
@@ -549,7 +550,21 @@ float _convertToTemp(uint16_t voltage_value, float supply_voltage, NTC ntc){
 
 #define ALPHA 1.0f
 #define ALPHA2 1.0f
-uint32_t num_reads = 0;
+
+/* Monotonic harvest counter. Written only in read_adc_values() (SysTick
+ * context) and read from the foreground via adc_sample_seq(), so it is
+ * volatile; a 32-bit aligned access is atomic on Cortex-M0+, so no critical
+ * section is needed. Wrap is 1.36 years at TICK_ADC_MS and its only consumer
+ * compares for equality, so a wrap costs at most one ignored sample. */
+volatile uint32_t num_reads = 0;
+
+/* Rolling history of the raw (unaveraged) V_PANEL conversion, oldest slot
+ * overwritten first. charger_input_guard() judges exactly this value, and the
+ * averaged channel cannot see the 1-2 sample events it trips on - so this is
+ * the only way to tell a bad conversion from a real input dip. Diagnostic
+ * only; nothing regulates on it. */
+static volatile uint16_t panel_trace_raw[ADC_PANEL_TRACE_DEPTH];
+static volatile uint8_t  panel_trace_head = 0;   /* next slot to write */
 
 /*
  * Simple deadband filter to suppress small fluctuations.
@@ -688,7 +703,6 @@ void GROUP1_IRQHandler(void){
  */
 void read_adc_values(void){
     if(gCheckADC1 && gCheckADC2){
-        num_reads++;
         uint8_t var_id = 0;
 
         for(uint8_t i = 0; i < 10; i++){
@@ -704,6 +718,19 @@ void read_adc_values(void){
             var_id++;
             ADC.Adc1Result[i] = raw;
         }
+
+        /* mem0 = VPANEL: keep the last ADC_PANEL_TRACE_DEPTH conversions for
+         * charger_input_guard()'s post-mortem (see panel_trace_raw). */
+        panel_trace_raw[panel_trace_head] = ADC.Adc1Result[0];
+        if(++panel_trace_head >= ADC_PANEL_TRACE_DEPTH) panel_trace_head = 0;
+
+        /* Publish the harvest LAST. adc_sample_seq() is a foreground
+         * guard's proof that a NEW and COMPLETE conversion set is visible;
+         * bumping it before the arrays are filled would let a guard
+         * preempted mid-harvest count the PREVIOUS sample as a fresh one.
+         * The WINDOW_SIZE test below is unaffected - it still sees this
+         * harvest counted. */
+        num_reads++;
 
         var_id = 0;
 
@@ -800,6 +827,28 @@ uint16_t get_input_voltage_now(void){
     return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc1Result[0]/(ADC.max_adc1_value)/VPANEL_DIV_RATIO);
 }
 
+uint32_t adc_sample_seq(void){
+    return num_reads;
+}
+
+/*
+ * Copy the raw V_PANEL history out in chronological order (oldest first),
+ * converted to mV with the same maths as get_input_voltage_now(). Callers
+ * must provide ADC_PANEL_TRACE_DEPTH entries.
+ *
+ * No critical section: the ISR appends one slot every TICK_ADC_MS while this
+ * copy takes a few microseconds, so a torn snapshot would need a 10 ms
+ * preemption inside a 16-iteration loop. It is post-mortem data either way.
+ */
+void adc_panel_trace_mv(uint16_t *out){
+    uint8_t head = panel_trace_head;   /* oldest slot = next one to be written */
+    for(uint8_t i = 0; i < ADC_PANEL_TRACE_DEPTH; i++){
+        uint8_t idx = (uint8_t)((head + i) % ADC_PANEL_TRACE_DEPTH);
+        out[i] = (uint16_t)((uint32_t)ADC.VREF*panel_trace_raw[idx]
+                            /(ADC.max_adc1_value)/VPANEL_DIV_RATIO);
+    }
+}
+
 uint16_t get_battery_voltage_now(void){
     return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc0Result[2]/(ADC.max_adc0_value)/VBATM_DIV_RATIO);
 }
@@ -843,17 +892,49 @@ uint16_t get_vdd(){
     return gAdcResultVolts;
 }
 
-int16_t get_temperature(TEMP_SENSOR temp_sensor){
-    uint16_t adcResultVDD = ADC.Adc0Result[6];
-    float gAdcResultVolts = (adcResultVDD * ADC.VREF*3) / (ADC.max_adc0_value);
+/*
+ * Thermistor read, shared by both sensors.
+ *
+ * Two things here that the original got wrong, both of them worth stating
+ * plainly because they were the entire "the temperatures are 10-15 degC too
+ * hot" bug:
+ *
+ * 1. SUPPLY. The divider top is 2.5V_VREF (THERMISTOR_BIAS_MV), not VDD. The
+ *    old code passed get_vdd()'s ~3300 mV, so Rt came out ~40 % low and every
+ *    reading landed 10-15 degC hot. Since the bias rail and the ADC reference
+ *    are the same rail, this is now ratiometric and a VREF error cancels.
+ *
+ * 2. AVERAGING. It read ADC.AdcNResult[] — a single raw conversion — while
+ *    every other channel on the board reads avg_readings[] (64-sample moving
+ *    average). One noisy sample was therefore enough to latch OVERTEMP, which
+ *    disables the lamps, USB and charging at once. Temperature is the slowest
+ *    signal in the system; it has the least excuse for being unfiltered.
+ *
+ * Returns TEMP_INVALID_C if the averaged count is outside the plausibility
+ * band, i.e. the NTC is shorted or open. Callers must handle that sentinel —
+ * silently converting it would report the extreme end of the lookup table as
+ * if it were a real measurement.
+ */
+static int16_t _readThermistor(uint32_t avg_count, uint16_t full_scale, NTC ntc){
+    if(avg_count < THERMISTOR_ADC_MIN || avg_count > THERMISTOR_ADC_MAX){
+        return (int16_t)TEMP_INVALID_C;      /* shorted / open / not yet sampled */
+    }
 
+    /* Node voltage and bias rail expressed against the same reference, so the
+     * ratio — and therefore Rt — is independent of the reference's accuracy. */
+    uint16_t node_mv = (uint16_t)((uint32_t)ADC.VREF * avg_count / full_scale);
+
+    return (int16_t)_convertToTemp(node_mv, (float)THERMISTOR_BIAS_MV, ntc);
+}
+
+int16_t get_temperature(TEMP_SENSOR temp_sensor){
     switch(temp_sensor){
-        case TEMP1:
-            return (int16_t)_convertToTemp((uint16_t)(ADC.VREF*ADC.Adc1Result[4]/(ADC.max_adc1_value)), gAdcResultVolts, NTCC_10K);
-        case TEMP3:
-            return (int16_t)_convertToTemp((uint16_t)(ADC.VREF*ADC.Adc0Result[3]/(ADC.max_adc0_value)), gAdcResultVolts, NCP18X);
+        case TEMP1:   /* pack NTC, ADC1 mem4 -> avg_readings[14] */
+            return _readThermistor(avg_readings[14], ADC.max_adc1_value, NTCC_10K);
+        case TEMP3:   /* board NTC, ADC0 mem3 -> avg_readings[3]  */
+            return _readThermistor(avg_readings[3], ADC.max_adc0_value, NCP18X);
         default:
-            return (int16_t)INVALID_RESULT;
+            return (int16_t)TEMP_INVALID_C;
     }
 }
 
@@ -1117,13 +1198,25 @@ void set_buck_pwm(uint16_t pwm_value){
 }
 
 /*
+ * Returns the LUT PWM count that produces `voltage` at the buck rail WITHOUT
+ * touching the timer. The foreground input guard needs the number to bound
+ * its backoff (it must never command a rail under the cell — see
+ * charger_input_guard), and it has no business writing the compare register
+ * as a side effect of a lookup.
+ */
+uint16_t lookup_charging_pwm(uint16_t voltage){
+    uint16_t duty_cycle_index = binary_search_closest_descending(voltage, output_voltages_buck_mV, 344);
+    return duty_cycles_buck[duty_cycle_index];
+}
+
+/*
  * Sets charging voltage by selecting the closest LUT entry and applying
  * the corresponding PWM duty cycle.
  */
 uint16_t set_charging_voltage(uint16_t voltage){
-    uint16_t duty_cycle_index = binary_search_closest_descending(voltage, output_voltages_buck_mV, 344);
-    set_pwm_duty_cycle(&_pwm_outputs[0], duty_cycles_buck[duty_cycle_index]);
-    return duty_cycles_buck[duty_cycle_index];
+    uint16_t pwm_value = lookup_charging_pwm(voltage);
+    set_pwm_duty_cycle(&_pwm_outputs[0], pwm_value);
+    return pwm_value;
 }
 
 /*

@@ -1,3 +1,972 @@
+# [v0.35] - 10.09.26
+## Revert v0.34's backoff clamp: commanding below V_bat IS the escape
+
+Changed files: `charger.c`, `system_types.h`, `main.c`, `CHANGELOG.md`
+
+### What v0.34 got wrong
+v0.34 clamped `charger_input_guard`'s backoff at the zero-draw point on the
+reasoning that backing off further only makes the buck sink. The bench said
+otherwise, immediately:
+
+```
+v0.33:  INTRACE @ 46007 RECOVERED  pwm:95->115     (20 counts, panel came back)
+v0.34:  INTRACE @ 18699 PENDING    pwm:97->106     (9 counts, clamped)
+        INTRACE @ 18811 STANDDOWN  pwm:106->399
+```
+
+Every collapse v0.33 rescued became a stand-down. The clamp removed the only
+escape that has ever worked, because of a physical fact the v0.32 notes stated
+and v0.34 failed to apply: **once the input has collapsed the buck is in
+dropout, and in dropout the FB target has no authority over duty.** The high
+side is on because the output cannot reach the target, and the only command
+that changes that is one the output is already *above* — i.e. below V_bat.
+
+So on this hardware "relieve the panel" and "briefly sink" are the same
+command. That is a property of the FCCM part, not a tuning error.
+
+### The fix
+- The backoff is unclamped again (v0.32/v0.33 behaviour).
+- `CHG_REVERSE_BLANK_MS` stays, but inside the window `charger_fast_guard`
+  now simply **yields**: no latch (v0.32's bug) and no corrective lift
+  (v0.34's bug — lifting the target back cancels the rescue). The input guard
+  owns the event and resolves it within `CHG_INPUT_LOST_SAMPLES` conversions
+  (~30 ms) either way.
+- `charger.zero_draw_pwm` and `charger_refresh_zero_draw()` removed.
+  `lookup_charging_pwm()` stays — it is a correct accessor regardless.
+
+**Bounded exposure:** reverse current now persists for up to 3 conversions
+(~30 ms) on a collapse instead of being pre-empted. The design already
+tolerated one or two 10 ms samples on every unplug; this is the same order.
+**Bench check:** scope V_panel during a collapse and confirm it does not climb
+toward the TPS564247's ~17 V input ceiling during those 30 ms.
+
+### Status
+**Builds clean on both `CHARGER_INPUT_VREG` branches; awaiting bench.**
+This restores v0.33's working rescue *without* v0.33's false `0x0100`. It is
+a correction, not progress — see the analysis note below on why the inner
+loop cannot hold an MPP at 400 ms pacing.
+
+---
+
+# [v0.34] - 10.09.26
+## The guard was rescuing the input and faulting the charger for it
+
+Changed files: `charger.c`, `SPCBoardAPI.c`, `SPCBoardAPI.h`, `main.c`,
+`hw_config.h`, `system_types.h`, `CHANGELOG.md`
+
+### The problem
+First v0.33 bench run, `serial_20260910_174314.log` — and the teardowns are
+still there. But the log finally says why, in one line:
+
+```
+CHG: CC -> OFF @ 46007 ms
+INTRACE @ 46007 ms RECOVERED pwm:95->115 dips:1 Vpanel_raw: … 11912 11901 6483 3494
+```
+
+**`RECOVERED` and `CC -> OFF` at the same millisecond.** All four teardowns of
+the session look like that: four collapses, four rescues, four teardowns. The
+v0.32 guard did its job every time and the charger went down anyway — with
+`fault:0100` (`FAULT_REVERSE_PUMP`) latched, which is why the restarts took
+`FAULT_RECOVER_WAIT_MS` (10 s) instead of `CHG_INPUT_REARM_MS` (2 s). The
+`flt_hist` is `0100` from 46 s onward. This is precisely the regression v0.32
+listed as the one to report.
+
+The two guards were fighting:
+
+1. Panel goes over its knee, V_panel pinned at V_bat.
+2. `charger_input_guard` backs off — pwm 95 → 115, **two full
+   `CHG_INPUT_RECOVER_STEP`s = ~57 mV of commanded rail**, blind to where
+   V_bat is. The pre-collapse rail was V_bat + ~20 mV, so the new target sits
+   ~37 mV *under the cell*.
+3. The panel recovers in milliseconds. Now the buck is a working converter
+   regulating to a target below the battery, so the sync FETs pump the cell
+   backwards — the exact physics `CHG_ACTIVATION_HEADROOM_MV` exists to
+   prevent at activation.
+4. `charger_fast_guard` samples reverse current with the input **live** —
+   its definition of the pathology — and latches.
+
+The backoff was manufacturing the fault the other guard latched on.
+
+A second, quieter defect showed up in the same log. `pwmf` ratcheted 101 →
+107 → 113 as designed, and the warm resume entered at 113 as designed — then
+`CHG_BUCK_SETTLE`'s acquisition ramp walked straight through the fence to
+107, and CC held 107 for 156 s until the panel fell over there again.
+`pwm_draw_more` cannot pull it back: below the fence it is a no-op by design.
+The ramp steps every 50 ms while the rail is merely still *slewing*, so it
+overshoots by 6-16 counts on every activation — harmless from 399, fatal to a
+warm resume.
+
+### The fix
+**Backoffs stop at the zero-draw point** (`charger.c`,
+`charger_refresh_zero_draw`). `charger.zero_draw_pwm` is the LUT count for
+V_bat + `CHG_ACTIVATION_HEADROOM_MV` — the same number activation
+pre-positions to, the point where the buck delivers ~nothing and still cannot
+sink. `charger_input_guard` clamps its backoff there. There was never any
+relief past it, only reversal. Refreshed every charger tick because it tracks
+V_bat: a CC session walking the cell 3.29 → 3.65 V moves it ~125 counts, so a
+value latched at activation is stale within a minute. `lookup_charging_pwm()`
+is a new non-writing LUT accessor (`SPCBoardAPI.c`) — the foreground guard
+needs the number, not a compare-register write.
+
+**The reverse-pump latch is blanked during a rescue** (`charger_fast_guard`).
+For `CHG_REVERSE_BLANK_MS` (200 ms) after the guard's last backoff, reverse
+current with a live input is the *rescue's own tail*, not the pathology — the
+panel is back at full voltage while the buck still carries the backed-off
+target. Inside the window: lift the target to the zero-draw point and give it
+one conversion; still reversing on the next one, stand down cleanly, the same
+call v0.26 makes for a dead input. Never latch. Outside the window nothing
+changes — a sustained reverse-pump event is still a fault. Exposure stays
+bounded at one 10 ms sample, as before.
+
+**The learned ceiling is re-asserted at the SETL → CC/PRECHARGE handoff.**
+Not inside the ramp — fencing the ramp is how a current limit becomes the
+"stranded in SETL forever" lockup the ramp was added to fix. At the handoff
+Q49 has just closed and the correction only ever reduces current.
+
+### Status
+**Builds clean on both `CHARGER_INPUT_VREG` branches; awaiting bench.**
+From a fresh `CHG_ONLY` capture:
+1. **No `0x0100`, and `flt_hist:0000`.** This is the headline check.
+2. `INTRACE … RECOVERED` with `CHG` staying `CC` across it — the region no
+   longer goes down on a rescued collapse, so no 10 s hole.
+3. `pwm` after `SETL -> CC` equals `pwmf` when a fence is live, instead of
+   sitting several counts under it.
+4. Unplug regression unchanged: pull the panel under a ~1 A charge — expect
+   `CHG: CC -> OFF` within ~50 ms, an `INTRACE … STANDDOWN`, and no `0x0100`.
+   A *sustained* reverse-pump condition must still latch; the blank window is
+   200 ms, it is not a disable.
+
+Watch the harvest trade-off: the fence gave up ~540 mA (600 → 250 mA) in this
+session, and once rescues stop tearing the region down the fence becomes the
+only thing setting the operating point. If `pwmf` proves over-conservative,
+the relax rate (`CHG_CLIFF_PWM_RELAX_MS`) is the knob.
+
+---
+
+# [v0.33] - 10.09.26
+## The setpoint ran out of authority: learn the cliff in the PWM domain, and resume there
+
+Changed files: `charger.c`, `mppt.c`, `energy_mode.c`, `main.c`, `hw_config.h`,
+`system_types.h`, `docs/constants_and_faults.md`, `CHANGELOG.md`
+
+### The problem
+Bench capture `serial_20260910_165847.log` — v0.30, 36 min of late-afternoon
+sun, `EM` never left `CHG_ONLY`, no fault ever latched, and the charger tore
+down **13 times**. Every one is the same `INTRACE`: flat V_panel, one sample
+of descent, pinned at V_bat, Voc again 400 ms later. Eleven of the thirteen fired
+with MPPT in `HLD`, i.e. with nothing perturbing anything — **the tracker was
+not the trigger.** v0.32 turns most of that class into a rescue, but it does
+not explain why the same operating point keeps falling over.
+
+The `pwm` at collapse tells the story: 93, 91, 94, 95, 97, 101, then **106
+seven times running**. Isc is falling with the sun under a draw that never
+moves, because nothing in the loop moves it:
+
+- `V_panel` 12736, setpoint 11576 → inside the ±`PANEL_VREG_DEADBAND_MV`
+  band, so `cc_regulate` holds PWM. The plant sits wherever the frozen count
+  put it.
+- The setpoint cannot rise to where it would command a backoff. That needs
+  `sp > V_panel + 1200` = 13936 mV, above Voc (13109), and
+  `MPPT_SP_VOC_GUARD_MV` correctly fences it 1500 mV *below* Voc. `spf` had
+  been pinned at that ceiling since 761 s — `sp_learn_cliff` had nothing left
+  to give.
+
+That is the structural hole: at a **near-Voc operating point** — every panel
+at low irradiance, so every late afternoon — a collapse is a *current* event
+with no precursor in V_panel, and the setpoint domain has no reachable value
+that responds to it. The cliff memory was in the wrong units.
+
+### The fix
+**Learn the cliff in PWM** (`mppt.c`, `learn_cliff_pwm`). Every collapse the
+guard sees — rescued (`input_dip_events`) or torn down — raises
+`mppt.cliff_pwm_min` to `CHG_CLIFF_PWM_MARGIN` (6 counts, ~270 mA) above
+`input_trace_pwm_from`, the count that actually fell over. It runs *before*
+`sp_learn_cliff`'s early returns: those guard the setpoint estimate, and
+neither says anything about the PWM. Same lifetime as `sp_session_floor_mv`
+— survives bounces and HOLD, released only by `enter_tracking_fresh`, so a
+new day (or any gap that drops `has_sun`) starts unfenced.
+
+**The regulator is fenced by it** (`charger.c`, `pwm_draw_more`). Only the
+branches that draw *more* go through it: the panel-voltage loop, the in-band
+re-acquire, and CV's pull-up. Backoffs, the reverse-current escape and the
+`CHG_BUCK_SETTLE` ramp keep using `pwm_step` — the ceiling bounds current,
+and blocking an escape or an interlock ramp with it would turn a current
+limit into a lockup.
+
+**One count back per `CHG_CLIFF_PWM_RELAX_MS`** (180 s) of collapse-free
+charging, so a haze that lifts without ever dropping `has_sun` is not capped
+at the level it imposed. The relax has to be slower than the drift it fences
+or it simply cancels the ratchet: replaying the session's 13 collapse points
+through the ratchet, one count per 60 s fences off 9 of them, one per 180 s
+fences 12 (the first is unlearnable by construction). (A replay of fixed fall points is arithmetic, not a prediction —
+a fenced loop parks somewhere different and changes the sequence.)
+
+**Warm resume** (`energy_mode.c`) — the reported symptom. Re-arming after a
+stand-down re-derived the entry point from the V_bat LUT every time: `pwm`
+399 → 121 → walk down to 106, ~2.5 s of the ~4.5 s outage spent re-finding
+the number it held two seconds earlier, on every restart. The learned
+ceiling *is* that number, already backed off, so activation now enters there
+instead. Gated on `!seed_invalidated` (the same "same panel, same day" test
+the setpoint resume uses) and bounded by `CHG_RESUME_MAX_ADVANCE` (10 counts)
+so the pre-position still bounds the inrush when `CHG_BUCK_SETTLE` closes
+Q49. A cold boot, a lost `has_sun` or a gap past `MPPT_RESEED_GAP_MS` take
+the LUT path exactly as before.
+
+**Telemetry**: the log line carries `pwmf:` (the live ceiling, 0 = none)
+right after `pwm:`.
+
+### What this does not change
+The ±1200 mV deadband stays. It is why the plant is free to sit 1.16 V above
+the setpoint in the first place, and narrowing it is a separate change with
+its own whipsaw history (v0.21) — the ceiling bounds the damage of the wide
+band without re-opening that question.
+
+### Status
+**Builds clean on both `CHARGER_INPUT_VREG` branches; awaiting bench.**
+Note the capture that motivated this is **v0.30** — v0.31/v0.32 have not been
+on the hardware yet, so the next flash carries three versions of change.
+From a fresh `CHG_ONLY` capture in fading sun:
+1. `pwmf` rises a few counts on each collapse and holds; `pwm` never goes
+   below it.
+2. Repeat teardowns at an identical `pwm` (the 106 × 7 signature) are gone.
+   With v0.32 most collapses should be `INTRACE … RECOVERED` with `CHG`
+   staying `CC`.
+3. After any stand-down, `CHG: OFF -> SETL` enters at ≈`pwmf` rather than at
+   the LUT count, and `Ichg` is back within ~2 s instead of ~4.5 s.
+4. `pwmf` back to 0 after an overnight idle or any `has_sun` drop.
+
+---
+
+# [v0.32] - 10.09.26
+## An input collapse is not input loss: back the draw off first, stand down only if the source doesn't come back
+
+Changed files: `charger.c`, `mppt.c`, `main.c`, `hw_config.h`,
+`system_types.h`, `docs/constants_and_faults.md`, `CHANGELOG.md`
+
+### The problem
+The v0.30 bench result (above) closes the loop on what `charger_input_guard`
+has actually been reacting to. Eighteen `INTRACE` dumps across two sessions,
+all the same shape: steady 11–12 V, one sample of descent, then **pinned at
+V_bat + ~190 mV** — and Voc again 400 ms after the stand-down. That is a live
+panel pushed over its knee, sitting on its current-source side pushing Isc
+through the buck (in dropout) into the cell. It is *forward* current, not the
+reverse-pump condition the guard exists to pre-empt, and it recovers the
+instant the draw drops below Isc — the input cap recharges in milliseconds.
+
+The guard treated every one of them as a removed source: Q49 open, buck off,
+`CHG_INPUT_REARM_MS` (2 s), `CHG_BUCK_SETTLE`, then a 25-count inner-loop
+walk back from the activation pre-position at one count per 400 ms. About
+**15 s of full sun per event**, for a fault that a 10-count backoff would
+have cleared in one 10 ms conversion. v0.28–v0.30 reduced how often the
+tracker *causes* the collapse (probe class: gone) but could do nothing about
+the parked class, because nothing in the pipeline can see a 10 ms event
+through a 640 ms average.
+
+### The fix
+**`charger_input_guard` backs off first** (`charger.c`). On each counted
+sub-margin conversion it raises `pwm` by `CHG_INPUT_RECOVER_STEP` (10 counts
+≈ 450 mA less) and writes the timer directly — the one foreground writer
+besides `apply_pwm`, same clamp, reduction only. If the input is back over
+the margin on the next conversion: **RECOVERED** — charging never stopped,
+`input_dip_events` ticks, `cc_regulate` walks the 10–20 counts back at its
+normal pace (4–8 s at reduced current, not 15 s at zero). If it is still
+under after `CHG_INPUT_LOST_SAMPLES` (3) conversions, that is a removed
+source and `charger_input_stand_down` runs exactly as before.
+
+**MPPT learns from a rescue** (`mppt.c`). A recovered collapse is a cliff
+sighting — the same information a teardown carried — so `sp_learn_cliff`
+now also fires when `input_dip_events` moves (`seen_dip_events`), before the
+tick's `V_panel` is recorded so it uses the pre-dip reading. In HOLD the
+lifted setpoint takes effect the same tick; in TRACKING the running dwell is
+restarted with a fresh baseline. The parked point ratchets up a few hundred
+mV per rescue until it stops falling over — the margin the knee needs,
+learned instead of guessed.
+
+**`INTRACE` says what happened**: `INTRACE @ ms RECOVERED|STANDDOWN|PENDING
+pwm:95->105 dips:N Vpanel_raw: …`. `charger_fast_guard` stand-downs now get
+a trace too.
+
+### What changed about safety
+The guard no longer pre-empts a genuine removal at the voltage crossover.
+The source falls through V_bat during the window and the reverse current
+that follows is caught by `charger_fast_guard` on its first ≥100 mA sample —
+which since v0.26 classifies a dead input as the same clean stand-down, no
+fault. That is the "narrowly lost the race" path the design already
+tolerated on fast unplugs; it is now the only path, so the FETs see one or
+two 10 ms samples of reverse current on every unplug instead of some. The
+backoff does not change that magnitude (in dropout the high side is on
+regardless of the FB target). **Regression check:** unplug the panel under
+a 1 A charge several times — expect `CHG: CC -> OFF` within ~50 ms, an
+`INTRACE … STANDDOWN` line, and **no `0x0100`**. If `FAULT_REVERSE_PUMP`
+appears on unplugs, that is the regression to report.
+
+### Status
+**Builds clean on both `CHARGER_INPUT_VREG` branches; awaiting bench.**
+From a fresh `CHG_ONLY` capture:
+1. `INTRACE … RECOVERED` lines with `CHG` staying `CC` across them and
+   `dips:` counting up; `CC -> OFF` only for the temperature fault or a
+   real unplug.
+2. `spf` steps up on each rescue; after a few, rescues in HOLD stop (the
+   parked point has margin).
+3. `Ichg` dips to roughly half for ~4–8 s per rescue, never to zero.
+4. No `0x0100`. Unplug regression check above.
+
+---
+
+# [v0.31] - 10.09.26
+## Thermistors were biased off VREF, not VDD: every temperature read 11-16 degC hot
+
+Changed files: `SPCBoardAPI.c`, `hw_config.h`, `measurements.c`,
+`fault_mgr.c`, `system_types.h`, `main.c`, `thermal.c` (new), `thermal.h`
+(new), `Debug/subdir_vars.mk`, `Debug/makefile`, `CHANGELOG.md`
+
+### The problem
+Both NTC dividers are biased from the **2.5V_VREF** rail (schematic sheet
+`OUTPUTS_CH`: R51/R52 10K 0603 pull-ups to `2.5V_VREF`, R55 NTC 10K to GND,
+R54/R53 200R to the test points). `get_temperature()` instead passed the
+*measured VDD* — `get_vdd()`, ~3300 mV — as the divider supply:
+
+```c
+float gAdcResultVolts = (adcResultVDD * ADC.VREF*3) / (ADC.max_adc0_value);
+... _convertToTemp(node_mv, gAdcResultVolts, NCP18X);
+```
+
+`Rt = 10k * V / (Vsupply - V)`, so an over-stated supply under-states Rt, and
+an under-stated resistance on an NTC reads hot. The error is +11 to +16 degC
+across the working range:
+
+| ADC count | reported (VDD 3300) | actual (VREF 2500) | error |
+|---|---|---|---|
+| 1000 | 69 degC | 57 degC | +12 |
+| 1400 | 55 degC | 43 degC | +12 |
+| 1800 | 44 degC | 31 degC | +13 |
+| 2200 | 35 degC | 21 degC | +14 |
+
+Re-reading `serial_20260910_155320.log` through the corrected math:
+
+| logged | actual | |
+|---|---|---|
+| board 47 | 34 degC | session start |
+| board 61 | 49 degC | where OVERTEMP latched |
+| board 70 | 58 degC | session peak |
+| pack 46 | 36 degC | where TEMP_CHARGE_BLOCK latched |
+
+So **both thermal faults in that session were false**. The board peaked at
+~58 degC against a 60 degC limit and the pack at ~36 degC against 45 degC.
+Neither should have tripped.
+
+Because the bias rail *is* the ADC reference rail, the corrected conversion
+is ratiometric: a real VREF error now cancels instead of being injected as a
+temperature offset. That cancellation is why the divider was designed off
+VREF in the first place; feeding it VDD threw it away.
+
+### Also fixed in the same path
+
+**Unfiltered samples.** `get_temperature()` read `ADC.AdcNResult[]` — a
+single raw conversion — while every other channel on the board reads
+`avg_readings[]` (64-sample moving average). One noisy sample was enough to
+latch OVERTEMP, which sheds lamps, USB, output and charging together. Now
+reads `avg_readings[3]` (TEMP3) and `avg_readings[14]` (TEMP1); those entries
+were already being maintained and simply were not used.
+
+**No plausibility check.** `_convertToTemp` clamps to the ends of the lookup
+table, so a *shorted* NTC reported the hot end of the table (instant,
+unrecoverable OVERTEMP) and an *open* one the cold end (permanent
+TEMP_CHARGE_BLOCK) — neither distinguishable from a real reading. Readings
+outside `[THERMISTOR_ADC_MIN, THERMISTOR_ADC_MAX]` now return
+`TEMP_INVALID_C`; `measurements_update` holds the last good value and, after
+`TEMP_SENSOR_FAIL_TICKS` (3 s), clears `ctx->temp_sensor_ok`.
+
+The response to a dead sensor is deliberately asymmetric: it blocks
+**charging** (a cell of unknown temperature must not be charged) but does not
+raise OVERTEMP, so a failed 10K resistor cannot black out the user's lamp.
+`fault_detect`'s thermal check is now gated on `temp_sensor_ok`.
+
+**Charge-block hysteresis was symmetric.** `TEMP_HYSTERESIS_C` 10 degC on
+both bounds meant one 46 degC sample locked charging out until the pack fell
+to 35 degC — in an enclosure on a sunny day, the rest of the afternoon. The
+log shows exactly that: TEMP_CHARGE_BLOCK latched at t=2658 s and never
+cleared. Hot side is now `TEMP_HYSTERESIS_HOT_C` = 5 degC (45 -> resume 40);
+the cold side keeps 10 degC.
+
+### New: thermal foldback (`thermal.c`, pipeline step 4b)
+FAULT_OVERTEMP is a cliff — it sheds every rail at once and needs a 10 degC
+recovery. With the calibration fixed the board reaches ~58 degC under a
+sustained 2.7 A lamp load and *stays* there, which is 2 degC of permanent
+margin. Foldback is the graceful stage underneath: above
+`THERMAL_FOLDBACK_START_C` (55) it walks `ctx->thermal.derate_pct` down 5 %
+per 4 s to a floor of 25 %, and recovers below `THERMAL_FOLDBACK_RESUME_C`
+(50). The 5 degC deadband stops it hunting against a plant whose time
+constant is minutes.
+
+`derate_pct` multiplies the *requested LED current* in `lamp_drive_ma()`; it
+never touches `ctx->lamp_level[]`. So the user's brightness choice survives
+the event, the buttons keep working while derated, and
+`led_boost_follow_lamps()` still sees a lit lamp as lit. The result is
+clamped to the lowest non-zero rung — foldback dims, it never switches a lamp
+off behind the user.
+
+Lamps are the only load the firmware can modulate: USB cannot be derated (the
+AP2151 switches cannot be pulse-gated) and the charger has its own limits. If
+the heat is coming from USB, foldback runs to its floor with no effect and
+the hard fault remains the backstop.
+
+Two stand-downs: a live OVERTEMP resets the derate to 100 % (the rails are
+already shed, nothing left to trade), and so does `!temp_sensor_ok` (never
+dim on a reading the measurement layer has disowned).
+
+### Telemetry
+Two new fields on the log line: `tsens:` (both NTCs plausible) and `derate:`
+(foldback multiplier). Foldback steps also print
+`THERM: derate 85% @ 58C @ <ms>`, printed only on a change.
+
+### NOT changed, and why
+`BAT_TEMP_MAX_CHARGE_C` (45), `BAT_TEMP_MIN_CHARGE_C` (0),
+`BAT_TEMP_MAX_DISCHARGE_C` (60) and `BOARD_TEMP_MAX_C` (60) are untouched.
+The first three are LiFePO4 datasheet ratings, not tuning knobs, and with the
+sensor corrected the board limit means what it says. The readings were wrong,
+not the limits.
+
+### Open, needs bench
+`serial_20260910_155320.log` shows OVERTEMP latching at t=1680 s and the load
+**continuing to flow** for the next 27 minutes: `Idsg` held 2708-2766 mA,
+`Vout` stayed at Vbat-184 mV (a conducting FET at 2.7 A) and `Vusb1` stayed
+pinned at 5208 mV. `fault_take_action(FAULT_OVERTEMP)` calls
+`disable_output_switch()` / `disable_usb_boost()` / `disable_led_boost()`, EM
+stayed CHG+LOAD the whole time (so no entry action re-armed anything),
+`fault_just_cleared` requires a fully clean `fault.code`, and the only other
+`enable_output_switch()` call sites are the energy-mode entry actions and
+boot. The firmware path holds up under reading; the rails did not come down.
+**Scope EN_OUTPUT / EN_USB / EN_LED at the trip.** Until that is understood,
+the hard thermal cutoff cannot be relied on and foldback is the only
+functioning thermal response.
+
+# [v0.30] - 10.09.26
+## MPPT learns the cliff from a teardown and keeps it; Voc-relative setpoint floor
+
+Changed files: `mppt.c`, `main.c`, `energy_mode.c`, `hw_config.h`,
+`system_types.h`, `CHANGELOG.md`
+
+### The problem
+The v0.29 bench result (above) shows the remaining teardowns are MPPT's own
+doing: it probes the setpoint downward, the inner loop obediently walks
+`pwm` down one count per 400 ms toward a band top that is below the knee,
+and the panel falls over mid-dwell. At 5 Hz:
+
+```
+355.1  Vpanel 11791  Ppanel 3537  Ichg 1023  pwm 74  sp 9054  TRK CC
+356.5  Vpanel 11472  Ppanel 3854  Ichg 1082  pwm 70  sp 9054  TRK CC
+356.9  Vpanel 11263  Ppanel 4009  Ichg 1079  pwm 69  sp 8054  TRK CC
+357.1  Vpanel 10373  Ppanel 3340  Ichg    0  pwm 399 OFF OFF     ← cliff
+```
+
+Power was still *rising* toward the 4136 mW peak when it went over, so
+P&O had every reason to keep going. Three things let this repeat forever:
+
+1. **The tracker never hears about the collapse.** Both cliff detectors —
+   the collapse branch (`V_panel < PANEL_SAFETY_MV`) and the dip classifier
+   (`V_panel < sp − deadband − 300`) — read the 640 ms average. The
+   collapse reaches V_bat in 10–20 ms and `charger_input_guard` tears the
+   region down ~40 ms in, so the average never gets close: minimum averaged
+   `Vpanel` in the session was 10 373, and the collapse branch fired **zero
+   times** in 14 minutes. The session floor that exists precisely to stop
+   re-probing a failed level was never raised.
+2. **What little it learned was erased on every entry.** `tracking_common()`
+   reset `sp_session_floor_mv` to `MPPT_SP_MIN_MV` on every TRACKING entry —
+   and a teardown ends the session, so the bounce re-entry (v0.28 Fix 1's
+   whole point was to make that a resume) came back with a clean slate and
+   probed straight back down. Bursts of 3–5 teardowns 20 s apart.
+3. **The absolute floor is a safety-ordering bound, not a plausibility one.**
+   `MPPT_SP_MIN_MV` = 6500 mV keeps the band's low edge above
+   `PANEL_SAFETY_MV`; it says nothing about where an MPP could be. The
+   tracker reached it on a panel whose MPP is 11 850 mV.
+
+### The fix
+**`sp_learn_cliff()` (`mppt.c`).** When the region goes down and
+`rearm_block_ms` is in the future — energy_mode stamps that at step 5 of the
+same tick, and only for an input-loss stand-down — the panel just collapsed
+under the tracker. Learn the level from the *plant*, not the setpoint: with a
+±1200 mV band the setpoint says little about where the panel actually sat,
+but the last clean averaged `V_panel` does. Set the floor so the band top
+lands `MPPT_SP_CLIFF_MARGIN_MV` (250) above that voltage, lift `sp` to the
+floor, point the search up. "Clean" = the tick-to-tick fall was under
+`MPPT_SP_VPANEL_DROP_MV` (300); a collapsed 10 ms sample drags the 64-deep
+average down 125–190 mV, honest regulation moves it ~50 mV per tick, so
+this rejects readings that already contain the fall. The floor is capped at
+the Voc ceiling — a collapse from up there (sun dimmed under a parked point)
+is not a setpoint problem, and a floor above the ceiling would park the loop
+at open circuit drawing nothing. If the first estimate is still under the
+knee (the average lags the real voltage by ~one PWM count), the next
+teardown ratchets it once more; that converges in one or two instead of
+never.
+
+**The floor belongs to the learned panel, not the session.** The reset moved
+out of `tracking_common()` into `enter_tracking_fresh()`, next to the Voc
+reset it already does. It now survives input-loss bounces *and* HOLD
+re-probes; only a fresh seed (sun lost, or `MPPT_RESEED_GAP_MS`) releases
+it. `ctx_init()` seeds it to `MPPT_SP_MIN_MV` since nothing else does any
+more. Known trade-off: after a light cloud lowers the knee, the tracker
+stays fenced a few hundred mV above the new MPP until the next fresh seed —
+a few percent under a cloud, against 12 s of full sun per teardown.
+
+**`MPPT_SP_FLOOR_PCT` (80).** `sp_clamp()` floors the setpoint at
+`0.80·Voc − deadband` once a credible Voc exists, i.e. the realised
+operating point cannot be commanded below 0.80·Voc. No crystalline-silicon
+MPP sits below ~0.7·Voc; 80 fences a textbook 0.76 panel ~4 % above its MPP
+(stable, a few % of power) and lifts this panel's floor from 6500 to
+~9260 mV. `MPPT_SP_MIN_MV` still applies underneath.
+
+**Telemetry: `spf:` column** — the learned floor, between `sp:` and `dips:`.
+The acceptance test for this change is that `spf` steps up on a teardown
+and `sp` never goes below it afterwards.
+
+### What this does not fix
+The parked-and-dimming class (v0.29 bench result, last bullet). A floor
+learned from such a teardown lands above where the panel sat, so the resume
+draws less — a reasonable response to "the sun dimmed" — but nothing here
+prevents the collapse itself. If the teardown rate stays well above single
+digits with `spf` visibly holding, that class is what is left, and the
+answer is a raw-sample backoff in the inner loop, not more setpoint logic.
+
+### Status
+**Builds clean on both `CHARGER_INPUT_VREG` branches; awaiting bench.**
+Verify from a fresh `CHG_ONLY` capture:
+1. `spf` rises on (most) `CHG: CC -> OFF` events and `sp ≥ spf` at all times
+   until the next `MPPT: OFF -> TRK` with a fresh seed.
+2. Teardowns in tight bursts (< 60 s apart) disappear; the residual rate is
+   the dimming class only.
+3. `sp` never goes below ~0.80·Voc − 1200 (≈ 9260 on the 13.3 V panel).
+4. No fault codes; `dips:` stays 0 (a non-zero value would be the first
+   observed near-miss and worth an INTRACE look).
+5. Mean `Ppanel` continues toward ~3500 mW; MPPT `TRK` power approaches
+   `HLD` power.
+
+### Bench result (`serial_20260910_165000.log`, panel connected 162 s → TEMP_CHARGE_BLOCK at 307 s)
+145 s of charging, 4 `CC -> OFF`: one is the temperature fault (same tick,
+no `INTRACE`, ignore), leaving **3 real collapses**.
+
+- **The floor works mechanically.** `spf` 6500 → 10533 → 10687 → 10929,
+  `sp ≥ spf` at every sample. Only the *first* collapse was a downward
+  probe (`sp` 9562 — nothing learned yet, the unavoidable learning event);
+  no session after it probed below the floor. **The probe class is gone.**
+- **The other two are parked in HOLD** — `pwm 95/96`, `Vpanel` 11 637 /
+  11 879 steady or slightly *rising*, `Ipanel` flat at ~285 / ~255 mA, no
+  dimming, no precursor in any averaged channel, then pinned at V_bat + 190
+  mV within one 10 ms sample. `INTRACE` for both: steady 11.6–11.9 V, one
+  sample of descent, V_bat. Not a shadow slow enough to see; either a
+  transient one or the input going unstable where the panel's impedance
+  peaks (the knee). No setpoint logic can pre-empt a 10 ms event.
+- Every one of the 18 traces captured across v0.29/v0.30 recovers to Voc
+  within 400 ms of the stand-down. **These are live panels over their knee,
+  not removed sources** — and the guard cannot tell the difference. That is
+  what v0.32 fixes.
+
+---
+
+# [v0.29] - 10.09.26
+## Stop the charger teardown limit cycle: debounce the input guard, stop re-seeding MPPT after a bounce, fix the FOCV fraction
+
+Changed files: `charger.c`, `mppt.c`, `main.c`, `hw_config.h`,
+`system_types.h`, `SPCBoardAPI.c`, `SPCBoardAPI.h`, `CHANGELOG.md`
+
+Ships in the same binary as the still-unverified v0.28 log-rate work; the
+banner is v0.29 so a capture identifies which of the two it came from.
+
+### The problem
+Two bench captures in `EM:CHG_ONLY` sun, both with the charger tearing itself
+down over and over while nothing was actually wrong:
+
+| | `spc20_f027_test3_solarissue.txt` (09.09) | `serial_20260910_144840.log` (10.09) |
+|---|---|---|
+| span | 100.9 min | 47.7 min |
+| `CHG: CC -> OFF` | 2030 (1207/hr) | 57 (72/hr) |
+| OFF dwell, median | 2049 ms | 2044 ms |
+| min **averaged** `Vpanel` | 11021 mV | 10989 mV |
+| samples under `PANEL_SAFETY_MV` (4800) | 0 / 6057 | 0 / 2533 |
+| `fault:` during the events | 0000 | 0000 |
+
+The 2 s dwell is exactly `CHG_INPUT_REARM_MS` and no fault ever latched, so
+every one of these is `charger_input_stand_down()` reached from
+`charger_input_guard()` — the *instantaneous* `V_panel < V_bat +
+CHG_INPUT_LOST_MARGIN_MV` test. The averaged panel voltage never went below
+11.0 V in either capture, so `panel_safety_backoff` (the intended graceful
+response at 4800 mV) is structurally blind to the event. Moving
+`PANEL_SAFETY_MV` cannot help; it cannot see it.
+
+Three separate defects stack up here.
+
+**1. Every resumption threw away the learned MPP.** `enter_disabled()`
+deliberately preserves `vreg_setpoint_mv` and `panel_voc_mv` across a
+teardown — and then the `MPPT_DISABLED` entry called
+`enter_tracking_fresh()` unconditionally, which sets `voc_pending = true`
+and `panel_voc_mv = 0`. The preservation was undone one tick later, every
+time. In the 10.09 capture 30 of 51 teardowns dropped `sp` from ~11.5 V to
+~8.65 V (= 0.76·Voc − deadband) within 10 s, and the median time back to
+≥850 mA was ~12.4 s — six times what the 2 s re-arm block itself costs.
+Self-perpetuating, too: while `sp` sits ~3 V below the knee the inner loop is
+chasing a target in the constant-current region and walks the panel off the
+cliff again, which is why the teardowns arrive in tight bursts rather than
+singly.
+
+**2. The input guard acted on one unconfirmed conversion.**
+`charger_input_present()` reads `get_input_voltage_now()`, i.e. raw
+`ADC.Adc1Result[0]`, not the 64-sample average. Nothing corroborated it, and a
+false positive costs a full teardown plus the re-arm block plus the MPPT
+re-climb. On the steady-state teardowns (`sp` and `pwm` frozen, operating
+point dead still for 25+ s at Vpanel 11917 / Ppanel 3492 / Ichg 940 / pwm 74)
+there is no precursor in *any* averaged channel, and the average moves ~154 mV
+across the teardown second — almost exactly the 11780/64 = 184 mV that one
+zeroed sample in a 64-deep window would explain. Everything else in this
+firmware debounces a decision this expensive (`has_sun` 3x/30x, the dusk path
+80x, every fault with hysteresis); this did not.
+
+**3. `MPPT_SP_FRACTION_PCT` was 76 on a panel that measures 0.87-0.89.** The
+seed is `k·Voc − PANEL_VREG_DEADBAND_MV` and the inner loop parks at the band
+TOP = `k·Voc`, so k is the voltage the plant is actually driven to. Measured
+MPP/Voc was 0.87 (09.09) and 0.89 (10.09, Voc 13307 mV, best point 11846 mV at
+4134 mW) under two different irradiance conditions. 0.76·Voc lands ~1.5 V past
+the knee where the buck behaves as a constant-power load and the operating
+point cannot be held. On 09.09 that alone was the whole failure: `pwm` stepped
+down one count per `PANEL_VREG_INTERVAL_MS` until the panel fell over, 2030
+times.
+
+### The fix
+
+**MPPT re-seeds only after a real gap** (`mppt.c`, `system_types.h`,
+`hw_config.h`). `enter_disabled()` now stamps `disabled_since_ms` and clears
+`seed_invalidated`; while the region is down, `mppt_update()` sets
+`seed_invalidated` if `has_sun` clears or the gap passes the new
+`MPPT_RESEED_GAP_MS` (60 s). The `MPPT_DISABLED` entry then picks
+`enter_tracking_fresh()` (cold boot, new panel, long gap) or
+`enter_tracking_reprobe()` (a bounce — keeps the setpoint and Voc, restarts at
+`MPPT_SP_STEP_MIN_MV`), which is exactly what that function already existed to
+do for HOLD re-probes. The discriminator is the one the design already had:
+`CHG_INPUT_REARM_MS`'s own sizing note says a genuine disconnect is resolved by
+`has_sun` clearing in 1.5 s, and a bounce never holds `V_panel` down that long.
+`panel_voc_mv < PANEL_MIN_MV` still forces the fresh path, so a stale flag can
+never route a boot with no credible Voc into a path that has neither a real
+setpoint nor a setpoint ceiling. `ctx_init()` seeds `seed_invalidated = true`.
+
+**The input guard is debounced over `CHG_INPUT_LOST_SAMPLES` (3) distinct
+conversions** (`charger.c`, `SPCBoardAPI.c/.h`, `system_types.h`,
+`hw_config.h`). The subtlety that makes this non-trivial:
+`charger_input_guard()` runs from the free-running super loop, thousands of
+times per second, against a value refreshed every `TICK_ADC_MS` (10 ms) by
+`SysTick_Handler`. A plain `if (++count >= N)` reaches N within microseconds
+off one stale sample and debounces nothing. So the counter is gated on a new
+`adc_sample_seq()` — the existing `num_reads` harvest counter, now `volatile`
+and exported — and advances at most once per conversion. One good sample
+re-arms. `num_reads++` also moved to the *end* of `read_adc_values()` so the
+sequence number is only published once the whole conversion set is coherent.
+
+3 samples = 30 ms of added exposure on a genuine collapse, which is acceptable
+because this guard was never the guaranteed protection: `charger_fast_guard`
+catches the reverse current that follows and its DEAD-input branch reaches the
+same stand-down. `charger_input_stand_down()` is deliberately **not**
+debounced — `charger_fast_guard` also calls it, and that call is already
+corroborated by measured reverse current.
+
+**`MPPT_SP_FRACTION_PCT` 76 -> 87.** Just under both measurements. It is only
+the starting point — P&O hill-climbs from there — and with the re-seed fix it
+now runs at cold boot rather than once per teardown.
+
+**Instrumentation for the remaining question.** The steady-state teardowns are
+still unexplained: either a real 10-20 ms dip on the panel input (connector,
+input cap, ringing) or a single bad conversion. `read_adc_values()` now keeps a
+16-deep ring of raw `V_PANEL` (`ADC_PANEL_TRACE_DEPTH`, 160 ms of history);
+`charger_input_guard()` snapshots it into the context when it trips and
+`main.c` prints it on the next tick as an `INTRACE` line next to the
+`CHG: CC -> OFF` it explains. An isolated outlier between healthy ~12 V
+neighbours means a bad conversion and the debounce is the complete answer; a
+smooth descent over 3-4 samples means a real electrical event and the hardware
+needs a look. The telemetry line gains a `dips:` column counting sub-margin
+dips that did *not* reach the threshold — i.e. the teardowns this change
+prevented.
+
+### Deliberately not in scope
+`PANEL_VREG_DEADBAND_MV` is +/-1200 mV, but on the 10.09 panel the entire
+usable region between the knee (11.9 V) and open circuit (13.3 V) is 1.4 V —
+the band is wider than the region, so "in band" means no restoring force at
+all. That is arguably a bigger design issue than the fraction, but narrowing it
+risks the whipsaw the wide band was chosen to prevent (see the charge-on/off
+limit cycle entry under v0.21). Raise it separately once these are bench-
+verified.
+
+### Status
+**Builds clean on both `CHARGER_INPUT_VREG` branches; awaiting bench.**
+Acceptance criteria from a fresh `CHG_ONLY` capture:
+1. `CHG: CC -> OFF` drops from ~72/hr to single digits per hour.
+2. After any teardown that still happens, `sp` stays within ~500 mV of its
+   pre-teardown value for the next 10 s (was 30/51 failing).
+3. Median time back to >=850 mA falls from ~12.4 s to ~2-3 s.
+4. No new `fault:` codes — in particular `0x0100` (`FAULT_REVERSE_PUMP`) must
+   not become more frequent. If it does, the debounce window is letting real
+   collapses through; report it rather than reverting the debounce.
+5. Mean `Ppanel` rises toward the ~3500 mW steady-state value.
+6. `INTRACE` lines answer the bad-conversion vs. real-dip question, and `dips:`
+   shows how many teardowns the debounce absorbed.
+
+Regression checks: a genuine panel unplug must still isolate within ~30 ms and
+leave `CHARGE_ONLY` via `has_sun` clearing without latching a fault; a cold
+boot with no learned Voc must still seed from FOCV.
+
+### Bench result (`serial_20260910_155320.log`, 14.1 min, cold boot, v0.29)
+| # | criterion | result |
+|---|---|---|
+| 1 | teardowns to single digits/hr | **63.8/hr** (15 in 14.1 min; was 72) — FAIL |
+| 2 | `sp` kept across a teardown | **14/15** (was 21/51) — PASS |
+| 3 | recovery to ≥850 mA in 2–3 s | median **11.6 s** (was 12.4) — FAIL |
+| 4 | no new faults | `fault:0000` all session, history 0000 — PASS |
+| 5 | mean `Ppanel` toward 3500 | **2932 mW** (was 2073); CC duty 63 → **95.5 %**, mean `Ichg` 512 → **816 mA** |
+
+Fix 1 works exactly as designed and Fix 3 moved real energy. The teardown
+rate did not move because the diagnosis of *what trips the guard* was wrong:
+
+- **`dips:0` for the whole session** — not one sub-margin dip recovered before
+  the threshold. All 15 `INTRACE` dumps look alike: steady ~11–12 V, one
+  intermediate sample, then **pinned at ~3600 mV = V_bat** for the rest of
+  the window. That is a real, sustained panel collapse with a 10–20 ms fall,
+  not a bad conversion. The "184 mV ≈ one zeroed sample" arithmetic was a
+  coincidence: the average barely moves because the guard stands the region
+  down ~40 ms after the fall, so only a few collapsed samples ever enter the
+  640 ms window. **Fix 2 guards a failure mode that has never been observed
+  on this hardware.** It is harmless (criterion 4) and stays as insurance.
+- The debounce also does not trip on the 3rd conversion as its comment
+  claimed: trips took **3–7 conversions, median 4**, because the counter
+  advances per *observed* sample and the blocking 5 Hz telemetry TX hides
+  whole conversions from the foreground. Counting elapsed conversions instead
+  would be worse (one reading after a TX block would carry several samples'
+  credit and trip alone). Comment corrected; logic unchanged.
+- **The real trigger is MPPT probing the setpoint down past the knee** —
+  13 of 15 teardowns followed a downward `sp` step within 6 s (median
+  1.6 s), `sp` ranged **6500 … 11554 mV** against a measured MPP of 11 850,
+  and the tracker sat at the absolute floor `MPPT_SP_MIN_MV` at one point.
+  MPPT `HLD` averaged 3342 mW / 938 mA; `TRK` 2701 mW / 757 mA; 12 of 15
+  teardowns fired in `TRK`. Tracking is the destabiliser. See v0.30.
+- A third class exists that no setpoint logic can touch: parked in `HLD`
+  (`pwm 75`, `sp 11304`, `Vpanel 11934` steady for 25 s), `Ichg` drifting
+  960 → 872 mA as the sun dims, then the panel falls over with zero
+  firmware action. Only a fast inner-loop backoff on the raw sample could
+  pre-empt that; out of scope.
+
+---
+
+# [v0.28] - 10.09.26
+## Selectable UART telemetry rate: ctx.log_mode (off / 1 Hz / 5 Hz), default 5 Hz
+
+Changed files: `hw_config.h`, `system_types.h`, `main.c`,
+`docs/flashing_and_uart_debug.md`, `docs/constants_and_faults.md`, `CHANGELOG.md`
+
+### The problem
+The fixed 1 s log tick undersamples the events it is being used to chase. The
+teardown limit cycle in `spc20_f027_test3_solarissue.txt` has a median
+`CHG: CC -> OFF` dwell of 2049 ms — two samples per cycle — and
+`charger_input_guard()` trips on an *instantaneous* `V_panel` reading the log
+can miss entirely between lines. Anything shorter than a second (the guard trip,
+the dip that caused it, one `PANEL_VREG_INTERVAL_MS` step) is aliased away.
+
+A fixed *fast* tick is not the answer either: a blocking ~27 ms TX five times a
+second is not what you want during an overnight capture, and there is no reason
+to pay it at all when nobody is reading the port.
+
+### The fix
+`ctx->log_mode` selects the rate — `LOG_MODE_OFF` (0) / `LOG_MODE_1HZ` (1) /
+`LOG_MODE_FAST` (2, 200 ms), seeded from `LOG_MODE_DEFAULT` (currently FAST) by
+`ctx_init()`. `log_interval_ms()` in `main.c` maps mode to interval and the
+super-loop re-reads it every pass, so the field is live-writable from a CCS
+breakpoint (Expressions -> `ctx.log_mode`) without a reflash. It is `volatile`
+for exactly that reason: a debugger write is outside what the compiler can see.
+
+Two deliberate details:
+
+- **OFF silences state-transition lines too**, not just telemetry. Those are
+  also blocking TX, so leaving them in would mean "off" still parks the loop
+  ~27 ms at every FSM edge — the one thing OFF exists to prevent. The boot
+  banner and the HardFault dump stay unconditional.
+- **An unrecognised mode logs nothing** (`log_interval_ms()` defaults to 0), so
+  a fat-fingered debugger write goes quiet rather than picking some rate.
+
+Switching OFF -> on leaves `last_log` stale, so the first line lands on the next
+pass — which is the wanted behaviour when you flip it on to watch something.
+
+`TICK_LOG_MS` is gone, replaced by `TICK_LOG_1HZ_MS` / `TICK_LOG_FAST_MS`.
+Boot banner bumped to v0.28 so a capture identifies the build it came from.
+
+### Cost, and why 200 ms is the floor
+A line is ~300 chars (315 max across the captured logs) and `printToUART()`
+blocks, so at 115200 8N1 each line parks the super-loop ~27 ms: ~14 % of wall
+time at FAST, ~3 % at 1HZ, zero at OFF. What that touches:
+
+- The 50 ms pipeline tick is *delayed*, never skipped or bunched — `last_main =
+  now` reloads from the actual service time, so there is no catch-up burst.
+- The filter-pacing constants (`PANEL_VREG_INTERVAL_MS` 400,
+  `CC_DOWNSTEP_INTERVAL_MS` 300) are `>=` tests, so jitter can only stretch
+  them, never shorten them. They exist to not outrun the 64-sample ADC average;
+  this cannot make them outrun it.
+- ADC harvest runs in the SysTick ISR, which preempts the blocking TX.
+- `charger_input_guard()` / `charger_fast_guard()` / `bat_wake_fast_guard()` at
+  the top of the loop can be delayed by one line's TX. Worst-case guard latency
+  is the same ~27 ms in every non-OFF mode — FAST just reaches it more often.
+
+Do not add a faster mode at this baud: below ~150 ms the TX stops fitting
+between lines and the loop lives inside `printToUART()`. That needs
+`UART1.targetBaudRate` raised in `SPC_20.syscfg` (460800 -> ~7 ms/line, room for
+20 Hz) and the terminal changed to match.
+
+**Status: builds clean, awaiting bench.** Verify: (1) default boot gives 5
+lines/s by the `ms:` column and the banner reads v0.28; (2) writing
+`ctx.log_mode = 1` then `0` at a breakpoint changes the rate and then silences
+the port, transitions included, with the unit still running; (3) a CC session
+still regulates normally at FAST — the added loop jitter is the only regression
+risk here.
+
+---
+
+# [v0.27] - 31.07.26
+## Sleep current: shed OUTPUT_EN + USB boost for the full STANDBY0 window
+
+Changed files: `main.c`, `CHANGELOG.md`
+
+### The problem
+Bench measured ~4 mA during STANDBY0 sleep — nowhere near the uA class
+STANDBY0 should cost. `system_sleep()` only ever powered down the LED boost,
+LED bar, and the measurement front-end; OUTPUT_EN and the USB boost (MIC2876 +
+2x AP2151 load switches) were left exactly as the entered state set them.
+`enter_idle()`, `enter_charge_only()`, and `enter_charge_and_load()` all turn
+both on deliberately, so a plugged-in load can be sensed — but a boost
+converter's regulation overhead is easily mA-class next to STANDBY0's own
+draw, and that's what was actually being measured.
+
+`enter_safe_mode()` already sheds both rails on entry, so this only ever
+applied to sleep entered from IDLE.
+
+### The fix
+`system_sleep()` now calls `disable_output_switch()` + `disable_usb_boost()`
+in its power-down section, next to the existing LED/measurement shutdown.
+Restoring them needed no new code: `energy_mode_reapply_entry()` on full wake
+already re-runs the current state's entry actions, which already set
+OUTPUT_EN and USB_EN correctly per state (on for IDLE, off for SAFE_MODE).
+
+The now-dead `SLEEP_WAKE_LOAD` periodic wake-check is removed: with the rail
+off, I_dsg reads dead regardless of what's plugged in, so it could never fire.
+
+### Traded away
+A USB device plugged in while the unit is already asleep now gets no power
+and isn't sensed until something else triggers a full wake (button, sun,
+battery threshold) — previously it charged immediately and the next 10 s
+wake-check noticed the draw. Once something does wake the unit,
+`enter_idle()`'s `enable_usb_boost()` is a cold restart of both AP2151s: the
+2026-07-08 revert established that they cannot cleanly restart into a load
+that's already drawing (stalls ~0.9 V; preloading the boost and only pulsing
+the switches didn't help either). The specific scenario this change newly
+exposes — something plugged in *during* sleep, then a later unrelated wake —
+has not been bench-tested.
+
+**Status: builds clean, awaiting bench.** Verify in order: (1) STANDBY0 draw
+actually drops to uA-class on a meter with nothing plugged in; (2) a normal
+wake (button/sun/vbat) with nothing plugged in restores USB/output cleanly;
+(3) the open risk — plug a USB load in while asleep, then trigger an
+unrelated wake, and confirm the AP2151s come back instead of stalling at
+~0.9 V. If (3) fails, this needs a hardware fix, not another firmware retry —
+the same failure already survived one firmware-only attempt.
+
+---
+
+# [v0.26] - 30.07.26
+## Input loss is no longer a fault: preventive stand-down, dedicated reverse-pump bit, charger re-arm path
+
+Changed files: `charger.c`, `charger.h`, `energy_mode.c`, `fault_mgr.c`, `fault_mgr.h`, `hw_config.h`, `main.c`, `system_types.h`, `docs/fault_recovery.md`
+
+### The bug
+Switching the bench PSU off mid-charge latched `fault:0004`
+(`FAULT_OVERCURRENT_CHG`) and tore the session down. The code was misleading:
+the third teardown in `serial_20260730_193108.log` latched it at `Ichg:664`,
+nowhere near `FAULT_OVERCURRENT_CHG_MA` (2200). `charger_fast_guard` was
+reusing that bit for **reverse current**, and killing the input is exactly what
+produces reverse current — with the buck at deep duty (pwm 31 ≈ 92 %) and Q49
+closed, the cell back-feeds into the collapsing input node.
+
+The guard was also the only thing fast enough to notice. It runs in the
+foreground on instantaneous conversions; everything else that could have shut
+down gracefully reads the 64-sample average, which still showed `Vpanel:4000` a
+full second after the rail was gone, and `has_sun` needs 30 ticks (1.5 s) below
+`PANEL_MIN_CLEAR_MV`. So the guard won the race on every disconnect.
+
+### `charger_input_guard` — trip on the voltage, not the current
+New foreground guard, called before `charger_fast_guard`, active only while the
+charge path is *connected* (PRECHARGE/CC/CV — `CHG_BUCK_SETTLE` holds VCHG below
+V_bat by design). It stands the charger down when instantaneous `V_panel` falls
+below `V_bat + CHG_INPUT_LOST_MARGIN_MV` (400 mV): Q49 opens **first**, so the
+cell's path to the dying rail is cut rather than the reverse current being
+caught after the fact.
+
+Judged on panel voltage, not VCHG: at 2 A the whole VCHG-to-V_bat separation is
+~44 mV (bench: `Vbat:3570 Vchg:3614`), unusable from a single conversion, while
+`V_panel` sits ~9 V clear.
+
+The margin is **sized to stay below `PANEL_SAFETY_MV`** (4800 mV). A
+sagging-but-present panel belongs to `panel_safety_backoff`, which steps demand
+down and recovers; a guard that could fire in that band would answer an ordinary
+over-draw with a full teardown and re-arm, reintroducing the charge-on/off limit
+cycle v0.21 fixed. 400 mV puts the trip at 1.9–4.05 V across the cell range,
+always clear of that floor, and correct at every cell voltage because the
+back-feed crossover tracks V_bat (`V_panel ≈ V_bat`) — the FB `pwm` value is the
+buck's *target voltage*, not its switching duty, which is internally
+`VCHG/V_panel ≈ 0.28` while charging. Staying under the backoff floor means the
+trip lands near the crossover rather than well above it, so it pre-empts the
+reversal only sometimes; it always bounds exposure to one 10 ms sample, with
+`charger_fast_guard` as the guaranteed backstop.
+
+The guard sets `charger.input_lost_pending` rather than touching the FSM;
+`energy_mode_update` calls the existing `deactivate_charger_region()` on the next
+tick. That preserves `mppt_limit_ma` across the bounce (as every normal mode exit
+does) and keeps the `CHG: … -> OFF` line in the log — `main.c` snapshots the old
+charger state at the *start* of the tick, so a state change made between ticks
+would compare equal to itself and never be reported.
+
+### `FAULT_REVERSE_PUMP` (bit 8) — the case that still deserves a latch
+Reverse current with the input **live** is a real control failure: the cell is
+pushed back into a working panel, which can drive `V_panel` above open circuit
+toward the TPS564247's ~17 V ceiling (May trace: −1010 mA at 14.1 V on a 13 V
+panel). That now latches its own bit. `charger_fast_guard` re-tests input
+presence and routes a dead-input trip to the clean stand-down instead, covering
+the case where the input dies inside one 10 ms conversion interval.
+
+Registered at all five sites the table-driven fault subsystem requires —
+`fault_take_action`, `fault_recovery_met`, `all_bits[]`, `CHG_FAULT_BLOCK_MASK`,
+and the header docs. Missing any one fails silently: the recovery default is
+`return false` (latched until reboot) and the action default is `break` (no
+containment at all).
+
+### `charger_rearm_due` — replacing the restart timer the fault was providing
+`charger_update()` hard-returns while `CHG_INACTIVE` ("energy_mode owns
+activation") and energy_mode only writes GPIOs on a transition, so the **only**
+re-arm path was the `fault.code` falling edge. The latched fault was doing
+double duty as a 10 s restart timer; removing it from ordinary input loss would
+have stranded the charger inactive inside a `CHARGE_ONLY` that never
+transitions. A full disconnect self-heals via `has_sun`, but a dropout shorter
+than 1.5 s does not — charging would have stopped silently and permanently.
+
+The no-transition branch now also re-applies entry actions when the mode still
+calls for charging, the charger is `CHG_INACTIVE`, `fault.code` is clean, sun is
+present, and `CHG_INPUT_REARM_MS` (2000 ms) has elapsed since the stand-down.
+Conditions mirror the fault-clear path deliberately, and
+`activate_charger_region()` self-guards on `CHG_INACTIVE`, so the call is a
+no-op once the charger is running again.
+
+### Net effect
+Unplugging the panel, flipping the PSU, a blown input fuse: clean
+`CHG: … -> OFF`, no latch, no 10 s lockout, no `flt_hist` noise, ~2 s to restart
+instead of 10. The dusk path (`has_sun` power gate) and `PANEL_SAFETY_MV` soft-
+collapse backoff are untouched.
+
+**Status: builds clean, awaiting bench.** Test order matches the implementation
+order — (1) unplug mid-charge, expect the new code not `0004`; (2) sub-second
+dropout, expect charging to resume ~2 s later; (3) confirm the stand-down
+pre-empts the guard so neither code appears on a normal disconnect.
+
+---
+
 # [v0.25] - 30.07.26
 ## Staged charger activation (CHG_BUCK_SETTLE), wake-probe hardening, high-resolution lamp dimming
 

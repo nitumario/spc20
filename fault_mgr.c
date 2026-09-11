@@ -58,9 +58,13 @@ static void fault_take_action(uint16_t fault_bit)
 
         case FAULT_BAT_OVERVOLT:
         case FAULT_OVERCURRENT_CHG:
+        case FAULT_REVERSE_PUMP:
         case FAULT_PRECHARGE_TIMEOUT:
         case FAULT_TEMP_CHARGE_BLOCK:
-            /* Charge-side faults — stop pushing current into the battery. */
+            /* Charge-side faults — stop pushing current into the battery.
+             * Order matters for REVERSE_PUMP: Q49 opens BEFORE the buck is
+             * disabled, so the cell is isolated from the rail rather than
+             * being left connected to a converter that is coasting down. */
             disable_charge_switch();
             disable_input_buck();
             break;
@@ -118,6 +122,14 @@ static bool fault_recovery_met(const system_ctx_t *ctx, uint16_t fault_bit)
             /* Auto-retry after wait period — current is only meaningful
              * when charger is running. The wait itself is the debounce. */
             return (m->chg_current < BAT_CC_MAX_MA);
+
+        case FAULT_REVERSE_PUMP:
+            /* Same shape as the over-current retry: the protective action
+             * opened Q49, so get_charge_current() reads 0 and this is
+             * trivially true — FAULT_RECOVER_WAIT_MS is the real debounce.
+             * Stated explicitly anyway so the bit can never clear while a
+             * reverse reading is somehow still live. */
+            return (m->chg_current > -(int16_t)CHG_REVERSE_CURRENT_MA);
 
         case FAULT_OVERCURRENT_DSG:
             return (m->dsg_current < BAT_CC_MAX_MA);
@@ -195,9 +207,18 @@ static void fault_detect(system_ctx_t *ctx)
 {
     const measurements_t *m = &ctx->meas;
 
-    /* ── Thermal ── */
-    if ((m->bat_temp   > BAT_TEMP_MAX_DISCHARGE_C) ||
-        (m->board_temp > BOARD_TEMP_MAX_C)) {
+    /* ── Thermal ──
+     *
+     * Gated on temp_sensor_ok. OVERTEMP is the most destructive fault in the
+     * system — it sheds the lamps, USB, output and charging together and will
+     * not recover until both sensors read 10 degC below their limits — so it
+     * must never be raised off a reading the measurement layer has already
+     * flagged as untrustworthy. A dead NTC instead blocks charging through
+     * temp_charge_ok / FAULT_TEMP_CHARGE_BLOCK, which is the conservative
+     * half of the response without the blackout. */
+    if (ctx->temp_sensor_ok &&
+        ((m->bat_temp   > BAT_TEMP_MAX_DISCHARGE_C) ||
+         (m->board_temp > BOARD_TEMP_MAX_C))) {
         fault_raise(ctx, FAULT_OVERTEMP);
     }
 
@@ -264,6 +285,7 @@ static void fault_recover(system_ctx_t *ctx)
         FAULT_USB_OVERVOLT,
         FAULT_PRECHARGE_TIMEOUT,
         FAULT_TEMP_CHARGE_BLOCK,
+        FAULT_REVERSE_PUMP,
     };
 
     for (unsigned i = 0; i < sizeof(all_bits)/sizeof(all_bits[0]); ++i) {

@@ -7,7 +7,7 @@
  *   - The SYS_INIT → SYS_RUN transition
  *   - The main super-loop with tick-based scheduling
  *   - The deterministic pipeline (50 ms tick)
- *   - UART diagnostic logging (1 s tick)
+ *   - UART diagnostic logging (rate selected by ctx.log_mode)
  *   - SysTick ISR (1 ms): timestamp + ADC kick
  *
  * Pipeline (every TICK_MAIN_MS = 50 ms, sequential, no races):
@@ -23,7 +23,7 @@
  *
  * Other periodic tasks (independent of the pipeline):
  *   - Buttons polled every TICK_BUTTON_MS (20 ms)
- *   - UART logging every TICK_LOG_MS (1000 ms)
+ *   - UART logging paced by ctx.log_mode (off / 1 Hz / 5 Hz)
  *
  * Deep sleep: after IDLE_SLEEP_TIMEOUT_MS of unchanged IDLE/SAFE_MODE,
  * system_sleep() parks the MCU in STANDBY0 with button-edge wake and a
@@ -39,6 +39,7 @@
 #include "energy_mode.h"
 #include "mppt.h"
 #include "charger.h"
+#include "thermal.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -61,7 +62,7 @@ static char uart_evt_buf[128];            /* state-transition events */
  * =========================================================================
  *
  * Tab-separated output for direct paste into a spreadsheet.
- * Header sent once on startup, data lines every TICK_LOG_MS.
+ * Header sent once on startup; data-line rate is ctx.log_mode.
  *
  * Columns cover: uptime, all measurements, all flags, state machines,
  * power budget outputs, PWM, and fault code.
@@ -82,8 +83,22 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.25\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.35\r\n"
                 "==============================================\r\n");
+}
+
+/*
+ * Telemetry pacing. Maps ctx.log_mode to a log interval; 0 means "never log"
+ * and is what any unrecognised value degrades to, so a bad debugger write
+ * silences the log instead of picking an arbitrary rate.
+ */
+static uint32_t log_interval_ms(const system_ctx_t *c)
+{
+    switch (c->log_mode) {
+        case LOG_MODE_1HZ:  return TICK_LOG_1HZ_MS;
+        case LOG_MODE_FAST: return TICK_LOG_FAST_MS;
+        default:            return 0;              /* LOG_MODE_OFF */
+    }
 }
 
 /*
@@ -102,6 +117,10 @@ static void log_state_transitions(uint32_t now,
                                   mppt_state_t mppt_old,
                                   bat_wake_phase_t bw_old)
 {
+    /* LOG_MODE_OFF means a silent UART, transitions included — otherwise the
+     * blocking TX is still in the loop and turning the log off buys nothing. */
+    if (ctx.log_mode == LOG_MODE_OFF) return;
+
     if (ctx.energy_mode != em_old) {
         int len = snprintf(uart_evt_buf, sizeof uart_evt_buf,
             "EM: %s -> %s @ %lu ms\r\n",
@@ -145,6 +164,65 @@ static void log_state_transitions(uint32_t now,
 }
 
 /*
+ * Input-collapse post-mortem. charger_input_guard() snapshots the raw
+ * V_panel ring on the first sub-margin conversion (charger.c) and sets
+ * input_trace_pending; this prints it on the next pipeline tick together
+ * with what the guard did: RECOVERED (backed off, source came back,
+ * charging never stopped), STANDDOWN (window ran out — lands next to the
+ * "CHG: CC -> OFF" line), or PENDING (window still open at print time).
+ *
+ * Reading it: the values are UNAVERAGED conversions at TICK_ADC_MS, oldest
+ * first, the descent at the young end. Every trace captured so far (18 on
+ * 10.09.26) shows a live panel over its knee — steady 11-12 V, one sample
+ * of descent, pinned at V_bat + ~190 mV. Diagnostic only.
+ */
+/*
+ * One line per thermal-foldback step, so a dimming event is explainable after
+ * the fact instead of looking like a hardware fault:
+ *   "THERM: derate 85% @ 58C @ 912345 ms"
+ * Printed only on a change (thermal_update returns the edge), so a steady
+ * derate costs nothing.
+ */
+static void log_thermal_derate(uint32_t now, const system_ctx_t *c)
+{
+    char buf[64];
+    int n = snprintf(buf, sizeof buf, "THERM: derate %u%% @ %dC @ %lu ms\r\n",
+                     (unsigned)c->thermal.derate_pct,
+                     (int)c->meas.board_temp,
+                     (unsigned long)now);
+    if (n > 0 && n < (int)sizeof buf) send_string(buf);
+}
+
+static void log_input_trace(uint32_t now)
+{
+    if (!ctx.charger.input_trace_pending) return;
+    ctx.charger.input_trace_pending = false;
+    if (ctx.log_mode == LOG_MODE_OFF) return;
+
+    const char *res =
+        (ctx.charger.input_trace_result == INPUT_TRACE_RECOVERED)  ? "RECOVERED" :
+        (ctx.charger.input_trace_result == INPUT_TRACE_STOOD_DOWN) ? "STANDDOWN" :
+                                                                     "PENDING";
+    int len = snprintf(uart_buf, UART_BUF_SIZE,
+                       "INTRACE @ %lu ms %s pwm:%u->%u dips:%u Vpanel_raw:",
+                       (unsigned long)now, res,
+                       (unsigned)ctx.charger.input_trace_pwm_from,
+                       (unsigned)ctx.charger.input_trace_pwm_to,
+                       (unsigned)ctx.charger.input_dip_events);
+    for (unsigned i = 0; i < ADC_PANEL_TRACE_DEPTH && len > 0 &&
+                         len < UART_BUF_SIZE; i++) {
+        len += snprintf(uart_buf + len, (size_t)(UART_BUF_SIZE - len),
+                        " %u", (unsigned)ctx.charger.input_trace_mv[i]);
+    }
+    if (len > 0 && len < UART_BUF_SIZE - 3) {
+        uart_buf[len++] = '\r';
+        uart_buf[len++] = '\n';
+        uart_buf[len]   = '\0';
+        send_string(uart_buf);
+    }
+}
+
+/*
  * Per-tick telemetry. One line per tick, space-separated, with each
  * value prefixed by a "label:" tag so the line is self-describing
  * (e.g. "ms:34270 Vbat:3200 ..."). Fields, in order:
@@ -176,8 +254,17 @@ static void log_state_transitions(uint32_t now,
  *  25  mppt.state          (name: OFF/TRK/HLD)
  *  26  pwm
  *  27  mppt.vreg_setpoint_mv (mV — live input-vreg target, owned by MPPT)
- *  28  fault.code          (hex)
- *  29  fault.history       (hex)
+ *  28  mppt.sp_session_floor_mv (mV — learned setpoint floor: the cliff.
+ *                            Rises on collapse/dip corrections and on an
+ *                            input-loss teardown; sp never goes below it
+ *                            until a fresh seed)
+ *  29  charger.input_dip_events (input collapses the guard RESCUED by
+ *                            backing off — charging never stopped;
+ *                            monotonic)
+ *  30  fault.code          (hex)
+ *  31  fault.history       (hex)
+ *  32  temp_ok_sensor      (1 = both NTCs reading plausibly)
+ *  33  thermal.derate_pct  (100 = no foldback)
  */
 static void log_measurements(void)
 {
@@ -188,7 +275,8 @@ static void log_measurements(void)
         "Tbat:%d Tboard:%d "
         "bat_low:%u has_sun:%u has_load:%u temp_ok:%u p_limited:%u bat_full:%u "
         "i_buck_max:%u allowed_chg:%u "
-        "EM:%s CHG:%s MPPT:%s pwm:%u sp:%u fault:%04X flt_hist:%04X\r\n",
+        "EM:%s CHG:%s MPPT:%s pwm:%u pwmf:%u sp:%u spf:%u dips:%u fault:%04X flt_hist:%04X "
+        "tsens:%u derate:%u\r\n",
         (unsigned long)time_now(),
         m->bat_voltage, m->chg_voltage, m->out_voltage,
         m->panel_voltage, m->usb1_voltage, m->usb2_voltage,
@@ -202,11 +290,20 @@ static void log_measurements(void)
         em_state_name(ctx.energy_mode),
         chg_state_name(ctx.charger.state),
         mppt_state_name(ctx.mppt.state),
-        ctx.pwm, ctx.mppt.vreg_setpoint_mv, ctx.fault.code, ctx.fault.history);
+        ctx.pwm, ctx.mppt.cliff_pwm_min,
+        ctx.mppt.vreg_setpoint_mv, ctx.mppt.sp_session_floor_mv,
+        (unsigned)ctx.charger.input_dip_events,
+        ctx.fault.code, ctx.fault.history,
+        (unsigned)ctx.temp_sensor_ok, (unsigned)ctx.thermal.derate_pct);
     if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
 }
 /* =========================================================================
  * PIPELINE STEP 8: apply_pwm
+ *
+ * The one write to the buck timer in the pipeline. The only other writer in
+ * the firmware is charger_input_guard()'s foreground backoff (charger.c,
+ * v0.32), which goes through the same clamp and only ever REDUCES current;
+ * ctx->pwm stays the single source of truth for both.
  * =========================================================================
  *
  * The ONLY function that touches the buck timer register.
@@ -298,25 +395,61 @@ static const uint8_t btn_lamp_group[2][2] = {
     { 2, 3 },   /* BTN2 (BUTTONS[1]) -> lamp 3 + lamp 4 */
 };
 
-/* Drive a lamp's current level to its LED channel and log the change. */
-static void lamp_apply(system_ctx_t *c, uint8_t i)
+/* The LED current a lamp should actually be driven at right now: its level's
+ * ladder entry, scaled by the thermal foldback multiplier.
+ *
+ * Foldback scales the CURRENT and never ctx->lamp_level[], so the user's
+ * brightness choice survives the whole thermal event and the buttons keep
+ * behaving normally while derated. A lit lamp also stays lit: the result is
+ * clamped to the lowest non-zero rung, because 0 mA is true-off (LEDCTRL pad
+ * parked at static GPIO low) and would put set_led_current() out of step with
+ * led_boost_follow_lamps(), which keys off lamp_level. Dimming is the trade
+ * being made here; switching a lamp off behind the user's back is not. */
+static uint16_t lamp_drive_ma(const system_ctx_t *c, uint8_t i)
 {
     uint16_t ma = lamp_level_ma[c->lamp_level[i]];
-    set_led_current(ma, lamp_led[i]);
+
+    if (ma == 0 || c->thermal.derate_pct >= 100)
+        return ma;
+
+    uint32_t scaled = ((uint32_t)ma * c->thermal.derate_pct) / 100u;
+    return (scaled < lamp_level_ma[1]) ? lamp_level_ma[1] : (uint16_t)scaled;
+}
+
+/* Drive a lamp's current to its LED channel and reconcile the shared boost
+ * rail. Silent — used both by lamp_apply() and by the thermal foldback
+ * re-apply, which must not spam the log every derate step. */
+static void lamp_drive(system_ctx_t *c, uint8_t i)
+{
+    set_led_current(lamp_drive_ma(c, i), lamp_led[i]);
 
     /* Reconcile the shared LED boost rail with the new lamp state: turning the
      * last lamp off sheds the rail so "off" is fully dark (not the ~15 mA
      * compare-99 glow), and turning any lamp on brings it back up. */
     led_boost_follow_lamps(c);
+}
 
-    char buf[40];
+/* Drive a lamp's current level to its LED channel and log the change. */
+static void lamp_apply(system_ctx_t *c, uint8_t i)
+{
+    lamp_drive(c, i);
+
+    char buf[48];
     int n;
     if (c->lamp_level[i] == 0)
         n = snprintf(buf, sizeof buf, "LAMP%u: OFF\r\n", (unsigned)(i + 1));
     else
         n = snprintf(buf, sizeof buf, "LAMP%u: L%u %umA\r\n",
-                     (unsigned)(i + 1), (unsigned)c->lamp_level[i], (unsigned)ma);
+                     (unsigned)(i + 1), (unsigned)c->lamp_level[i],
+                     (unsigned)lamp_drive_ma(c, i));
     if (n > 0 && n < (int)sizeof buf) send_string(buf);
+}
+
+/* Re-drive every lamp after the thermal derate multiplier changed. */
+static void lamps_refresh(system_ctx_t *c)
+{
+    for (uint8_t i = 0; i < 4; i++)
+        lamp_drive(c, i);
 }
 
 static void lamp_buttons_update(system_ctx_t *c)
@@ -559,15 +692,24 @@ void HardFault_Handler(void)
  *     Only sleeps with all lamps off (gated in energy_mode), so nothing
  *     visible is lost.
  *   - LED bar display blanked (content zeroed + anodes parked).
+ *   - OUTPUT_EN + USB boost (MIC2876) + both AP2151 load switches OFF for
+ *     the whole sleep, not just IDLE's normal "stay on to sense a load"
+ *     policy (v0.27 — was the dominant sleep-current draw: a boost
+ *     converter's regulation overhead is mA-class next to STANDBY0's uA).
+ *     Traded away deliberately: a USB device plugged in mid-sleep now gets
+ *     no power and can't be sensed (I_discharge reads dead with the rail
+ *     off) until something else triggers a full wake, instead of charging
+ *     immediately as before. The re-enable on that eventual wake
+ *     (energy_mode_reapply_entry → enter_idle) is a cold restart of the
+ *     AP2151s — safe if nothing was plugged in while off, unverified if
+ *     something was: the load-switch datasheet and the 2026-07-08 revert
+ *     both say restart-into-an-already-drawing-load can stall at ~0.9 V.
+ *     Awaiting bench.
  *   - Measurement front-end (VBATM_EN + CRT_SNS_EN) gated off between
  *     wake-checks.
  *   - RTC READY interrupt masked: it is not used by any logic and would
  *     wake the core needlessly.
- *   Everything else keeps the entered state's configuration — notably the
- *   USB boost + load switches stay ON in IDLE (the AP2151s cannot restart
- *   into a plugged load — 2026-07 revert — so a USB device plugged during
- *   sleep is powered by hardware immediately and merely *detected* at the
- *   next wake-check).
+ *   Everything else keeps the entered state's configuration.
  *
  * Wake sources (armed only inside this function):
  *   - BTN1/BTN2 edges via GROUP1 → immediate full wake (buttons stay
@@ -581,9 +723,12 @@ void HardFault_Handler(void)
  * flags re-verify everything after wake, so a false wake just costs one
  * idle timeout before re-sleeping):
  *   from IDLE:      V_panel > PANEL_MIN_MV (respecting the dusk relock)
- *                   I_dsg   > LOAD_DETECT_MA
  *                   V_bat   < BAT_LOW_MV (cell present: > 500 mV, the
  *                             same disconnected-sense guard fault_mgr uses)
+ *                   (no load wake: OUTPUT_EN/USB boost are off for the
+ *                    whole sleep — v0.27 — so I_dsg reads dead regardless
+ *                    of what's plugged in; a load only surfaces once
+ *                    something else triggers a full wake)
  *   from SAFE_MODE: V_bat   > BAT_SAFE_RECOVER_MV
  *                   (no sun/load wake: SAFE_MODE only exits on recovery,
  *                    so waking for sun would burn the cell all day)
@@ -599,7 +744,6 @@ typedef enum {
     SLEEP_WAKE_NONE = 0,
     SLEEP_WAKE_BUTTON,      /* front-panel button edge                     */
     SLEEP_WAKE_SUN,         /* V_panel above has_sun set threshold         */
-    SLEEP_WAKE_LOAD,        /* discharge current above load-detect         */
     SLEEP_WAKE_VBAT,        /* battery crossed a threshold the current
                              * state must react to (low in IDLE,
                              * recovered in SAFE_MODE)                     */
@@ -610,7 +754,6 @@ static const char *sleep_wake_name(sleep_wake_t w)
     switch (w) {
         case SLEEP_WAKE_BUTTON: return "BTN";
         case SLEEP_WAKE_SUN:    return "SUN";
-        case SLEEP_WAKE_LOAD:   return "LOAD";
         case SLEEP_WAKE_VBAT:   return "VBAT";
         default:                return "???";
     }
@@ -643,6 +786,8 @@ static void system_sleep(system_ctx_t *c)
     update_led_bar(0x00, LED_BAR_2);     /* renders dark during wake-checks  */
     disable_led_bar();
     disable_led_boost();                 /* LEDCTRL freeze hazard — see above */
+    disable_output_switch();             /* shed 3VOUT — see header comment  */
+    disable_usb_boost();                 /* shed USB boost + both AP2151s    */
     disable_measure_sense();
     DL_RTC_disableInterrupt(RTC, DL_RTC_INTERRUPT_READY);
 
@@ -744,16 +889,14 @@ static void system_sleep(system_ctx_t *c)
                 wake = SLEEP_WAKE_VBAT;
         } else {
             uint16_t v_panel = get_input_voltage_now();
-            uint16_t i_dsg   = get_discharge_current_now();
 
             if (v_panel > PANEL_MIN_MV && time_now() >= c->has_sun_relock_ms)
                 wake = SLEEP_WAKE_SUN;
-            else if (i_dsg > LOAD_DETECT_MA)
-                wake = SLEEP_WAKE_LOAD;
             else if (v_bat > 500 && v_bat < BAT_LOW_MV)
-                wake = SLEEP_WAKE_VBAT;   /* wake to shed via SAFE_MODE —
-                                           * the USB boost is still up and
-                                           * bleeding the cell in IDLE   */
+                wake = SLEEP_WAKE_VBAT;   /* wake to transition into SAFE_MODE
+                                           * — bat_low still has to latch the
+                                           * state even though the load rails
+                                           * are already shed during sleep */
         }
 
         if (wake == SLEEP_WAKE_NONE)
@@ -958,6 +1101,10 @@ int main(void)
          * foreground and isolate Q49 immediately; bat_wake_tick records the
          * corresponding FSM transition on the next pipeline tick. */
         bat_wake_fast_guard(&ctx);
+        /* Input-loss first: it trips on the voltage collapse that PRECEDES
+         * reverse current, so on a source removal the cell is isolated before
+         * charger_fast_guard has anything to trip on. */
+        charger_input_guard(&ctx);
         charger_fast_guard(&ctx);
 
         /* ── 20 ms tick: button polling ──
@@ -995,6 +1142,18 @@ int main(void)
             /* Step 4: fault detection/recovery → ctx->fault */
             fault_mgr_update(&ctx);
 
+            /* Step 4b: thermal foldback → ctx->thermal.derate_pct
+             *
+             * After fault_mgr (it must see this tick's latched faults — a live
+             * OVERTEMP means the rails are already shed and there is nothing
+             * to derate) and before energy_mode, so the multiplier is settled
+             * before anything downstream drives the lamps. Re-drives the LED
+             * channels only on a change; the common case costs one compare. */
+            if (thermal_update(&ctx)) {
+                lamps_refresh(&ctx);
+                log_thermal_derate(now, &ctx);
+            }
+
             /* Step 5: energy mode FSM → hardware enables */
             energy_mode_update(&ctx);
 
@@ -1010,14 +1169,23 @@ int main(void)
             /* One-line UART log per region whose state changed. */
             log_state_transitions(now, em_old, chg_old, mppt_old, bw_old);
 
+            /* ...and the raw-panel post-mortem if the input guard tripped
+             * between ticks, so it prints alongside the CHG -> OFF line. */
+            log_input_trace(now);
+
             /* Refresh the bar-graph content from this tick's measurements
              * (battery SoC + panel power; an absent source leaves its bar
              * dark). The mux pumped at the top of the loop renders it. */
             ui_display_update(&ctx);
         }
 
-        /* ── 1 s tick: UART diagnostic logging ── */
-        if ((now - last_log) >= TICK_LOG_MS) {
+        /* ── UART diagnostic logging ──
+         * Interval comes from ctx.log_mode (OFF / 1 Hz / 5 Hz), re-read every
+         * pass so a debugger write takes effect on the spot. Switching from
+         * OFF leaves last_log stale, so the first line lands immediately —
+         * which is what you want when you flip it on to watch something. */
+        uint32_t log_ms = log_interval_ms(&ctx);
+        if (log_ms != 0 && (now - last_log) >= log_ms) {
             last_log = now;
             log_measurements();
         }
@@ -1040,8 +1208,10 @@ int main(void)
          * energy_mode arms idle_sleep_pending after IDLE_SLEEP_TIMEOUT_MS
          * of unchanged IDLE or SAFE_MODE (lamps off, no fault latched).
          * system_sleep() holds the MCU in STANDBY0 — waking briefly every
-         * SLEEP_WAKE_INTERVAL_MS to sniff for sun / load / battery
-         * movement, instantly on a button edge — and only returns on a
+         * SLEEP_WAKE_INTERVAL_MS to sniff for sun / battery movement
+         * (load rails are shed for the duration, so a plugged-in USB
+         * device is not sensed until an unrelated full wake — v0.27),
+         * instantly on a button edge — and only returns on a
          * real wake condition, with the current state's hardware enables
          * re-applied and time_now() credited for the slept duration. The
          * next pipeline tick (which fires immediately: the tick baselines

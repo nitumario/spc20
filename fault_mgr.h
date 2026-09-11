@@ -35,6 +35,10 @@
  *   FAULT_USB_OVERVOLT      — USB1 or USB2 voltage > FAULT_USB_OVERVOLT_MV
  *   FAULT_PRECHARGE_TIMEOUT — set externally by charger on precharge timeout
  *   FAULT_TEMP_CHARGE_BLOCK — bat temp outside charge window (soft fault)
+ *   FAULT_REVERSE_PUMP      — set externally by charger_fast_guard: cell
+ *                             back-feeding a still-LIVE input. Input LOSS is
+ *                             not a fault — charger_input_guard stands the
+ *                             charger down without latching anything.
  */
 
 #ifndef FAULT_MGR_H

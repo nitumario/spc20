@@ -255,6 +255,11 @@ typedef struct {
  * from the power budget as its CC target. The power budget already
  * subtracted load current — the charger just regulates to the number.
  */
+/* charger_ctx_t.input_trace_result — outcome of the last input-guard event */
+#define INPUT_TRACE_PENDING     0u   /* window still open when logged        */
+#define INPUT_TRACE_RECOVERED   1u   /* source came back after the backoff   */
+#define INPUT_TRACE_STOOD_DOWN  2u   /* window ran out (or fast guard) → OFF */
+
 typedef struct {
     charger_state_t state;
 
@@ -292,6 +297,52 @@ typedef struct {
     uint32_t bat_full_timer_start;
     bool     bat_full_timing;
     bool     bat_full_signaled;
+
+    /* Set by charger_input_guard() in the foreground when the input rail has
+     * gone away underneath a connected charger. The hardware is isolated
+     * immediately, but the FSM transition is left to the next 50 ms tick —
+     * same discipline as the other fast guards, and the only way the
+     * "CHG: x -> OFF" line still reaches the log (main.c snapshots the old
+     * state at the START of the tick, so a state change made between ticks
+     * would compare equal to itself and never be reported). */
+    bool     input_lost_pending;
+
+    /* Debounce state for charger_input_guard(). The guard runs at super-loop
+     * rate (kHz) against a value that only changes every TICK_ADC_MS, so the
+     * counter is gated on adc_sample_seq() rather than on calls — counting
+     * calls would re-test one stale conversion CHG_INPUT_LOST_SAMPLES times
+     * within microseconds and debounce nothing at all.
+     *
+     * input_dip_events is diagnostic: near-misses (the input dipped below the
+     * margin but recovered before the threshold) are exactly the events that
+     * used to tear the charger down, so this counter is the direct measure of
+     * what the debounce is buying. */
+    uint8_t  input_lost_count;    /* consecutive DISTINCT sub-margin samples;
+                                   * each one backs the draw off, the Nth
+                                   * stands down (CHG_INPUT_LOST_SAMPLES)    */
+    uint32_t input_lost_seq;      /* adc_sample_seq() of the last counted one */
+    uint16_t input_dip_events;    /* input collapses that RECOVERED after the
+                                   * backoff — charging never stopped. MPPT
+                                   * watches this to learn the cliff.        */
+
+    /* Raw V_panel history snapshotted on the first sub-margin sample, oldest
+     * first, so main.c can print it on the next tick without the ISR racing
+     * the print, together with what the guard did about it. Diagnostic. */
+    uint16_t input_trace_mv[ADC_PANEL_TRACE_DEPTH];
+    uint32_t input_rescue_ms;     /* time_now() of the input guard's last
+                                   * backoff action. Opens the window in
+                                   * which charger_fast_guard reads reverse
+                                   * current as the rescue's tail rather
+                                   * than as reverse pumping.             */
+    uint16_t input_trace_pwm_from; /* pwm before the guard touched it        */
+    uint16_t input_trace_pwm_to;   /* pwm after its last action              */
+    uint8_t  input_trace_result;   /* INPUT_TRACE_*                          */
+    bool     input_trace_pending;  /* a snapshot is waiting to be logged     */
+
+    /* time_now() value before which energy_mode must not re-arm the charger
+     * region. Stops the input-loss stand-down and the re-arm path from
+     * fighting inside the same tick. */
+    uint32_t rearm_block_ms;
 
 } charger_ctx_t;
 
@@ -360,10 +411,13 @@ typedef struct {
     uint16_t vreg_setpoint_mv;  /* LIVE input-vreg target consumed by
                                  * cc_regulate. Seeded by ctx_init to
                                  * PANEL_VREG_SETPOINT_MV, re-seeded from
-                                 * 0.76·Voc at each charger activation,
-                                 * then hill-climbed. PRESERVED across
-                                 * EM bounces (like mppt_limit_ma) so a
-                                 * brief teardown doesn't forget the MPP. */
+                                 * MPPT_SP_FRACTION_PCT·Voc on a FRESH
+                                 * activation, then hill-climbed.
+                                 * PRESERVED across EM bounces (like
+                                 * mppt_limit_ma) so a brief teardown
+                                 * doesn't forget the MPP — and since
+                                 * v0.28 the resume path preserves it for
+                                 * real (see seed_invalidated below).     */
     uint16_t prev_sp_mv;        /* setpoint of the previous (accepted)
                                  * dwell — revert target when a probe
                                  * measures worse                          */
@@ -380,17 +434,51 @@ typedef struct {
                                  * NOT at entry, where the 640 ms panel-ADC
                                  * window is still half-full of pre-plug
                                  * samples (has_sun debounces in 150 ms)  */
+    uint32_t disabled_since_ms; /* time_now() when the region last went
+                                 * DISABLED; 0 = never (cold boot)        */
+    bool     seed_invalidated;  /* set while DISABLED once the learned Voc
+                                 * and setpoint can no longer be trusted —
+                                 * has_sun dropped, or the gap exceeded
+                                 * MPPT_RESEED_GAP_MS. Decides whether the
+                                 * next activation re-seeds from FOCV or
+                                 * resumes from the converged point.
+                                 * true at cold boot so the first
+                                 * activation always seeds.               */
     bool     dwell_dipped;      /* V_panel dipped below the regulation
                                  * band during this dwell's measure window
                                  * → the setpoint cannot park (band-hop
                                  * whipsaw); classified as "too low"
                                  * regardless of the measured average     */
     uint16_t sp_session_floor_mv; /* raised to the post-push setpoint on
-                                 * every collapse/dip correction: a level
-                                 * that failed to park is not re-probed
-                                 * within the same TRACKING session (the
-                                 * cliff is tested at most once per
-                                 * session). Reset on session entry.      */
+                                 * every collapse/dip correction, and by
+                                 * sp_learn_cliff on an input-loss
+                                 * teardown: a level that failed is not
+                                 * re-probed while the learned panel is
+                                 * still trusted. Since v0.30 it survives
+                                 * bounces and HOLD re-probes; only a
+                                 * FRESH entry (new Voc) resets it.      */
+    uint16_t seen_dip_events;   /* charger.input_dip_events last acted on —
+                                 * a change means the guard just rescued a
+                                 * collapse; sp_learn_cliff on it          */
+    uint16_t cliff_pwm_min;     /* learned PWM ceiling: the lowest count
+                                 * (= highest current) cc_regulate may
+                                 * command. Raised CHG_CLIFF_PWM_MARGIN
+                                 * above every PWM that collapsed the
+                                 * input, released one count per
+                                 * CHG_CLIFF_PWM_RELAX_MS. 0 = nothing
+                                 * learned. Same lifetime as
+                                 * sp_session_floor_mv (survives bounces
+                                 * and HOLD, cleared on a FRESH entry) —
+                                 * it is the same cliff seen in the
+                                 * current domain, where a near-Voc
+                                 * operating point still has authority. */
+    uint32_t cliff_pwm_relax_ms; /* time_now() of the last ratchet move,
+                                 * either direction — the relax clock    */
+    uint16_t last_good_vpanel_mv; /* averaged V_panel from the last
+                                 * charging tick whose reading was not
+                                 * already contaminated by a collapse
+                                 * (MPPT_SP_VPANEL_DROP_MV). The cliff
+                                 * estimate a teardown learns from.      */
     uint16_t sp_step_mv;        /* current probe step: MPPT_SP_STEP_MV at
                                  * session entry, halved on each reversal
                                  * down to MPPT_SP_STEP_MIN_MV (brackets
@@ -444,6 +532,19 @@ typedef struct {
 #define FAULT_USB_OVERVOLT      (1U << 5)   /* USB output over-voltage            */
 #define FAULT_PRECHARGE_TIMEOUT (1U << 6)   /* precharge exceeded 15 min          */
 #define FAULT_TEMP_CHARGE_BLOCK (1U << 7)   /* too cold or hot to charge          */
+/*
+ * Reverse pumping detected with the input still ALIVE — the buck rail is
+ * parked below V_bat and the sync FETs are pushing cell charge back into a
+ * live panel, which can drive V_panel above open circuit toward the
+ * TPS564247's ~17 V input ceiling. A genuine control-loop failure.
+ *
+ * Split out of FAULT_OVERCURRENT_CHG (bench 2026-07-30): charger_fast_guard
+ * reused that bit, so an ordinary source removal — PSU switched off, panel
+ * unplugged — latched a code reading "charge over-current" at 664 mA. The
+ * two now report separately. Losing the input is NOT this fault: it is
+ * handled by the un-latched stand-down in charger_input_guard().
+ */
+#define FAULT_REVERSE_PUMP      (1U << 8)   /* back-feeding a LIVE input          */
 
 /*
  * Battery protection wake probe (energy_mode.c bat_wake_tick) — recovers
@@ -484,6 +585,34 @@ typedef struct {
     uint16_t probe_target_mv;        /* fixed target selected for this try   */
     bool     probe_cut_requested;    /* fast raw guard already cut stimulus  */
 } bat_wake_ctx_t;
+
+/* =========================================================================
+ * THERMAL FOLDBACK (thermal.c, pipeline step 4b)
+ * =========================================================================
+ *
+ * The graceful stage underneath the hard OVERTEMP fault. FAULT_OVERTEMP is a
+ * cliff — it kills lamps, USB and charging together and demands a 10 degC
+ * recovery — so on a board that simply runs warm under a big load it turns a
+ * thermal margin problem into a blackout. Foldback trades brightness for
+ * temperature instead: it scales the LED lamp current down until the board
+ * stops climbing, then walks it back up when there is headroom again.
+ *
+ * derate_pct is a MULTIPLIER on the requested lamp current, never a change to
+ * the user's lamp_level[]. The distinction matters: the user's brightness
+ * choice is preserved across the whole event, the front-panel buttons keep
+ * behaving normally while derated, and led_boost_follow_lamps() still keys off
+ * lamp_level so the boost rail is not shed out from under a lit lamp.
+ *
+ * Lamps are the only load the firmware can actually modulate. A USB load is
+ * not derateable (the AP2151 switches cannot be pulse-gated — see
+ * SPCBoardAPI.c), so if the heat is coming from USB, foldback will run to its
+ * floor without effect and the hard fault remains the backstop.
+ */
+typedef struct {
+    uint8_t  derate_pct;      /* 100 = full brightness, THERMAL_FOLDBACK_MIN_PCT = floor */
+    uint32_t last_step_ms;    /* pacing anchor for the next derate step                  */
+    bool     active;          /* true while derate_pct < 100 (telemetry / log edge)      */
+} thermal_ctx_t;
 
 typedef struct {
     uint16_t code;              /* bitmask of active faults                    */
@@ -554,6 +683,12 @@ typedef struct {
     bool bat_full;                   /* charger signaled taper complete     */
     bool panel_limited;              /* I_chg < allowed_chg - margin AND sun */
     bool temp_charge_ok;             /* battery temp within charge range    */
+    bool temp_sensor_ok;             /* both NTCs reading plausibly (see measurements.c).
+                                      * false = shorted/open sensor. Blocks charging (a cell of
+                                      * unknown temperature must not be charged) but deliberately
+                                      * does NOT raise OVERTEMP: a dead sensor should not shed the
+                                      * user's light. */
+    uint16_t temp_invalid_count;     /* consecutive invalid samples, vs TEMP_SENSOR_FAIL_TICKS */
 
     /* ── Power budget (written by power_budget_update, step 3) ── */
     uint16_t i_buck_max;             /* MIN(BUCK_MAX, mppt_limit)           */
@@ -584,6 +719,9 @@ typedef struct {
     /* ── FAULT_MGR child HSM (parallel to ENERGY_MGMT) ── */
     fault_ctx_t fault;
 
+    /* ── Thermal foldback (parallel, runs with FAULT_MGR) ── */
+    thermal_ctx_t thermal;
+
     /* ── Battery protection wake probe (SAFE_MODE in-state, energy_mode.c) ── */
     bat_wake_ctx_t bat_wake;
 
@@ -613,6 +751,21 @@ typedef struct {
      */
     uint8_t lamp_level[4];
     uint8_t lamp_hold_steps[2];
+
+    /* ── Diagnostics ──
+     *
+     * UART telemetry rate: LOG_MODE_OFF / LOG_MODE_1HZ / LOG_MODE_FAST
+     * (hw_config.h), seeded from LOG_MODE_DEFAULT by ctx_init(). Not system
+     * state — nothing in the pipeline reads it; main() alone consults it to
+     * pace log_measurements() and to gate log_state_transitions().
+     *
+     * volatile because the intended way to change it is a debugger write at a
+     * CCS breakpoint, which is outside what the compiler can see. An out-of-
+     * range value logs nothing (log_interval_ms() treats anything unrecognised
+     * as OFF), so a fat-fingered write silences the log rather than doing
+     * something unpredictable.
+     */
+    volatile uint8_t log_mode;
 
 } system_ctx_t;
 
@@ -654,6 +807,12 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->mppt.vreg_setpoint_mv = PANEL_VREG_SETPOINT_MV;
     ctx->mppt.prev_sp_mv       = PANEL_VREG_SETPOINT_MV;
     ctx->mppt.sp_direction     = +1;
+    ctx->mppt.sp_session_floor_mv = MPPT_SP_MIN_MV;   /* no cliff learned yet */
+    ctx->mppt.cliff_pwm_min       = 0;                /* ...in either domain  */
+    /* Nothing learned yet: the first activation must take the FOCV path.
+     * (disabled_since_ms stays 0 from the struct zeroing — it is only read
+     * once seed_invalidated has been cleared by enter_disabled().) */
+    ctx->mppt.seed_invalidated = true;
 
     /* No faults */
     ctx->fault.code = FAULT_NONE;
@@ -684,8 +843,21 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->has_sun_relock_ms = 0;      /* no lockout at boot — probe the panel immediately */
     ctx->has_sun_dusk_count = 0;
 
-    /* Assume temperature OK until first measurement */
+    /* Assume temperature OK until first measurement. temp_sensor_ok likewise
+     * starts true: avg_readings[] is empty until 64 conversions have landed,
+     * and main()'s ADC warm-up runs before the first pipeline tick, so the
+     * first real sample is already a valid average. */
     ctx->temp_charge_ok = true;
+    ctx->temp_sensor_ok = true;
+    ctx->temp_invalid_count = 0;
+
+    /* Thermal foldback idle: full brightness, nothing derated. */
+    ctx->thermal.derate_pct   = 100;
+    ctx->thermal.last_step_ms = 0;
+    ctx->thermal.active       = false;
+
+    /* UART telemetry rate (diagnostics only — see log_mode above) */
+    ctx->log_mode = LOG_MODE_DEFAULT;
 
     /* All four lamps default to off, mirroring the boot LED-current arming in
      * main(). A tap toggles full/off; press-and-hold dims to off. */

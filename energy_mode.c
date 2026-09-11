@@ -156,7 +156,39 @@ static void activate_charger_region(system_ctx_t *ctx)
     disable_charge_switch();
 
     uint16_t target_mv = ctx->meas.bat_voltage + CHG_ACTIVATION_HEADROOM_MV;
-    ctx->pwm = set_charging_voltage(target_mv);
+    uint16_t entry_pwm = set_charging_voltage(target_mv);
+
+    /*
+     * Warm resume. The LUT pre-position is a COLD start: it knows only V_bat,
+     * so after an input-loss bounce the inner loop spends ~2.5 s walking back
+     * down to the operating point it held two seconds ago (one count per
+     * PANEL_VREG_INTERVAL_MS — bench 10.09.26: pwm 399 → 121 → 106 on every
+     * one of 11 restarts, all of them re-deriving the same number).
+     *
+     * mppt.cliff_pwm_min is that number, already backed off by one
+     * CHG_CLIFF_PWM_MARGIN from the count that fell over, so it is both the
+     * fastest safe entry and the one the regulator is fenced at anyway.
+     * Gated on !seed_invalidated — the same "same panel, same day" test the
+     * setpoint resume uses (mppt.c). A cold boot, a lost has_sun or a gap
+     * past MPPT_RESEED_GAP_MS all take the LUT path, as before.
+     *
+     * Only ever a partial advance toward the ceiling: CHG_RESUME_MAX_ADVANCE
+     * bounds the rail above the cell at Q49 close, and a resume that would be
+     * LESS current than the LUT point (a heavily ratcheted ceiling) keeps the
+     * LUT point — CHG_BUCK_SETTLE still has to raise the rail over V_bat from
+     * wherever it starts, and starting lower than the cold path only makes
+     * that acquisition longer.
+     */
+    uint16_t resume_pwm = ctx->mppt.cliff_pwm_min;
+    if (!ctx->mppt.seed_invalidated && resume_pwm != 0 &&
+        resume_pwm < entry_pwm) {
+        if ((uint16_t)(entry_pwm - resume_pwm) > CHG_RESUME_MAX_ADVANCE)
+            resume_pwm = entry_pwm - CHG_RESUME_MAX_ADVANCE;
+        entry_pwm = resume_pwm;
+        set_buck_pwm(entry_pwm);
+    }
+
+    ctx->pwm = entry_pwm;
 
     ctx->charger.state = CHG_BUCK_SETTLE;
     ctx->charger.active_start_ms = time_now();
@@ -498,6 +530,48 @@ static void apply_entry_actions(system_ctx_t *ctx, energy_mode_state_t s)
 void energy_mode_reapply_entry(system_ctx_t *ctx)
 {
     apply_entry_actions(ctx, ctx->energy_mode);
+}
+
+/*
+ * charger_rearm_due — should an idle charger be restarted without a mode
+ * transition?
+ *
+ * charger_update() hard-returns while the charger is CHG_INACTIVE ("energy_mode
+ * owns activation"), and energy_mode only writes GPIOs on a transition. That
+ * left exactly one re-arm path: the fault.code falling edge. The latched fault
+ * was therefore doing double duty — protection AND a 10 s restart timer — so
+ * removing the latch from ordinary input loss would have stranded the charger
+ * INACTIVE inside a CHARGE_ONLY that never transitions.
+ *
+ * That only self-heals via has_sun clearing, which needs HAS_SUN_CLEAR_COUNT
+ * (30 ticks = 1.5 s) below PANEL_MIN_CLEAR_MV. A full disconnect gets there; a
+ * shorter dropout does not, and charging would have stopped silently and
+ * permanently. This is the replacement restart path.
+ *
+ * Conditions mirror the fault-clear re-arm deliberately: an entirely clean
+ * fault.code (same test as fault_just_cleared, so a latched USB or thermal
+ * fault holds the charger off exactly as it does today), usable sun, and the
+ * cooldown armed by the stand-down. activate_charger_region() self-guards on
+ * CHG_INACTIVE, so the resulting apply_entry_actions() is a no-op once the
+ * charger is running again — the same idempotence safe_mode_rescue_tick relies
+ * on.
+ */
+static bool charger_rearm_due(const system_ctx_t *ctx, energy_mode_state_t s)
+{
+    if ((s != EM_CHARGE_ONLY) && (s != EM_CHARGE_AND_LOAD))
+        return false;
+
+    if (ctx->charger.state != CHG_INACTIVE)
+        return false;                       /* already running */
+
+    if (ctx->fault.code != FAULT_NONE)
+        return false;                       /* fault owns the re-arm instead */
+
+    if (!ctx->flag_has_sun.value)
+        return false;                       /* no source to restart onto */
+
+    /* Signed difference — tolerates the time_now() wrap. */
+    return (int32_t)(time_now() - ctx->charger.rearm_block_ms) >= 0;
 }
 
 /*
@@ -972,6 +1046,27 @@ void energy_mode_update(system_ctx_t *ctx)
     energy_mode_state_t old_state = ctx->energy_mode;
     energy_mode_state_t new_state;
 
+    /* ── Input-loss stand-down (deferred from the foreground) ──
+     *
+     * charger_input_guard() isolated the hardware the instant V_panel fell
+     * under the battery; this is where the FSM catches up. Doing the state
+     * change HERE rather than in the guard is what keeps the "CHG: CC -> OFF"
+     * line in the log: main.c snapshots the old charger state at the start of
+     * the tick, so a change made between ticks would compare equal to itself.
+     *
+     * deactivate_charger_region() is reused deliberately — it is the same exit
+     * path every normal mode transition takes, including the preservation of
+     * mppt_limit_ma across a brief bounce. MPPT derives "charging" from
+     * charger.state and disables itself at step 6 of this same tick; it reads
+     * the fresh rearm_block_ms there to tell an input-loss teardown from any
+     * other deactivation and learn the collapse level (sp_learn_cliff). */
+    if (ctx->charger.input_lost_pending) {
+        ctx->charger.input_lost_pending = false;
+        if (ctx->charger.state != CHG_INACTIVE)
+            deactivate_charger_region(ctx);
+        ctx->charger.rearm_block_ms = time_now() + CHG_INPUT_REARM_MS;
+    }
+
     /* ── Fault-clear edge detection ──
      *
      * fault_take_action() in fault_mgr can disable hardware (input buck,
@@ -1033,8 +1128,9 @@ void energy_mode_update(system_ctx_t *ctx)
 
     /* ── No transition → handle in-state behaviour ── */
     if (new_state == old_state) {
-        if (fault_just_cleared) {
-            /* Re-arm any GPIOs the fault path tore down. */
+        if (fault_just_cleared || charger_rearm_due(ctx, old_state)) {
+            /* Re-arm any GPIOs the fault path tore down, or restart a charger
+             * that an input-loss stand-down parked while the mode stayed put. */
             apply_entry_actions(ctx, old_state);
         }
         if (old_state == EM_IDLE) {

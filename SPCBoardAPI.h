@@ -29,6 +29,7 @@
 
 #include "ti_msp_dl_config.h"
 #include "stdint.h"
+#include "hw_config.h"   /* ADC_PANEL_TRACE_DEPTH (panel trace ring) */
 
 /* ============================================================================
  * GLOBAL VARIABLES
@@ -162,6 +163,15 @@ uint16_t get_discharge_current_now(void);  /* I_dsg,   mA */
 uint16_t get_charge_voltage_now(void);     /* V_chg,   mV */
 int16_t  get_charge_current_now(void);     /* I_chg,   mA, signed */
 
+/* Monotonic count of completed ADC harvests (one per TICK_ADC_MS). Lets a
+ * foreground guard running at loop rate tell a NEW conversion from a re-read
+ * of the same one — see charger_input_guard(). */
+uint32_t adc_sample_seq(void);
+
+/* Post-mortem: last ADC_PANEL_TRACE_DEPTH raw V_panel conversions in mV,
+ * oldest first. out[] must hold ADC_PANEL_TRACE_DEPTH entries. */
+void     adc_panel_trace_mv(uint16_t *out);
+
 /* ============================================================================
  * PWM MODULE
  * ============================================================================ */
@@ -175,6 +185,7 @@ typedef struct {
 void     pwm_init(void);
 void     set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle);
 void     set_buck_pwm(uint16_t pwm_value);
+uint16_t lookup_charging_pwm(uint16_t voltage);
 uint16_t set_charging_voltage(uint16_t voltage);
 void     set_led_voltage(uint16_t voltage);
 void     set_led_current(uint16_t current, LED_OUTPUT led);

@@ -64,8 +64,16 @@
 /* Step 7: run the charger state machine and regulate ctx->pwm. */
 void charger_update(system_ctx_t *ctx);
 
+/* Foreground input-loss guard. Runs BEFORE charger_fast_guard: it trips on the
+ * voltage collapse that PRECEDES reverse current, so the cell is isolated
+ * before it can back-feed. Losing the source is not a fault — this stands the
+ * charger down without latching (ctx->charger.input_lost_pending). */
+void charger_input_guard(system_ctx_t *ctx);
+
 /* Foreground fast trip for reverse current. The normal regulator uses filtered
- * data; this guard cuts the power path from the latest 10 ms ADC conversion. */
+ * data; this guard cuts the power path from the latest 10 ms ADC conversion.
+ * Backstop to charger_input_guard: reverse current on a dead input stands down
+ * cleanly, on a LIVE input it latches FAULT_REVERSE_PUMP. */
 void charger_fast_guard(system_ctx_t *ctx);
 
 #endif /* CHARGER_H */
