@@ -282,8 +282,10 @@ void charger_fast_guard(system_ctx_t *ctx)
 
     /* A stand-down already isolated the path this tick; nothing left to judge
      * (and chg_current reads 0 with Q49 open anyway). */
-    if (!charger_connected(ctx) || c->input_lost_pending)
+    if (!charger_connected(ctx) || c->input_lost_pending) {
+        c->reverse_count = 0;
         return;
+    }
 
     /* chg_current (R440) is NET cell current: I_cell = I_buck − I_load. An
      * activation under load connects Q49 with the buck at ~zero delivery, so
@@ -296,7 +298,9 @@ void charger_fast_guard(system_ctx_t *ctx)
     int32_t i_buck_now = (int32_t)get_charge_current_now() +
                          (int32_t)get_discharge_current_now();
 
-    if (i_buck_now < -(int32_t)CHG_REVERSE_CURRENT_MA) {
+    if (i_buck_now >= -(int32_t)CHG_REVERSE_CURRENT_MA) {
+        c->reverse_count = 0;
+    } else {
         /* Classify before latching. Reverse current with the input already
          * DEAD is a disconnect whose voltage signature charger_input_guard
          * narrowly lost the race to — the input node can fall past the
@@ -345,8 +349,39 @@ void charger_fast_guard(system_ctx_t *ctx)
             return;
         }
 
+        /* Same yield for the connection transient. The buck hands off from
+         * CHG_BUCK_SETTLE delivering ~nothing, so for the first conversions
+         * after Q49 closes the net cell current sits AT zero — the one place
+         * where a single raw sample straddles a -100 mA threshold on noise
+         * alone. The reverse-pump condition itself is excluded by
+         * construction here: SETL does not connect until instantaneous VCHG
+         * is above the cell. This is what made 467 of the 498 charge sessions
+         * in the 10.09.26 bench log die inside 300 ms. */
+        if ((time_now() - c->connect_ms) < CHG_CONNECT_BLANK_MS)
+            return;
+
+        /* Debounce the latch on DISTINCT conversions, exactly as
+         * charger_input_guard debounces its own teardown — this runs at
+         * super-loop rate against a value that only moves every TICK_ADC_MS,
+         * so counting calls would reach the threshold off one stale sample
+         * within microseconds.
+         *
+         * Real reverse pumping is a sustained state (-1010 mA on the May
+         * trace) and clears CHG_REVERSE_SAMPLES without difficulty; a noise
+         * sample about zero does not. Latching is expensive enough
+         * (FAULT_RECOVER_WAIT_MS, 10 s of no charging) to be worth ~30 ms of
+         * confirmation. */
+        uint32_t seq = adc_sample_seq();
+        if (seq == c->reverse_seq)
+            return;
+        c->reverse_seq = seq;
+
+        if (++c->reverse_count < CHG_REVERSE_SAMPLES)
+            return;
+
         fault_raise(ctx, FAULT_REVERSE_PUMP);
         ctx->pwm = PWM_MIN_DUTY;
+        c->reverse_count = 0;
     }
 }
 
@@ -724,6 +759,15 @@ static void tick_buck_settle(system_ctx_t *ctx)
 
     enable_charge_switch();
     c->cc_last_downstep_ms = now;
+
+    /* Q49 just closed, so cell current starts existing now — at ~0, because
+     * the acquisition ramp stopped as soon as VCHG cleared the cell and
+     * cc_regulate has yet to walk any delivery up. Open the window in which
+     * charger_fast_guard yields rather than reading noise about zero as
+     * reverse pumping, and clear any debounce carried in from the last
+     * session. See CHG_CONNECT_BLANK_MS. */
+    c->connect_ms     = now;
+    c->reverse_count  = 0;
 
     /* Re-assert the learned ceiling at the handoff. The acquisition ramp above
      * is deliberately unfenced — fencing it is how a current limit becomes a

@@ -344,6 +344,21 @@ typedef struct {
      * fighting inside the same tick. */
     uint32_t rearm_block_ms;
 
+    /* time_now() when CHG_BUCK_SETTLE closed Q49, i.e. when cell current
+     * started existing at all. Opens the CHG_CONNECT_BLANK_MS window in which
+     * charger_fast_guard yields: the buck hands off delivering ~nothing, and
+     * a net cell current sitting at zero is one noisy conversion away from
+     * either side of the reverse threshold. */
+    uint32_t connect_ms;
+
+    /* Debounce state for charger_fast_guard's latch path, gated on
+     * adc_sample_seq() exactly as input_lost_count is — the guard runs at
+     * super-loop rate against a value refreshed every TICK_ADC_MS, so a plain
+     * call counter would reach the threshold off one stale sample in
+     * microseconds. Reset by any conversion that is not reverse. */
+    uint8_t  reverse_count;       /* consecutive DISTINCT reverse samples     */
+    uint32_t reverse_seq;         /* adc_sample_seq() of the last counted one */
+
 } charger_ctx_t;
 
 /* =========================================================================

@@ -1,3 +1,105 @@
+# [v0.36] - 13.09.26
+## The charger was never getting off the line: fast_guard latched at every activation
+
+Changed files: `charger.c`, `hw_config.h`, `system_types.h`, `main.c`,
+`docs/constants_and_faults.md`, `CHANGELOG.md`
+
+### The problem
+`serial_20260910_180041.log` — v0.34, 96 minutes, and the question it answers
+is not the one the session set out to ask. Counted over the whole log:
+
+```
+charge sessions (SETL -> CC)        498
+mean session length                 479 ms   (432 of them under 300 ms)
+mean gap between sessions        10 720 ms   (= FAULT_RECOVER_WAIT_MS)
+sessions ending in fault:0100       467 / 498  (94 %)
+INTRACE events (input collapse)      33
+MPPT: OFF -> TRK / TRK -> HLD       472 / 7
+```
+
+**The charger spent 4 % of the session charging.** Not because of the cliff,
+not because of the tracker: only 33 of the 498 teardowns have an `INTRACE` at
+all, so `charger_input_guard` was not involved in 94 % of them. Those 467 are
+`charger_fast_guard` latching `FAULT_REVERSE_PUMP` — and the telemetry at the
+moment of the latch shows a perfectly healthy plant: `Vpanel` 11–13 V, and the
+averaged `Ichg` under 25 mA in 469 of 498 cases.
+
+It was latching on the activation transient. `CHG_BUCK_SETTLE`'s acquisition
+ramp stops the instant `VCHG` clears `V_bat + CHG_BUCK_READY_MARGIN_MV`, so
+Q49 closes with the buck delivering ~nothing and net cell current at **zero**
+— the one operating point where a ±100 mA threshold is a coin flip, since
+`get_charge_current_now()` is a single raw conversion at ~2.4 mA/LSB with a
+hard-coded 1260 mV zero. One unlucky sample inside the first few conversions
+opened Q49 and blocked restart for 10 s. Then SETL, CC, and the same coin
+flip ~479 ms later, 498 times.
+
+This is the third appearance of the same root confusion, and the first two
+fixes each covered one special case of it: v0.28 added `I_dsg` to the
+comparison because a lamps-on activation reads `−I_load` (bench 2026-07-29),
+and v0.32–v0.35 added `CHG_REVERSE_BLANK_MS` because a rescued collapse reads
+reverse on its way back. Both are instances of "the guard is judging a moment
+when the buck is not yet delivering". With no load (`Idsg:0` throughout this
+log) the v0.28 fix contributes nothing, and with `dips:0` and no `INTRACE` the
+rescue window never opened either.
+
+### The fix
+**Yield across the connection transient** (`CHG_CONNECT_BLANK_MS`, 150 ms).
+`tick_buck_settle` records `charger.connect_ms` at `enable_charge_switch()` —
+the moment cell current starts existing — and `charger_fast_guard` returns
+without judging until the window closes. This does not weaken the interlock it
+appears to: SETL refuses to connect until instantaneous `VCHG` is above the
+cell, so the rail *starts* the window on the correct side of the crossover,
+and `charger_input_guard` (the voltage-domain guard, which is what actually
+catches a dying source) is not blanked and keeps running throughout.
+
+**Debounce the latch** (`CHG_REVERSE_SAMPLES`, 3). A live-input reverse
+reading now has to repeat across three DISTINCT conversions (~30 ms) before it
+latches, gated on `adc_sample_seq()` and not on calls — the guard runs at
+super-loop rate against a value that only moves every `TICK_ADC_MS`, the same
+trap `CHG_INPUT_LOST_SAMPLES` documents. Genuine reverse pumping is a
+sustained state (−1010 mA on the May trace) and clears this trivially; noise
+about zero does not. Any non-reverse conversion resets the count.
+
+The dead-input branch is deliberately left undebounced: it stands down cleanly
+without latching, and a real source removal should still be isolated on the
+first sample.
+
+### What this does not claim
+Nothing here touches MPPT, and nothing here is a tracker fix. The pacing
+question this session opened with — whether the loop can run faster than the
+64-sample / 640 ms moving average allows — is not answered, because it was
+never the binding constraint: a 3 s probe (`MPPT_SP_SETTLE_MS` +
+`MPPT_SP_MEASURE_MS`) cannot complete inside a 479 ms session at any pacing.
+The tracker converged 7 times out of 472 entries for want of a charger that
+stays up, not for want of speed. Whether the setpoint loop needs retuning is
+simply unmeasured, and stays unmeasured until a session runs long enough to
+produce evidence either way.
+
+**Bounded exposure:** reverse current on a live input now persists up to 3
+conversions (~30 ms) before latching instead of 1, and is unjudged for the
+first 150 ms after connection. Both are the same order as the 3-conversion
+window `charger_input_guard`'s own teardown path has always carried.
+
+### Status
+**Builds clean on both `CHARGER_INPUT_VREG` branches; awaiting bench.**
+From a fresh `CHG_ONLY` capture:
+1. **`flt_hist:0000`** with the panel connected throughout — the headline
+   check. Any `0x0100` now means three consecutive reverse conversions on a
+   live input, which is the fault doing its job.
+2. Session length: minutes, not milliseconds. If `CHG: CC -> OFF` still fires
+   sub-second, capture `Ichg`/`Idsg` at the teardown — a latch that survives
+   both the blank and the debounce is a real one and the sensor zero
+   (1260 mV, never checked against a meter) is the next suspect.
+3. MPPT actually completes probes: `TRK -> HLD` should become common, and
+   `sp` should move and settle rather than re-seeding on every entry.
+4. Unplug regression unchanged: pull the panel under a ~1 A charge — expect
+   `CHG: CC -> OFF` within ~50 ms via `charger_input_guard`, an
+   `INTRACE … STANDDOWN`, and no `0x0100`. Pull it during the first 150 ms
+   after an activation too: the input guard, not the blanked fast guard, is
+   what must catch that.
+
+---
+
 # [v0.35] - 10.09.26
 ## Revert v0.34's backoff clamp: commanding below V_bat IS the escape
 

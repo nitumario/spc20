@@ -611,6 +611,50 @@
  * did not take; it never latches. */
 #define CHG_REVERSE_BLANK_MS      200UL
 
+/* How long after Q49 closes that charger_fast_guard yields instead of judging
+ * reverse current (charger.c, tick_buck_settle → charger_fast_guard).
+ *
+ * At the CHG_BUCK_SETTLE → CC/PRECHARGE handoff the buck is delivering
+ * essentially nothing: the acquisition ramp stops the moment VCHG clears
+ * V_bat + CHG_BUCK_READY_MARGIN_MV, so the cell current starts at ~0 and
+ * cc_regulate has to walk the delivery up from there. Zero is the one
+ * operating point where a single noisy conversion can cross a -100 mA
+ * threshold in either direction, and get_charge_current_now() is one raw
+ * sample at ~2.4 mA/LSB.
+ *
+ * Bench 10.09.26 (v0.34, serial_20260910_180041.log): 498 charge sessions,
+ * mean length 479 ms, 432 of them under 300 ms, and 467 ending in an 0x0100
+ * latch with the panel healthy at 11-13 V and the averaged Ichg under 25 mA.
+ * At FAULT_RECOVER_WAIT_MS (10 s) apiece that is a 4 % charging duty cycle,
+ * and MPPT never completed even one 3 s probe in 96 minutes.
+ *
+ * The reverse-pump condition this blanks is already excluded by construction
+ * for the duration: SETL does not close Q49 until the instantaneous VCHG is
+ * above the cell, so the rail starts the window on the right side of it. The
+ * voltage-domain guard (charger_input_guard) is NOT blanked and keeps running
+ * throughout. 150 ms is ~15 conversions — long enough for the connection
+ * transient and the first cc_regulate steps, far shorter than the ramp to a
+ * real operating point. */
+#define CHG_CONNECT_BLANK_MS      150UL
+
+/* Consecutive DISTINCT reverse-current conversions required before
+ * charger_fast_guard latches FAULT_REVERSE_PUMP on a live input.
+ *
+ * Genuine reverse pumping is a sustained state — the May bench trace sat at
+ * -1010 mA — so it survives any debounce trivially. A single sample below
+ * the threshold does not distinguish that from sensor noise about zero, and
+ * the cost of the two is wildly asymmetric: the fault opens Q49 and blocks
+ * restart for FAULT_RECOVER_WAIT_MS (10 s).
+ *
+ * Same count and same adc_sample_seq() gating as CHG_INPUT_LOST_SAMPLES, for
+ * the same reason — the guard runs at super-loop rate against a value that
+ * only changes every TICK_ADC_MS, so counting calls would debounce nothing.
+ * Exposure grows from one 10 ms sample to three (~30 ms), the bound the input
+ * guard's own teardown path has always carried. The dead-input branch is
+ * deliberately NOT debounced: that path stands down cleanly without latching,
+ * and a real removal should still be isolated on the first sample. */
+#define CHG_REVERSE_SAMPLES       3U
+
 /* ── Learned PWM ceiling (the current-domain cliff memory) ──────────────
  *
  * sp_session_floor_mv learns a collapse in the SETPOINT domain, and on a
