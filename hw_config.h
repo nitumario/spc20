@@ -378,6 +378,15 @@
 #define PWM_MIN_DUTY              399     /* highest pwm value → lowest duty cycle (off)          */
 #define BUCK_MAX_CURRENT_MA       2000    /* hardware current limit of the inductor/FET           */
 
+/* Nominal MCU supply. The FB-injection network converts the PWM pin's AVERAGE
+ * voltage (VDD x duty) into a buck setpoint, and the LED channels drive a
+ * transconductance source the same way, so every duty in this firmware is
+ * really a request for a fraction of VDD. scale_duty_cycle() divides the
+ * requested duty by the measured rail to hold that fraction constant when the
+ * rail drifts; this is the value it scales back to, and the fallback get_vdd()
+ * reports before the ADC average exists. */
+#define VDD_NOMINAL_MV            3300U
+
 /* LED boost (TPS61088) rail target. Needs enough headroom for the LED string
  * Vf plus Vce_sat of the PNP current source; below ~10 V the per-channel CC
  * loop falls out of regulation and the lamps only weakly glow at <<150 mA.

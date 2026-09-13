@@ -1040,12 +1040,18 @@ int main(void)
     enable_led_boost();
 
     /* ADC warm-up before any voltage-targeting PWM op. set_led_voltage() →
-     * set_pwm_duty_cycle() → scale_duty_cycle() → get_vdd(), which reads
-     * ADC.Adc0Result[6]; that field is 0 until the first conversion lands.
-     * Without this loop scale_duty_cycle ends up with 3300/0 and clamps to
-     * an out-of-period CC value — PB15 parks at its init-low state and the
+     * set_pwm_duty_cycle() → scale_duty_cycle() → get_vdd(), which has no
+     * reading to report until a conversion has landed. Without this loop
+     * scale_duty_cycle used to end up with 3300/0 and clamp to an
+     * out-of-period CC value — PB15 parks at its init-low state and the
      * TPS61088 only regulates off its passive feedback divider, well below
-     * the LED-string dropout. Mirrors the 1000-iter warm-up in V2.5.5/main.c. */
+     * the LED-string dropout. Mirrors the 1000-iter warm-up in V2.5.5/main.c.
+     *
+     * get_vdd() now falls back (average → raw → VDD_NOMINAL_MV) so that
+     * divide can no longer happen, but the loop still earns its place: it is
+     * what makes the value a MEASUREMENT rather than the nominal fallback,
+     * and if it lands WINDOW_SIZE harvests the reading is already the
+     * 64-sample average the rest of the firmware uses. */
     for (int i = 0; i < 1000; i++) {
         read_adc_values();
         delay_cycles(400);

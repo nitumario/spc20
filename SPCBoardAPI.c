@@ -881,15 +881,34 @@ uint16_t get_led_transistor_voltage(LED_OUTPUT led){
 }
 
 /*
- * Returns computed VDD in mV (based on internal measurement scaling).
- * NOTE: scaling factor "*3" implies a divider/reference assumption.
+ * Returns computed VDD in mV. ADC0 mem6 is the internal supply monitor
+ * (CHAN_15 = "Supply/Battery Monitor" on MSPM0G3x0x), which presents VDD/3 —
+ * hence the *3. The divider is an internal analog block; its ratio has never
+ * been checked against a meter on this board, and every buck duty depends on
+ * it (see scale_duty_cycle).
+ *
+ * AVERAGING. This reads avg_readings[] like every other channel, not a single
+ * raw conversion. scale_duty_cycle() calls this on EVERY PWM write, so one
+ * noisy sample here multiplies straight into the buck duty and the LED
+ * current duties: ~1 % of sample jitter is a whole count of pwm at the
+ * charger's operating point — about 4 mV of buck rail, ~100 mA of charge
+ * current — injected by the firmware on top of whatever the control loop
+ * asked for. Same bug, same fix, as _readThermistor's.
+ *
+ * WARM-UP. avg_readings[] stays zero until the first WINDOW_SIZE harvests
+ * have landed (read_adc_values), so fall back to the raw conversion until
+ * then, and to the nominal rail before even that exists. This function must
+ * never return 0: scale_duty_cycle() divides by it, and its clamp resolves
+ * the resulting garbage to period-1 — which is "off" for the buck but
+ * MAXIMUM current on the LED channels.
  */
-uint16_t get_vdd(){
-    float gAdcResultVolts;
-    uint16_t adcResultVDD;
-    adcResultVDD = ADC.Adc0Result[6];
-    gAdcResultVolts = (adcResultVDD * ADC.VREF*3) / (ADC.max_adc0_value);
-    return gAdcResultVolts;
+uint16_t get_vdd(void){
+    uint32_t counts = avg_readings[6];
+
+    if(counts == 0U) counts = ADC.Adc0Result[6];   /* pre-average warm-up  */
+    if(counts == 0U) return VDD_NOMINAL_MV;        /* no conversion yet    */
+
+    return (uint16_t)((counts * (uint32_t)ADC.VREF * 3U) / ADC.max_adc0_value);
 }
 
 /*
@@ -1154,7 +1173,7 @@ uint16_t binary_search_closest_descending(uint16_t value, const uint16_t * LUT, 
  */
 static uint16_t scale_duty_cycle(uint16_t duty_cycle, uint16_t period){
     uint16_t vdd_actual = get_vdd();
-    float scale = 3300.0 / (float)vdd_actual;
+    float scale = (float)VDD_NOMINAL_MV / (float)vdd_actual;
     float pwm_res_float = scale * (float)duty_cycle;
     uint16_t pwm_res = (uint16_t)ceil((double)pwm_res_float);
 
