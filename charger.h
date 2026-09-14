@@ -76,4 +76,18 @@ void charger_input_guard(system_ctx_t *ctx);
  * cleanly, on a LIVE input it latches FAULT_REVERSE_PUMP. */
 void charger_fast_guard(system_ctx_t *ctx);
 
+/* Half-width of the V_panel regulation band, in mV.
+ *
+ * NOT a constant: derived from the plant gain the voltage loop measures off
+ * its own paced steps (charger.plant_mv_per_count), because the band's real
+ * criterion is "wider than one PWM count of V_panel" and the mV that
+ * corresponds to varies ~20x between panels. Falls back to the static
+ * PANEL_VREG_DEADBAND_MV until a gain exists, and never exceeds it. See the
+ * adaptive-deadband note in hw_config.h.
+ *
+ * mppt.c sizes the FOCV seed, both setpoint clamps, the cliff floor and the
+ * dip classifier off this, so the outer loop's notion of the band is always
+ * the one the inner loop is actually enforcing. */
+uint16_t charger_vreg_deadband_mv(const system_ctx_t *ctx);
+
 #endif /* CHARGER_H */

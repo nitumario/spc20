@@ -330,6 +330,116 @@
  * landing point always exists, and any in-band point is ≥97 % of MPP. */
 #define PANEL_VREG_DEADBAND_MV    1200U
 
+/* ── Adaptive deadband ────────────────────────────────────────────────────
+ *
+ * Read the note above again: every sentence justifying 1200 mV is written
+ * in PWM COUNTS ("more panel current than one step quantum", "≈ 2 PWM
+ * counts, so a landing point always exists"). The criterion is a count
+ * criterion; 1200 mV is only what it evaluated to on the 4x-parallel 6.5 V
+ * array, whose panel-side gain is ~600 mV per count.
+ *
+ * That mapping is NOT portable, and on one panel it is not even one number.
+ * Measured per count on the 13 V panel (bench 14.09.26,
+ * serial_20260914_085920.log):
+ *
+ *     pwm  95→ 96    16 mV/count  ┐
+ *     pwm  84→ 85    55 mV/count  ├ flat stretch, pwm 62-105: 16-55
+ *     pwm  70→ 71    39 mV/count  ┘
+ *     pwm  60→ 61   138 mV/count  ┐ the knee, pwm 59-61
+ *     pwm  59→ 60   192 mV/count  ┘
+ *
+ * An order of magnitude across one curve, and ~40x against the 6.5 V array's
+ * ~600 mV/count. A band sized for "2 counts" is ±25 to ±75 counts wide on
+ * this panel's flat stretch — a full half of the usable PWM range — and
+ * ±12 at its knee. No constant in millivolts is right in both places.
+ *
+ * What that costs: the same log, ms 35946-247262. The tracker had converged
+ * its setpoint to 12414 mV — within 80 mV of the MPP it had itself measured
+ * at 12494 mV / 5.0 W. V_panel sat at 13450 mV. Error 1036 mV, deadband
+ * 1200 mV, so cc_regulate held, for 211 seconds, at 13.45 V / 190 mA /
+ * 2.5 W. Half the available power, with the right answer already in
+ * vreg_setpoint_mv and no branch able to command it. The outer loop is
+ * blinded by the same band: a setpoint probe that lands inside it moves the
+ * plant not at all, the P&O reads its own noise, calls it flat, reverses,
+ * and converges on a point it never actually visited.
+ *
+ * So measure the gain instead of assuming it. cc_regulate steps ONE count
+ * per PANEL_VREG_INTERVAL_MS and observes the result after the ADC group
+ * delay — that is a gain measurement, taken for free, every interval. The
+ * live estimate is charger.plant_mv_per_count and the band derived from it
+ * is charger_vreg_deadband_mv():
+ *
+ *     deadband = clamp(gain * PANEL_VREG_DEADBAND_COUNTS,
+ *                      PANEL_VREG_DEADBAND_MIN_MV, PANEL_VREG_DEADBAND_MV)
+ *
+ * PANEL_VREG_DEADBAND_MV survives as the CEILING and as the value used
+ * before any gain has been learned, so a cold boot behaves exactly as it
+ * does today and the 6.5 V array (gain ~600 mV/count → 1200 mV) lands back
+ * on its bench-validated number. On the 13 V panel the band becomes
+ * 2*26..2*48 = 52..96 mV, floored at PANEL_VREG_DEADBAND_MIN_MV. */
+
+/* Band half-width in PWM counts — the actual design criterion. 2 counts
+ * means a landing zone ~4 counts wide always exists between the branches,
+ * which is what stops the loop hopping across the band every interval. */
+#define PANEL_VREG_DEADBAND_COUNTS 2U
+
+/* Absolute floor on the derived band (mV). Not a control requirement — the
+ * counts criterion is — but a guard against a gain estimate that has gone
+ * implausibly small (a stiff source, a stretch of flat readings) shrinking
+ * the band to the point where panel noise alone drives a step every
+ * interval. ~3x the tick-to-tick V_panel jitter seen on the bench (11-22
+ * mV). */
+#define PANEL_VREG_DEADBAND_MIN_MV 150U
+
+/* Sanity clamps on the online gain estimate (mV of V_panel per PWM count).
+ * Anything outside this is not a plant measurement — it is an irradiance
+ * step, a collapse tail, or a reading taken while another clamp moved the
+ * PWM. Low end covers a stiff bench PSU; high end covers the 4x-parallel
+ * array's ~600 mV/count with headroom. */
+#define PANEL_GAIN_MIN_MV_PER_COUNT 5U
+#define PANEL_GAIN_MAX_MV_PER_COUNT 800U
+
+/* IIR weight (shift) for the gain estimate: new = new/4 + old*3/4. The
+ * per-step signal is one count of movement (16-55 mV on the flat stretch)
+ * against 11-22 mV of panel jitter, so roughly 2:1 — averaging over ~4 steps
+ * (1.6 s) gets that to a usable number without lagging a real irradiance
+ * change. Applied to FALLING samples only: a steeper reading is adopted on
+ * the spot instead, see vloop_observe_gain. */
+#define PANEL_GAIN_IIR_SHIFT       2
+
+/* Largest step the voltage loop may take in one interval, in PWM counts.
+ * One count per 400 ms is correct NEAR the setpoint (each step verified by
+ * observation before the next — the dead-time rule), but it makes a long
+ * traverse glacial: acquisition from Voc to a seed 1.8 V below it is 38-70
+ * counts, i.e. 15-28 s, during which the tracker is dwelling on a plant
+ * still in transit. With a known gain the loop can size the step to the
+ * error and still stay closed-loop, as long as the step cannot leap the
+ * knee: capped at 3, and the step is never larger than the remaining error
+ * warrants. Convergence stays monotonic; only the far-from-target case
+ * speeds up (70 counts becomes ~24 steps, ~9 s). */
+#define PANEL_VREG_STEP_MAX       3
+
+/* Learning probes allowed before giving up on measuring this source.
+ *
+ * The gain is measured off the loop's own steps, so a loop that is not
+ * stepping learns nothing — and until it learns, the band stays at the wide
+ * static value that stopped it stepping. A loop parked in-band with the
+ * gain still unknown is therefore stuck in exactly the 14.09.26 stall, with
+ * no way out. (Normally acquisition breaks the circle for free: every
+ * activation starts near Voc, far outside any band, and the walk down
+ * measures the gain within a few steps. This is for the case where it did
+ * not — a resume that came up already in-band, or a source that swallowed
+ * the acquisition samples.)
+ *
+ * So when the gain is unknown and the error still exceeds
+ * PANEL_VREG_DEADBAND_MIN_MV, step toward the setpoint anyway: a correct
+ * control action in its own right, and the excitation that produces a
+ * sample. This bounds it for the source that never responds — a stiff
+ * bench PSU moves V_panel by nothing per count, so no sample is ever
+ * usable. 16 steps is 6.4 s, four times what the IIR needs, after which
+ * the loop holds exactly as it does today. */
+#define CHG_VLOOP_PROBE_MAX       16U
+
 /* PWM counts per regulation step. ONE count (~45 mA charge-side, ~25 mA
  * panel-side — see deadband note) is already ~20 % of this array's MPP
  * current. The previous 2-count step out-jumped the entire usable
@@ -819,6 +929,25 @@
 #define MPPT_SP_SETTLE_MS         2000UL
 #define MPPT_SP_MEASURE_MS        1000UL
 
+/* Hard cap on the settle phase (ms) once it also waits for ARRIVAL.
+ *
+ * MPPT_SP_SETTLE_MS alone assumes the inner loop realises a setpoint change
+ * within 2 s. It does not: at PANEL_VREG_STEP_MAX counts per
+ * PANEL_VREG_INTERVAL_MS, a 1000 mV probe on a 26-48 mV/count panel is
+ * 7-38 counts, i.e. 1-5 s. The 14.09.26 log shows the consequence — the
+ * activation walk pwm 106→84 took 9 s while the tracker ran three complete
+ * dwells against a plant that was still moving under it, then compared
+ * their averages as if they were fitness.
+ *
+ * So the settle phase now ends when the timer has expired AND V_panel is
+ * inside the band (the inner loop has arrived), which is what "settled"
+ * was always meant to mean. This cap bounds the case where it never
+ * arrives — a stiff source that cannot be pulled to the setpoint, or a
+ * setpoint fenced out of reach by cliff_pwm_min — so the tracker measures
+ * what it has rather than stalling. Measuring a not-quite-arrived plant is
+ * the OLD behaviour, so the cap is strictly no worse than today. */
+#define MPPT_SP_SETTLE_MAX_MS     8000UL
+
 /* Improvement threshold (mA) between dwell averages. Below this the two
  * setpoints are considered equal-power: the tracker reverses instead of
  * walking on noise — this is what makes it converge (not random-walk)
@@ -889,6 +1018,15 @@
  * loop can "park" at open circuit drawing zero current. Ceiling =
  * Voc − this. 300 mV of real load below OC plus the band half-width. */
 #define MPPT_SP_VOC_GUARD_MV      (PANEL_VREG_DEADBAND_MV + 300U)
+
+/* The load margin inside that guard — the part that is NOT the band half-
+ * width. mppt.c computes the live ceiling as
+ * charger_vreg_deadband_mv() + this, so the guard tracks the adaptive band:
+ * on the 13 V panel it falls from 1500 mV to ~450 mV, which is what finally
+ * lets the setpoint reach the near-Voc region that low irradiance pushes
+ * the MPP into (the authority hole of v0.33). MPPT_SP_VOC_GUARD_MV above
+ * remains the un-learned value. */
+#define MPPT_SP_VOC_GUARD_MARGIN_MV 300U
 
 /* Collapse blanking (ms) from dwell start. A probe below the panel's
  * knee collapses V_panel (< PANEL_SAFETY_MV); the tracker must react

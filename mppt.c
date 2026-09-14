@@ -86,6 +86,7 @@
  */
 
 #include "mppt.h"
+#include "charger.h"     /* charger_vreg_deadband_mv: the live band */
 #include "SPCBoardAPI.h"
 
 #if CHARGER_INPUT_VREG
@@ -111,12 +112,14 @@
  * unloaded, drawing nothing. Applied only once a credible Voc estimate
  * exists (see the comment at the ceiling check below).
  */
-static uint16_t sp_clamp(const mppt_ctx_t *m, int32_t sp)
+static uint16_t sp_clamp(const system_ctx_t *ctx, int32_t sp)
 {
-    int32_t lo = (int32_t)MPPT_SP_MIN_MV;
+    const mppt_ctx_t *m = &ctx->mppt;
+    int32_t band = (int32_t)charger_vreg_deadband_mv(ctx);
+    int32_t lo   = (int32_t)MPPT_SP_MIN_MV;
     if (m->panel_voc_mv >= PANEL_MIN_MV) {
         int32_t voc_lo = ((int32_t)m->panel_voc_mv * MPPT_SP_FLOOR_PCT) / 100
-                       - (int32_t)PANEL_VREG_DEADBAND_MV;
+                       - band;
         if (voc_lo > lo) lo = voc_lo;
     }
     if ((int32_t)m->sp_session_floor_mv > lo)
@@ -131,19 +134,26 @@ static uint16_t sp_clamp(const mppt_ctx_t *m, int32_t sp)
      * parkable region (simulation: load-biased capture + guard left
      * every reachable band hopping the knee). */
     if (m->panel_voc_mv >= PANEL_MIN_MV) {
-        int32_t hi = (int32_t)m->panel_voc_mv - (int32_t)MPPT_SP_VOC_GUARD_MV;
+        int32_t hi = (int32_t)m->panel_voc_mv -
+                     (band + (int32_t)MPPT_SP_VOC_GUARD_MARGIN_MV);
         if (hi < lo) hi = lo;
         if (sp > hi) return (uint16_t)hi;
     }
     return (uint16_t)sp;
 }
 
+static inline int32_t abs_diff_i32(int32_t a, int32_t b)
+{
+    return (a > b) ? (a - b) : (b - a);
+}
+
 /* Begin a new dwell at the CURRENT setpoint: settle, then measure. */
 static void start_dwell(system_ctx_t *ctx)
 {
     mppt_ctx_t *m   = &ctx->mppt;
-    m->dwell_start_ms = time_now();
-    m->dwell_phase    = 0;          /* settling */
+    m->dwell_start_ms   = time_now();
+    m->measure_start_ms = m->dwell_start_ms;
+    m->dwell_phase      = 0;        /* settling */
     m->ichg_acc       = 0;
     m->ichg_acc_cnt   = 0;
     m->dwell_dipped   = false;
@@ -171,7 +181,7 @@ static void sp_push_up(system_ctx_t *ctx)
      * adaptive step has refined, a fine down-probe that dips must step
      * back exactly to the known-good level — a coarse push would raise
      * the session floor PAST the accepted optimum and fence it out. */
-    uint16_t up = sp_clamp(m, (int32_t)m->vreg_setpoint_mv +
+    uint16_t up = sp_clamp(ctx, (int32_t)m->vreg_setpoint_mv +
                               (int32_t)m->sp_step_mv);
     m->vreg_setpoint_mv     = up;
     m->prev_sp_mv           = up;
@@ -207,12 +217,12 @@ static void sp_probe_step(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
     uint16_t cur  = m->vreg_setpoint_mv;
-    uint16_t next = sp_clamp(m, (int32_t)cur +
+    uint16_t next = sp_clamp(ctx, (int32_t)cur +
                       (int32_t)m->sp_direction * (int32_t)m->sp_step_mv);
     if (next == cur) {
         m->sp_direction = (int8_t)-m->sp_direction;
         sp_note_reversal(m);
-        next = sp_clamp(m, (int32_t)cur +
+        next = sp_clamp(ctx, (int32_t)cur +
                   (int32_t)m->sp_direction * (int32_t)m->sp_step_mv);
     }
     m->prev_sp_mv       = cur;
@@ -299,11 +309,13 @@ static void sp_learn_cliff(system_ctx_t *ctx)
     if (m->last_good_vpanel_mv < PANEL_MIN_MV)
         return;                                  /* nothing credible learned */
 
+    int32_t band     = (int32_t)charger_vreg_deadband_mv(ctx);
     int32_t floor_sp = (int32_t)m->last_good_vpanel_mv
-                     - (int32_t)PANEL_VREG_DEADBAND_MV
+                     - band
                      + (int32_t)MPPT_SP_CLIFF_MARGIN_MV;
     if (m->panel_voc_mv >= PANEL_MIN_MV) {
-        int32_t hi = (int32_t)m->panel_voc_mv - (int32_t)MPPT_SP_VOC_GUARD_MV;
+        int32_t hi = (int32_t)m->panel_voc_mv -
+                     (band + (int32_t)MPPT_SP_VOC_GUARD_MARGIN_MV);
         if (floor_sp > hi) floor_sp = hi;
     }
     if (floor_sp <= (int32_t)m->sp_session_floor_mv)
@@ -311,7 +323,7 @@ static void sp_learn_cliff(system_ctx_t *ctx)
 
     m->sp_session_floor_mv = (uint16_t)floor_sp;
     /* Resume above the cliff, probing away from it. */
-    uint16_t up = sp_clamp(m, (int32_t)m->vreg_setpoint_mv);
+    uint16_t up = sp_clamp(ctx, (int32_t)m->vreg_setpoint_mv);
     m->vreg_setpoint_mv = up;
     m->prev_sp_mv       = up;
     m->sp_direction     = +1;
@@ -370,6 +382,12 @@ static void enter_tracking_fresh(system_ctx_t *ctx)
     ctx->mppt.sp_session_floor_mv = MPPT_SP_MIN_MV;  /* ...and its cliff  */
     ctx->mppt.cliff_pwm_min       = 0;               /* ...in both domains */
     ctx->mppt.last_good_vpanel_mv = 0;
+    ctx->charger.plant_mv_per_count = 0;  /* ...and its gain: the regulation
+                                           * band goes back to the static
+                                           * PANEL_VREG_DEADBAND_MV until the
+                                           * voltage loop has measured this
+                                           * panel (hw_config.h) */
+    ctx->charger.vloop_measure_armed = false;
     tracking_common(ctx);
 }
 
@@ -454,9 +472,28 @@ static void tracking_tick(system_ctx_t *ctx)
         return;   /* collapsed reading: never measure, let the rail recover */
     }
 
-    /* ── Phase 0: settle ── */
+    /* ── Phase 0: settle ──
+     *
+     * "Settled" means the INNER loop has arrived, not that a timer expired.
+     * cc_regulate realises a setpoint change at a few PWM counts per
+     * PANEL_VREG_INTERVAL_MS, so a coarse probe takes seconds to reach the
+     * plant — bench 14.09.26, the activation walk pwm 106→84 took 9 s, and
+     * the tracker ran three whole dwells against a plant still in transit
+     * and then compared their averages as though they were fitness.
+     *
+     * So wait for both: the timer AND V_panel inside the band. Capped at
+     * MPPT_SP_SETTLE_MAX_MS for the setpoint that is never reached at all
+     * (a stiff source, or one fenced out of reach by cliff_pwm_min) — that
+     * case measures a not-quite-arrived plant, which is exactly what every
+     * dwell did before. */
     if (m->dwell_phase == 0) {
-        if (dwelt >= MPPT_SP_SETTLE_MS) {
+        bool arrived =
+            (uint32_t)abs_diff_i32((int32_t)ctx->meas.panel_voltage,
+                                   (int32_t)m->vreg_setpoint_mv)
+            <= (uint32_t)charger_vreg_deadband_mv(ctx);
+
+        if (dwelt >= MPPT_SP_SETTLE_MS &&
+            (arrived || dwelt >= MPPT_SP_SETTLE_MAX_MS)) {
             /* Deferred FOCV seed (fresh activation only), now that the
              * MA has fully settled past the plug-in transient:
              *   sp = k·Voc − deadband
@@ -476,14 +513,15 @@ static void tracking_tick(system_ctx_t *ctx)
                 if (m->panel_voc_mv >= PANEL_MIN_MV) {
                     int32_t seed = ((int32_t)m->panel_voc_mv *
                                     MPPT_SP_FRACTION_PCT) / 100
-                                 - (int32_t)PANEL_VREG_DEADBAND_MV;
-                    m->vreg_setpoint_mv = sp_clamp(m, seed);
+                                 - (int32_t)charger_vreg_deadband_mv(ctx);
+                    m->vreg_setpoint_mv = sp_clamp(ctx, seed);
                     m->prev_sp_mv       = m->vreg_setpoint_mv;
                 }
                 start_dwell(ctx);
                 return;
             }
-            m->dwell_phase = 1;
+            m->dwell_phase      = 1;
+            m->measure_start_ms = now;
         }
         return;
     }
@@ -499,10 +537,11 @@ static void tracking_tick(system_ctx_t *ctx)
      * measured average is oscillation-phase noise, not fitness. The
      * 300 mV margin ignores parked readings grazing the edge. */
     if ((int32_t)ctx->meas.panel_voltage <
-        (int32_t)m->vreg_setpoint_mv - (int32_t)PANEL_VREG_DEADBAND_MV - 300)
+        (int32_t)m->vreg_setpoint_mv -
+        (int32_t)charger_vreg_deadband_mv(ctx) - 300)
         m->dwell_dipped = true;
 
-    if (dwelt < (MPPT_SP_SETTLE_MS + MPPT_SP_MEASURE_MS))
+    if ((now - m->measure_start_ms) < MPPT_SP_MEASURE_MS)
         return;
 
     /* ── Whipsaw dwell: the setpoint is too low to park — push up.
@@ -742,7 +781,7 @@ void mppt_update(system_ctx_t *ctx)
          * nothing the hold-expiry re-probe won't). */
         if (ctx->meas.panel_voltage < PANEL_SAFETY_MV &&
             (time_now() - m->hold_start_ms) >= MPPT_SP_COLLAPSE_BLANK_MS) {
-            uint16_t up = sp_clamp(m, (int32_t)m->vreg_setpoint_mv +
+            uint16_t up = sp_clamp(ctx, (int32_t)m->vreg_setpoint_mv +
                                       (int32_t)MPPT_SP_STEP_MV);
             if (up != m->vreg_setpoint_mv) {
                 m->vreg_setpoint_mv = up;

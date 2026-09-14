@@ -83,7 +83,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.36\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.38\r\n"
                 "==============================================\r\n");
 }
 
@@ -275,7 +275,8 @@ static void log_measurements(void)
         "Tbat:%d Tboard:%d "
         "bat_low:%u has_sun:%u has_load:%u temp_ok:%u p_limited:%u bat_full:%u "
         "i_buck_max:%u allowed_chg:%u "
-        "EM:%s CHG:%s MPPT:%s pwm:%u pwmf:%u sp:%u spf:%u dips:%u fault:%04X flt_hist:%04X "
+        "EM:%s CHG:%s MPPT:%s pwm:%u pwmf:%u sp:%u spf:%u gain:%u db:%u "
+        "dips:%u fault:%04X flt_hist:%04X "
         "tsens:%u derate:%u\r\n",
         (unsigned long)time_now(),
         m->bat_voltage, m->chg_voltage, m->out_voltage,
@@ -292,6 +293,12 @@ static void log_measurements(void)
         mppt_state_name(ctx.mppt.state),
         ctx.pwm, ctx.mppt.cliff_pwm_min,
         ctx.mppt.vreg_setpoint_mv, ctx.mppt.sp_session_floor_mv,
+        /* gain = measured mV of V_panel per PWM count (0 = not yet learned),
+         * db = the regulation half-band it produces. Together they say
+         * whether the loop can still command the setpoint it has: the
+         * 14.09.26 stall was sp 12414 / V_panel 13450 / db 1200. */
+        (unsigned)ctx.charger.plant_mv_per_count,
+        (unsigned)charger_vreg_deadband_mv(&ctx),
         (unsigned)ctx.charger.input_dip_events,
         ctx.fault.code, ctx.fault.history,
         (unsigned)ctx.temp_sensor_ok, (unsigned)ctx.thermal.derate_pct);

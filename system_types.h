@@ -339,6 +339,25 @@ typedef struct {
     uint8_t  input_trace_result;   /* INPUT_TRACE_*                          */
     bool     input_trace_pending;  /* a snapshot is waiting to be logged     */
 
+    /* ── Online plant gain (the adaptive regulation band) ──
+     * |ΔV_panel| per PWM count, mV, as measured by the voltage loop's own
+     * paced steps: it moves the PWM, waits PANEL_VREG_INTERVAL_MS (past the
+     * ADC group delay), and reads what happened. See the adaptive-deadband
+     * note in hw_config.h for why a band specified in millivolts is a band
+     * of unknown width. 0 = nothing learned yet; the loop then uses the
+     * static PANEL_VREG_DEADBAND_MV, exactly as it did before. */
+    uint16_t plant_mv_per_count;
+    uint16_t vloop_prev_pwm;      /* pwm as the last measurable step left it  */
+    uint16_t vloop_prev_vp_mv;    /* V_panel at that moment                   */
+    uint8_t  vloop_probe_steps;   /* learning probes spent without a usable
+                                   * gain sample; caps how far the probe may
+                                   * walk on a source that does not respond
+                                   * (see CHG_VLOOP_PROBE_MAX).             */
+    bool     vloop_measure_armed; /* that step was the voltage loop's alone —
+                                   * no clamp, guard or backoff touched the
+                                   * PWM, so the pair above is a clean gain
+                                   * sample one interval from now.            */
+
     /* time_now() value before which energy_mode must not re-arm the charger
      * region. Stops the input-loss stand-down and the re-arm path from
      * fighting inside the same tick. */
@@ -499,6 +518,11 @@ typedef struct {
                                  * down to MPPT_SP_STEP_MIN_MV (brackets
                                  * the knee below one PWM count)          */
     uint8_t  dwell_phase;       /* 0 = settling, 1 = measuring            */
+    uint32_t measure_start_ms;  /* time_now() when phase 1 began. The settle
+                                 * phase now also waits for the inner loop to
+                                 * ARRIVE, so it has no fixed length and the
+                                 * measure window cannot be timed off
+                                 * dwell_start_ms any more.               */
     int8_t   sp_direction;      /* +1 = probing toward Voc, -1 = away     */
     int32_t  ichg_acc;          /* chg_current accumulator over the
                                  * measure window                         */
@@ -823,6 +847,13 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->mppt.prev_sp_mv       = PANEL_VREG_SETPOINT_MV;
     ctx->mppt.sp_direction     = +1;
     ctx->mppt.sp_session_floor_mv = MPPT_SP_MIN_MV;   /* no cliff learned yet */
+    ctx->mppt.measure_start_ms      = 0;
+    ctx->charger.plant_mv_per_count = 0;             /* band: static until
+                                                      * the loop measures  */
+    ctx->charger.vloop_prev_pwm     = 0;
+    ctx->charger.vloop_prev_vp_mv   = 0;
+    ctx->charger.vloop_probe_steps  = 0;
+    ctx->charger.vloop_measure_armed = false;
     ctx->mppt.cliff_pwm_min       = 0;                /* ...in either domain  */
     /* Nothing learned yet: the first activation must take the FOCV path.
      * (disabled_since_ms stays 0 from the struct zeroing — it is only read

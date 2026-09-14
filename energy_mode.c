@@ -96,6 +96,8 @@ static void deactivate_charger_region(system_ctx_t *ctx)
     ctx->charger.active_start_ms = 0;
     ctx->charger.activation_ready_mv = 0;
     ctx->charger.cc_last_downstep_ms = 0;
+    ctx->charger.vloop_measure_armed = false;
+    ctx->charger.vloop_probe_steps   = 0;
     ctx->charger.bat_full_timing = false;
     ctx->charger.bat_full_signaled = false;
 
@@ -195,6 +197,10 @@ static void activate_charger_region(system_ctx_t *ctx)
     ctx->charger.activation_ready_mv =
         ctx->meas.bat_voltage + CHG_BUCK_READY_MARGIN_MV;
     ctx->charger.cc_last_downstep_ms = ctx->charger.active_start_ms;
+    /* The pre-positioned PWM is not a step the voltage loop took, so it is
+     * not a gain sample — discard any left armed by the previous session. */
+    ctx->charger.vloop_measure_armed = false;
+    ctx->charger.vloop_probe_steps   = 0;
     ctx->charger.bat_full_timing = false;
     ctx->charger.bat_full_signaled = false;
     enable_input_buck();

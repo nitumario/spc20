@@ -158,12 +158,36 @@ static void charger_input_stand_down(system_ctx_t *ctx)
 {
     charger_ctx_t *c = &ctx->charger;
     /* charger_fast_guard reaches here without a snapshot; take one so the
-     * log gets a trace for every stand-down, whichever guard called it. */
-    if (!c->input_trace_pending) {
-        adc_panel_trace_mv(c->input_trace_mv);
-        c->input_trace_pwm_from = ctx->pwm;
-        c->input_trace_pending  = true;
-    }
+     * log gets a trace for every stand-down, whichever guard called it.
+     *
+     * ⚠ Gate on input_lost_count, NOT on input_trace_pending alone.
+     * input_trace_pending is a LOGGING flag: log_input_trace clears it on
+     * every 50 ms pipeline tick (before its own LOG_MODE_OFF return, so this
+     * happens in every build). The guard's descent spans up to three 10 ms
+     * conversions, so a tick boundary lands between its first sighting and
+     * this stand-down about half the time — and re-snapshotting here then
+     * records input_trace_pwm_from AFTER the guard's own two
+     * CHG_INPUT_RECOVER_STEP backoffs. learn_cliff_pwm reads that field as
+     * "the draw that fell over" and fences 2*CHG_INPUT_RECOVER_STEP counts
+     * too high, permanently.
+     *
+     * Bench 14.09.26, serial_20260914_085920.log: the panel peaked at 5.0 W
+     * (pwm 59, 12.49 V, 400 mA) and fell over at pwm 58. INTRACE printed
+     * `PENDING pwm:58->78` @ 24832 ms; the stand-down landed @ 24883 ms, one
+     * tick later, and overwrote pwm_from with 78. The fence came out at 84
+     * instead of 64 and pinned the next 211 s at pwm 84 / 13.45 V / ~2.5 W —
+     * half the available power, on a panel whose MPP the tracker had already
+     * measured.
+     *
+     * input_lost_count is the honest test: charger_input_guard leaves it
+     * non-zero for the whole event (it resets it at the END of this
+     * function), and charger_fast_guard — the path that genuinely has no
+     * snapshot — always arrives with it at zero. */
+    if (!c->input_trace_pending)
+        adc_panel_trace_mv(c->input_trace_mv);  /* old window already printed */
+    if (c->input_lost_count == 0)
+        c->input_trace_pwm_from = ctx->pwm;     /* no guard snapshot: this is it */
+    c->input_trace_pending = true;              /* always re-arm the log line */
     c->input_trace_result = INPUT_TRACE_STOOD_DOWN;
 
     disable_charge_switch();
@@ -172,6 +196,7 @@ static void charger_input_stand_down(system_ctx_t *ctx)
     c->input_trace_pwm_to  = ctx->pwm;
     c->input_lost_pending  = true;
     c->input_lost_count    = 0;   /* next connection starts clean */
+    c->vloop_measure_armed = false;
 }
 
 /*
@@ -274,6 +299,15 @@ void charger_input_guard(system_ctx_t *ctx)
     ctx->pwm = pwm_clamp((int32_t)ctx->pwm + (int32_t)CHG_INPUT_RECOVER_STEP);
     set_buck_pwm(ctx->pwm);
     c->input_trace_pwm_to = ctx->pwm;
+
+    /* Whatever the voltage loop had armed, this interval is no longer a
+     * measurement of the plant: the PWM moved 10 counts underneath it and
+     * V_panel is mid-collapse. A rescue that happens to recover with the
+     * signs agreeing (rail snaps from V_bat back to Voc while the guard
+     * steps the draw off) reads as ~470 mV/count — inside the sanity
+     * clamps, and enough to widen the band right back to where this whole
+     * change started. Drop it instead. */
+    c->vloop_measure_armed = false;
 }
 
 void charger_fast_guard(system_ctx_t *ctx)
@@ -467,6 +501,7 @@ static bool panel_safety_backoff(system_ctx_t *ctx)
 #endif
 
     pwm_step(ctx, +PANEL_BACKOFF_STEP);  /* reduce current → V_panel recovers */
+    ctx->charger.vloop_measure_armed = false;  /* not a plant measurement */
     return true;
 }
 
@@ -498,7 +533,125 @@ static inline bool mppt_owns_pwm(const system_ctx_t *ctx)
  *
  * Two implementations, selected by CHARGER_INPUT_VREG (hw_config.h):
  */
+/* =========================================================================
+ * Adaptive regulation band
+ * ========================================================================= */
+
+/*
+ * charger_vreg_deadband_mv — half-width of the V_panel regulation band.
+ *
+ * The band's job is to guarantee a reachable operating point inside it:
+ * one PWM count must move V_panel by LESS than the band, or the loop hops
+ * clean across it every interval and whipsaws the panel over its knee.
+ * That is a statement about PWM counts, and PANEL_VREG_DEADBAND_MV is only
+ * what it evaluated to on the panel it was tuned against — see the adaptive
+ * deadband note in hw_config.h, and bench 14.09.26 for the 2.5 W it costs
+ * on a panel with a 20x smaller gain.
+ *
+ * So: derive it from the gain the loop has actually measured, fall back to
+ * the static value until there is one, and never exceed it. Shared with
+ * mppt.c, which sizes the FOCV seed, the setpoint clamps and the dip
+ * classifier off the same band.
+ */
+uint16_t charger_vreg_deadband_mv(const system_ctx_t *ctx)
+{
+    uint32_t gain = ctx->charger.plant_mv_per_count;
+    if (gain == 0)
+        return PANEL_VREG_DEADBAND_MV;      /* nothing measured yet */
+
+    uint32_t db = gain * PANEL_VREG_DEADBAND_COUNTS;
+    if (db < PANEL_VREG_DEADBAND_MIN_MV) db = PANEL_VREG_DEADBAND_MIN_MV;
+    if (db > PANEL_VREG_DEADBAND_MV)     db = PANEL_VREG_DEADBAND_MV;
+    return (uint16_t)db;
+}
+
 #if CHARGER_INPUT_VREG
+/*
+ * vloop_observe_gain — fold the last paced step into the gain estimate.
+ *
+ * Called once per PANEL_VREG_INTERVAL_MS at the top of cc_regulate, before
+ * anything moves the PWM, so ctx->meas.panel_voltage is the settled answer
+ * to the step taken one interval ago (the interval is >= the 64-sample ADC
+ * group delay by construction — that is why it exists).
+ *
+ * Only steps the voltage loop took alone are measurable, and only if the
+ * panel moved the way the plant says it must (pwm DOWN → draw more → V
+ * falls). A sample that disagrees is not the plant: it is an irradiance
+ * step, a collapse tail, or the guard having moved the PWM underneath us.
+ * Throw those away rather than filtering them — a single wrong-signed
+ * sample dragged through the IIR is a wrong band for seconds.
+ */
+static void vloop_observe_gain(system_ctx_t *ctx)
+{
+    charger_ctx_t *c = &ctx->charger;
+
+    if (!c->vloop_measure_armed)
+        return;
+    c->vloop_measure_armed = false;
+
+    int32_t d_pwm = (int32_t)c->vloop_prev_pwm - (int32_t)ctx->pwm;
+    int32_t d_v   = (int32_t)c->vloop_prev_vp_mv -
+                    (int32_t)ctx->meas.panel_voltage;
+    if (d_pwm == 0)
+        return;
+
+    /* pwm DOWN (d_pwm > 0) must lower V_panel (d_v > 0), and vice versa:
+     * the ratio is positive on a real plant reading, either direction. */
+    if ((d_pwm > 0) != (d_v > 0))
+        return;
+
+    if (d_pwm < 0) { d_pwm = -d_pwm; d_v = -d_v; }
+
+    uint32_t sample = (uint32_t)d_v / (uint32_t)d_pwm;
+    if (sample < PANEL_GAIN_MIN_MV_PER_COUNT ||
+        sample > PANEL_GAIN_MAX_MV_PER_COUNT)
+        return;                              /* not a plant measurement */
+
+    c->vloop_probe_steps = 0;                       /* this source responds */
+
+    /* ASYMMETRIC on purpose. The gain is not one number: measured per count
+     * on the 14.09.26 panel it is 16-55 mV/count across the flat stretch
+     * (pwm 62-105) and 138-192 mV/count at the knee (pwm 59-61) — an order
+     * of magnitude, on one curve, and the steep end is the end that
+     * collapses. Underestimating it is the dangerous direction: the step law
+     * divides by it, so a stale flat-region estimate carried into the knee
+     * asks for the maximum step exactly where the plant moves furthest per
+     * count. So believe a STEEPER reading immediately and filter only the
+     * flatter ones. The band widens with it, which damps the approach to the
+     * knee by itself. */
+    if (c->plant_mv_per_count == 0 || sample > c->plant_mv_per_count) {
+        c->plant_mv_per_count = (uint16_t)sample;
+    } else {
+        uint32_t old = c->plant_mv_per_count;
+        c->plant_mv_per_count = (uint16_t)
+            (old - ((old - sample) >> PANEL_GAIN_IIR_SHIFT));
+    }
+}
+
+/*
+ * vloop_step_counts — how many counts to move for this error.
+ *
+ * One count per interval is the dead-time rule near the setpoint, and it
+ * stays one until the gain is known. With a gain, a long traverse (Voc down
+ * to the seed: 38-70 counts on the 14.09.26 panel, 15-28 s at one count per
+ * 400 ms, the whole of it with the tracker dwelling on a moving plant) can
+ * be sized to the error instead. Still closed-loop: the step never exceeds
+ * what the remaining error justifies, and PANEL_VREG_STEP_MAX keeps a
+ * mis-estimated gain from leaping the knee in one interval.
+ */
+static int32_t vloop_step_counts(const system_ctx_t *ctx, int32_t err_mv)
+{
+    uint32_t gain = ctx->charger.plant_mv_per_count;
+    if (gain == 0)
+        return PANEL_VREG_STEP;
+
+    if (err_mv < 0) err_mv = -err_mv;
+    int32_t n = err_mv / (int32_t)gain;
+    if (n < PANEL_VREG_STEP)     n = PANEL_VREG_STEP;
+    if (n > PANEL_VREG_STEP_MAX) n = PANEL_VREG_STEP_MAX;
+    return n;
+}
+
 /*
  * INPUT-VOLTAGE-REGULATED bulk charging ("constant-voltage MPPT").
  *
@@ -561,6 +714,10 @@ static void cc_regulate(system_ctx_t *ctx)
         return;
     ctx->charger.cc_last_downstep_ms = now;
 
+    /* The step taken one interval ago has now settled through the ADC
+     * average: read the plant's gain off it before anything moves again. */
+    vloop_observe_gain(ctx);
+
     int32_t i_chg    = (int32_t)ctx->meas.chg_current;
     int32_t i_limit  = (int32_t)ctx->allowed_chg;
     int32_t v_panel  = (int32_t)ctx->meas.panel_voltage;
@@ -576,14 +733,14 @@ static void cc_regulate(system_ctx_t *ctx)
      * two can never fight. */
     if (i_chg < -(int32_t)CHG_REVERSE_CURRENT_MA) {
         pwm_step(ctx, -PANEL_BACKOFF_STEP);
-        return;
+        return;   /* not the voltage loop's step: no gain sample */
     }
 
     /* Clamp 1: never exceed the battery's allowed intake. Over-current
      * always wins → reduce current → pwm UP (toward off). */
     if (i_chg > i_limit + CC_DEADBAND_MA) {
         pwm_step(ctx, +PANEL_VREG_STEP);
-        return;
+        return;   /* current-limited, not voltage-limited: no gain sample */
     }
 
     /* Clamp 2: regulate the panel to the MPP setpoint. The target is the
@@ -592,16 +749,42 @@ static void cc_regulate(system_ctx_t *ctx)
      * see mppt.c), NOT the static PANEL_VREG_SETPOINT_MV, which is only its
      * cold-boot seed. */
     int32_t v_sp = (int32_t)ctx->mppt.vreg_setpoint_mv;
-    if (v_panel < v_sp - (int32_t)PANEL_VREG_DEADBAND_MV) {
+    int32_t band = (int32_t)charger_vreg_deadband_mv(ctx);
+    int32_t err  = v_panel - v_sp;
+
+    /* Arm the gain measurement: from here on the only thing that moves the
+     * PWM this interval is the voltage loop itself, so whatever V_panel has
+     * done by the next call is this step's answer. Recorded BEFORE the step
+     * (vloop_observe_gain differences against ctx->pwm as it stands then). */
+    uint16_t pwm_before = ctx->pwm;
+
+    if (err < -band) {
         /* Sagging below MPP → drawing too much → DRAW LESS (pwm UP) → V recovers. */
-        pwm_step(ctx, +PANEL_VREG_STEP);
-    } else if (v_panel > v_sp + (int32_t)PANEL_VREG_DEADBAND_MV) {
+        pwm_step(ctx, +vloop_step_counts(ctx, err));
+    } else if (err > band) {
         /* Above MPP with current-headroom (clamp 1 didn't fire) → DRAW MORE (pwm DOWN) → V falls.
          * Fenced by the learned PWM ceiling: this branch is what walked the
          * panel off its knee in the first two teardowns of the 10.09.26
          * session (V_panel 1.5 V above the band, one step per interval,
-         * straight into the collapse). */
-        pwm_draw_more(ctx, PANEL_VREG_STEP);
+         * straight into the collapse).
+         *
+         * It is also the branch the 14.09.26 log needed and never got: the
+         * band was 1200 mV wide against a 1036 mV error, so a converged,
+         * correct setpoint sat uncommanded for 211 s at half power. The band
+         * is now sized to the measured plant — see charger_vreg_deadband_mv. */
+        pwm_draw_more(ctx, vloop_step_counts(ctx, err));
+    } else if (ctx->charger.plant_mv_per_count == 0 &&
+               ctx->charger.vloop_probe_steps < CHG_VLOOP_PROBE_MAX &&
+               (err > (int32_t)PANEL_VREG_DEADBAND_MIN_MV ||
+                err < -(int32_t)PANEL_VREG_DEADBAND_MIN_MV)) {
+        /* Learning probe: in-band by the WIDE fallback band only because the
+         * gain that would narrow it has never been measured — and it never
+         * will be while the loop holds still. Step toward the setpoint: the
+         * right direction regardless, and the excitation that breaks the
+         * circle. See CHG_VLOOP_PROBE_MAX. */
+        ctx->charger.vloop_probe_steps++;
+        if (err > 0) pwm_draw_more(ctx, PANEL_VREG_STEP);
+        else         pwm_step(ctx, +PANEL_VREG_STEP);
     } else if (i_chg < (int32_t)LOAD_REACQUIRE_MA) {
         /* Clamp 3: in-band but delivering ~nothing → RE-ACQUIRE (pwm DOWN).
          * This is the tail of a panel_safety_backoff overshoot: the emergency
@@ -622,6 +805,15 @@ static void cc_regulate(system_ctx_t *ctx)
         pwm_draw_more(ctx, PANEL_VREG_STEP);
     }
     /* Within the deadband and delivering current → stable, hold PWM. */
+
+    /* A step of at least one count, taken by the voltage loop alone, is a
+     * clean gain sample one interval from now. Holding is not (no
+     * excitation), and neither is a step the fence swallowed. */
+    if (ctx->pwm != pwm_before) {
+        ctx->charger.vloop_prev_pwm      = pwm_before;
+        ctx->charger.vloop_prev_vp_mv    = (uint16_t)v_panel;
+        ctx->charger.vloop_measure_armed = true;
+    }
 }
 #else
 /*

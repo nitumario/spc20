@@ -1,3 +1,127 @@
+# [v0.38] - 14.09.26
+## Two ways to be fenced off the MPP: a mis-learned cliff, and a band wider than the plant
+
+Changed files: `charger.c`, `charger.h`, `mppt.c`, `energy_mode.c`,
+`hw_config.h`, `system_types.h`, `main.c`, `CHANGELOG.md`
+
+### The problem
+`serial_20260914_085920.log`. The first charge session walks the panel down
+its own I-V curve and finds the maximum power point exactly:
+
+```
+pwm 66  Vp 13010  Ip 339  P 4410
+pwm 61  Vp 12802  Ip 368  P 4711
+pwm 60  Vp 12604  Ip 395  P 4978
+pwm 59  Vp 12494  Ip 400  P 4997   <- peak, Ip saturated at Isc
+pwm 59  Vp 12406  Ip 400  P 4962   <- rolling over
+```
+
+pwm 58 goes over the knee and the panel collapses (`INTRACE @ 24832 PENDING
+pwm:58->78`, stand-down at 24883). Everything after that runs at **half
+power**: from ms 35946 to 247262 — 211 seconds — `pwm` is frozen at 84,
+`V_panel` pinned at 13.4–13.5 V (95 % of the 14.14 V Voc), ~190 mA, ~2.5 W.
+Eleven seconds after a 5.0 W reading, the same panel in the same light makes
+2.7 W. Two independent mechanisms put it there.
+
+**1. The cliff fence learned the wrong number.** `pwmf` (`cliff_pwm_min`)
+reads 84. `learn_cliff_pwm` fences `input_trace_pwm_from +
+CHG_CLIFF_PWM_MARGIN` (6), so it should have learned 58 + 6 = 64. It learned
+78 + 6.
+
+`charger_input_stand_down` used `input_trace_pending` — a *logging* flag — as
+its "already snapshotted" test, and `log_input_trace` clears that flag on
+every 50 ms pipeline tick (before its own `LOG_MODE_OFF` return, so in every
+build). The guard's descent spans up to three 10 ms conversions, so a tick
+boundary lands between its first sighting and the stand-down roughly half the
+time. Here it did: the PENDING trace printed at 24832, the stand-down landed
+at 24883, and re-snapshotted `pwm_from` **after** the guard's own two
+`CHG_INPUT_RECOVER_STEP` backoffs. The guard's retreat got recorded as the
+draw that fell over, and the fence came out 20 counts too conservative —
+permanently, since `CHG_CLIFF_PWM_RELAX_MS` gives back one count per 180 s.
+
+**2. The regulation band is wider than the plant.** Even once the fence
+relaxed to 83 (ms 204937), `pwm` did not move. The tracker had converged its
+setpoint to 12414 mV — within 80 mV of the MPP it had itself measured at
+12494 mV — and `V_panel` sat at 13450 mV. Error 1036 mV, deadband 1200 mV, so
+`cc_regulate` held. The right answer was in `vreg_setpoint_mv` and no branch
+could command it.
+
+`PANEL_VREG_DEADBAND_MV`'s own note justifies 1200 mV entirely in PWM counts
+("more panel current than one step quantum", "≈ 2 PWM counts, so a landing
+point always exists"). That is a count criterion, and 1200 mV is only what it
+evaluated to on the 4x-parallel 6.5 V array. Measured on this panel: pwm
+106→84 moved V_panel 14142→13560 (26 mV/count near Voc), pwm 76→59 moved
+13318→12494 (48 mV/count near the knee). The band sized for "2 counts" is
+**±25 to ±46 counts** here — half the usable PWM range.
+
+The same band blinds the outer loop. A setpoint probe landing inside it moves
+the plant not at all, so the P&O measures its own noise, the ±15 mA gate calls
+it flat, it reverses, and it "converges" on a point it never visited. That is
+the 12414 it settled on.
+
+### The fix
+**Stop trusting a log flag with control state** (`charger.c`). The stand-down
+now gates its `pwm_from` capture on `input_lost_count`, which the guard leaves
+non-zero for the whole event and which is zero exactly on the
+`charger_fast_guard` path that genuinely has no snapshot. The log line is
+re-armed independently, so both INTRACE lines still print.
+
+**Measure the band instead of assuming it** (`charger.c`, `charger.h`,
+`hw_config.h`). `cc_regulate` steps one count per `PANEL_VREG_INTERVAL_MS`
+and observes the result after the ADC group delay — that is a plant-gain
+measurement, free, every interval. `vloop_observe_gain` folds each clean step
+into `charger.plant_mv_per_count` (sign-checked against the plant, sanity-
+clamped, discarded whenever a foreground guard moved the PWM underneath it),
+and `charger_vreg_deadband_mv` derives the live band:
+
+```
+deadband = clamp(gain * PANEL_VREG_DEADBAND_COUNTS,
+                 PANEL_VREG_DEADBAND_MIN_MV, PANEL_VREG_DEADBAND_MV)
+```
+
+`PANEL_VREG_DEADBAND_MV` survives as the ceiling and as the pre-measurement
+value, so a cold boot behaves as before and the 6.5 V array (gain
+~600 mV/count) lands back on its bench-validated 1200. `mppt.c` sizes the
+FOCV seed, both setpoint clamps, the cliff floor and the dip classifier off
+the same accessor, so the outer loop's idea of the band is always the one the
+inner loop enforces — which also drops `MPPT_SP_VOC_GUARD_MV` from 1500 to
+~450 mV on this panel and finally opens the near-Voc region that low
+irradiance pushes the MPP into (the authority hole of v0.33).
+
+**Break the learning circle** (`CHG_VLOOP_PROBE_MAX`). The gain is measured
+off the loop's own steps, so a loop parked in-band with no gain yet learns
+nothing and stays parked — the stall, exactly. Simulation against the logged
+I-V curve caught this: starting at pwm 84 with the setpoint at 12414, fixing
+the fence alone still parks at 2730 mW. When the gain is unknown and the error
+exceeds `PANEL_VREG_DEADBAND_MIN_MV`, the loop now steps toward the setpoint
+anyway — correct control in its own right, and the excitation that produces a
+sample. Bounded at 16 steps for a source that never responds (a stiff PSU
+moves nothing per count), after which it holds as before.
+
+**Size the step to the error** (`PANEL_VREG_STEP_MAX`, 3). One count per
+400 ms is right near the setpoint but makes a traverse glacial: the 14.09.26
+activation walk pwm 106→84 took 9 s. With a known gain the step is
+`err/gain` capped at 3 — still closed-loop (integer truncation means it can
+never carry past the setpoint) and still one observation per interval.
+
+**Wait for arrival, not for a timer** (`MPPT_SP_SETTLE_MAX_MS`). Phase 0 of a
+dwell now ends when the timer has expired AND `V_panel` is inside the band.
+During that 9 s walk the tracker ran three complete dwells against a plant
+still in transit and compared their averages as fitness. Capped at 8 s for a
+setpoint that is never reached, which is the old behaviour.
+
+**Telemetry**: `gain:` and `db:` join the log line. Together they say whether
+the loop can still command the setpoint it holds — the stall reads
+`sp:12414 gain:0 db:1200` against `Vpanel:13450`.
+
+### Status
+Builds clean under `-Wall -Wextra` in both `CHARGER_INPUT_VREG` modes.
+Validated only in simulation, replaying the logged panel curve: the stall
+condition (setpoint 12414, starting pwm 84) goes 2730 mW → 4408 mW with the
+fence at its corrected 64, and 4980 mW — the measured MPP — with the fence
+out of the way. Parking is dead still (zero pwm span over the last 50
+intervals) at every setpoint tried from 11000 to 13600 mV. **Awaiting bench.**
+
 # [v0.36] - 13.09.26
 ## The charger was never getting off the line: fast_guard latched at every activation
 
