@@ -264,15 +264,7 @@ void flags_update(system_ctx_t *ctx)
      * that event advances path 1, not this one — the two can't compound.
      * Clearing here arms the re-set lockout, since the unloaded panel floats
      * straight back above PANEL_MIN_MV (re-probe ~once a minute, not instantly). */
-    /* v0.44: ...and only while the buck is actually commanded to DRAW. A
-     * fence parked at the zero-delivery count is the firmware declining to
-     * load the panel, not the panel failing to deliver (CHG_DUSK_DRAW_COUNTS). */
-    bool charger_drawing =
-        (ctx->charger.zero_draw_pwm == 0) ||
-        ((uint32_t)ctx->pwm + CHG_DUSK_DRAW_COUNTS <=
-             (uint32_t)ctx->charger.zero_draw_pwm);
     bool panel_dead = ctx->flag_has_sun.value && charge_path_connected &&
-                      charger_drawing &&
                       (m->panel_voltage > PANEL_MIN_MV) &&
                       (m->panel_power   < PANEL_USABLE_MIN_MW);
     if (panel_dead) {

@@ -348,22 +348,7 @@ typedef struct {
                                    * claim (mppt.c) and sizes the RECOVERED
                                    * restore (charger.c)                    */
     uint16_t input_trace_vpanel_from; /* v0.41: averaged V_panel at the same
-                                   * moment — the knee voltage (v0.44)      */
-    bool     input_trace_settled;  /* v0.44: had the count been held for
-                                   * CHG_PWM_SETTLED_TICKS when the event
-                                   * started? If not, the averaged current
-                                   * describes the PREVIOUS count and the
-                                   * event teaches no knee (13:20 log: a
-                                   * droop at the zero-draw count, 200 ms
-                                   * after a full shed, learned a knee from
-                                   * a 537 mA average that belonged to the
-                                   * count before it)                       */
-    uint32_t last_backoff_ms;      /* v0.44: time_now() of the voltage loop's
-                                   * last sag step (pwm up because V_panel
-                                   * fell under the band). A loop that is
-                                   * backing off is a panel whose light is
-                                   * falling — mppt.c will not lower the
-                                   * voltage floor into that              */
+                                   * moment, for the Voc plausibility gate  */
 
     /* v0.41: where the rail is parked when delivery is zero — the count at
      * which the buck output sits exactly on the cell and no current flows in
@@ -483,10 +468,8 @@ typedef struct {
                                    * started — the delivery the count could not
                                    * hold. Sizes the event's backoff bound and
                                    * gates the knee claim (mppt.c)             */
-    uint16_t droop_vpanel_from;   /* v0.41: averaged V_panel at the same moment
-                                   * — the knee voltage (v0.44)                */
-    bool     droop_settled;       /* v0.44: count held CHG_PWM_SETTLED_TICKS at
-                                   * the sighting (see input_trace_settled)    */
+    uint16_t droop_vpanel_from;   /* v0.41: averaged V_panel at the same moment,
+                                   * for the Voc plausibility gate             */
     uint16_t droop_limit_pwm;     /* v0.41: highest count this event may back
                                    * off to — the zero-delivery point plus
                                    * CHG_ZERO_DRAW_MARGIN. Past it the guard
@@ -723,12 +706,6 @@ typedef struct {
                                  * where a search that ends on its runtime
                                  * cap parks. 0 = nothing measured yet     */
     int16_t  best_ichg;         /* ...and what it delivered                 */
-    uint16_t floor_probe_mv;    /* v0.44: how far below knee_vpanel_mv +
-                                 * MPPT_KNEE_VFLOOR_MV the voltage floor is
-                                 * currently lowered UNDER TEST; committed
-                                 * into knee_vpanel_mv when the dwell pays,
-                                 * dropped when it does not               */
-    bool     floor_probing;     /* a floor step is under test this dwell  */
     bool     event_knee_accepted; /* v0.41: did the last droop/dip event pass
                                  * the MPPT_KNEE_VOC_MAX_PCT plausibility
                                  * gate and move the fence? For the log   */

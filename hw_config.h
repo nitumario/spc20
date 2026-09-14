@@ -1085,15 +1085,6 @@
 #define CHG_BUCK_MA_PER_COUNT     45U
 #define CHG_ZERO_DRAW_MARGIN      1U
 
-/* v0.44: the has_sun "dead-but-floating panel" clear (measurements.c) only
- * counts while the buck is actually commanded to draw — at least this many
- * counts below the zero-delivery count. Bench 14.09.26 13:20: a droop at
- * the zero-draw count taught a knee there, the fence pinned the draw at
- * 91 mW on a panel sitting at 13.1 V, and four seconds later has_sun
- * cleared and the charger idled for HAS_SUN_RELOCK_MS (60 s). A panel the
- * firmware has chosen not to load is not a dead panel. */
-#define CHG_DUSK_DRAW_COUNTS      3U
-
 /* ── v0.42: telling a panel fall from the buck's own transient ───────────
  *
  * A panel falling cannot push MORE current into the cell: the buck's output
@@ -1278,37 +1269,6 @@
  * and above the regulation band, so a settled HOLD at the fence never
  * qualifies by noise. The timer stays as the fallback. */
 #define MPPT_KNEE_RELEASE_MV      500U
-
-/* ── v0.44: the knee is a VOLTAGE, and the search now stops above it ──────
- *
- * Bench 14.09.26 13:20 (v0.43): the light fell over five seconds and the
- * tracker collapsed the panel FOUR times in a row — at pwm 87, 92, 94, 98 —
- * because every re-descent after a rescue walked straight back to a fence
- * that the falling light had already left behind. A fence is a COUNT, and a
- * count is a fixed current draw; under falling light the maximum-power
- * point moves to a higher count while its VOLTAGE barely moves. So the
- * knee now also remembers where it was in volts (knee_vpanel_mv, v0.43),
- * and during TRACKING the voltage loop's target is that voltage plus this
- * margin (plus the regulation band, so the backoff fires AT the floor):
- * the descent is metered by the fence as before, but it cannot be driven
- * below the last collapse voltage however far the count says it may go,
- * and a sag under fading light is answered by the 400 ms loop instead of
- * the droop guard. HOLD's setpoint follow is floored the same way.
- *
- * 300 mV is ~2 counts at the 150 mV/count the plant shows near the knee
- * (the raw V_panel average at a droop sighting already lags the fall, so
- * the recorded knee voltage sits somewhat above the true knee). */
-#define MPPT_KNEE_VFLOOR_MV       300U
-
-/* A floor learned in bright light is too high for dimmer light (Vmp falls a
- * few hundred mV per halving of irradiance). When a fence probe cannot be
- * realised because the voltage loop is holding at the floor, the tracker
- * lowers the floor one MPPT_KNEE_VFLOOR_MV under test and lets the dwell
- * measurement decide — but only while the loop has been QUIET: no sag
- * backoff for this long. A loop that is backing off is a panel whose light
- * is falling, and lowering the floor into that is what v0.43 did four
- * times in five seconds. */
-#define MPPT_FLOOR_PROBE_QUIET_MS 3000UL
 
 /* ── Event-sourced knee sightings: what gates them ───────────────────────
  *
