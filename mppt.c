@@ -229,10 +229,14 @@ static void knee_learn(system_ctx_t *ctx, uint32_t bad_pwm, uint32_t margin,
  * (CHG_DROOP_SPIKE_MA) and never reports as an event at all.
  */
 static bool knee_learn_event(system_ctx_t *ctx, uint32_t bad_pwm,
-                             int16_t ichg_at, uint16_t vpanel_at)
+                             int16_t ichg_at, uint16_t vpanel_at,
+                             bool settled)
 {
     if (ichg_at < (int16_t)CHG_DELIVERING_MIN_MA)
         return false;                   /* nothing was being drawn there */
+    if (!settled)
+        return false;                   /* v0.44: the average describes the
+                                         * PREVIOUS count, not this one     */
 
     knee_learn(ctx, bad_pwm, CHG_CLIFF_PWM_MARGIN, vpanel_at);
     return true;
@@ -294,51 +298,112 @@ static bool knee_probe_step(system_ctx_t *ctx, uint8_t step)
 }
 
 /*
+ * sp_floor_mv (v0.44) — the knee VOLTAGE floor: the averaged V_panel at which
+ * the panel last collapsed or was measured not to pay, plus
+ * MPPT_KNEE_VFLOOR_MV, minus whatever is currently lowered under test
+ * (floor_probe_mv). 0 = no knee voltage known. See MPPT_KNEE_VFLOOR_MV.
+ */
+static uint16_t sp_floor_mv(const system_ctx_t *ctx)
+{
+    const mppt_ctx_t *m = &ctx->mppt;
+    if (m->knee_vpanel_mv == 0)
+        return 0;
+    uint32_t f = (uint32_t)m->knee_vpanel_mv + MPPT_KNEE_VFLOOR_MV;
+    if (f > m->floor_probe_mv) f -= m->floor_probe_mv; else f = 0;
+    /* A knee cannot sit at open circuit. A sighting right under Voc (a
+     * one-sample dip on an unloaded panel) would otherwise put the floor
+     * above anything the panel can show and the loop would back off
+     * forever; cap it one margin under the learned Voc. */
+    if (m->panel_voc_mv >= PANEL_MIN_MV &&
+        f + MPPT_KNEE_VFLOOR_MV > (uint32_t)m->panel_voc_mv)
+        f = (uint32_t)m->panel_voc_mv - MPPT_KNEE_VFLOOR_MV;
+    if (f < PANEL_MIN_MV)
+        return 0;
+    return (uint16_t)f;
+}
+
+/* The voltage-loop target that makes the backoff fire AT the floor: the loop
+ * steps up once V_panel < setpoint - band, so the setpoint sits one band
+ * above the floor. */
+static uint32_t sp_floor_target_mv(const system_ctx_t *ctx)
+{
+    uint16_t floor = sp_floor_mv(ctx);
+    if (floor == 0)
+        return 0;
+    return (uint32_t)floor + charger_vreg_deadband_mv(ctx);
+}
+
+/*
  * sp_follow — re-synchronise the voltage setpoint to where the plant is.
  *
  * The setpoint keeps exactly one job now: sag protection. Parked at the
  * settled operating voltage, cc_regulate's err < -band branch backs the draw
  * off when irradiance falls, as it always did — the fence is a floor on the
  * count, not a target, so backing off above it is free. Called on entry to
- * HOLD, once the fence has stopped moving.
+ * HOLD, once the fence has stopped moving, and every HOLD tick the reading
+ * is in band.
  *
- * During TRACKING the setpoint is instead parked LOW (sp_drive_down), so the
- * loop always wants more current and the fence alone meters the descent.
- * Protection during the search is charger_panel_droop_guard, which is both
- * faster and better targeted than the voltage loop ever was.
+ * v0.44: never below the knee voltage floor. A gradual sag used to be
+ * followed all the way down (the setpoint moved with the reading, so the
+ * loop never saw an error); now the follow stops at the floor and the loop
+ * backs off from there.
  */
 static void sp_follow(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
     if (ctx->meas.panel_voltage >= PANEL_MIN_MV) {
-        m->vreg_setpoint_mv = ctx->meas.panel_voltage;
+        uint32_t sp = ctx->meas.panel_voltage;
+        uint32_t f  = sp_floor_target_mv(ctx);
+        if (sp < f) sp = f;
+        m->vreg_setpoint_mv = (uint16_t)sp;
         m->prev_sp_mv       = m->vreg_setpoint_mv;
     }
 }
 
-/* Park the setpoint below anything the panel will show, so cc_regulate's
- * "above the band with headroom" branch fires every interval and the fence
- * is the only thing metering the descent.
+/*
+ * sp_track_target — the TRACKING setpoint.
  *
- * Just above PANEL_SAFETY_MV, not at MPPT_SP_MIN_MV. MPPT_SP_MIN_MV (6500)
- * was sized to keep a SETPOINT's band clear of the emergency floor, which
- * mattered when the setpoint was the target. It is the wrong number for a
- * "say more, forever" value: on the 6.5 V array the operating point IS
- * ~6500 mV, so a setpoint there sits inside its own 1200 mV band and the
- * loop would never command a single step — the descent would stall and the
- * fence would never be probed.
+ * With no knee voltage known (a fresh panel), parked below anything the
+ * panel will show, so cc_regulate's "above the band with headroom" branch
+ * fires every interval and the fence is the only thing metering the descent.
+ * Just above PANEL_SAFETY_MV, not at MPPT_SP_MIN_MV: on the 6.5 V array the
+ * operating point IS ~6500 mV, so a setpoint there sits inside its own band
+ * and the descent would stall.
  *
- * Setting it here is safe precisely because the setpoint no longer bounds
- * anything: the FENCE bounds the descent, one measured count at a time, and
- * panel_safety_backoff still owns everything under PANEL_SAFETY_MV (it runs
- * before cc_regulate and returns, so the two can never fight). A plant that
- * actually sagged to this level would have tripped the droop guard many
- * volts earlier. */
-static void sp_drive_down(system_ctx_t *ctx)
+ * With a knee voltage known (v0.44), the floor target instead: the fence
+ * still meters the descent, but the loop stops asking for more one band
+ * above the last collapse voltage and backs off below it — the descent
+ * cannot be driven into a knee the light has moved, and a sag during a
+ * search is answered by the 400 ms loop rather than the droop guard.
+ * Re-evaluated every TRACKING tick (the band and the floor both move).
+ */
+static void sp_track_target(system_ctx_t *ctx)
 {
-    uint16_t sp = (uint16_t)(PANEL_SAFETY_MV + PANEL_VREG_DEADBAND_MIN_MV);
-    ctx->mppt.vreg_setpoint_mv = sp;
-    ctx->mppt.prev_sp_mv       = sp;
+    uint32_t sp = (uint32_t)PANEL_SAFETY_MV + PANEL_VREG_DEADBAND_MIN_MV;
+    uint32_t f  = sp_floor_target_mv(ctx);
+    if (f > sp) sp = f;
+    ctx->mppt.vreg_setpoint_mv = (uint16_t)sp;
+    ctx->mppt.prev_sp_mv       = (uint16_t)sp;
+}
+
+/* v0.44: end a floor probe. Committing lowers the remembered knee voltage
+ * by the amount that was under test (the dwell paid there); dropping it
+ * puts the floor back where it was (the loop then backs off to it). */
+static void floor_probe_commit(mppt_ctx_t *m)
+{
+    if (m->floor_probe_mv != 0) {
+        if (m->knee_vpanel_mv > m->floor_probe_mv)
+            m->knee_vpanel_mv -= m->floor_probe_mv;
+        else
+            m->knee_vpanel_mv = 0;
+    }
+    m->floor_probe_mv = 0;
+    m->floor_probing  = false;
+}
+static void floor_probe_drop(mppt_ctx_t *m)
+{
+    m->floor_probe_mv = 0;
+    m->floor_probing  = false;
 }
 
 /* =========================================================================
@@ -366,7 +431,8 @@ static void tracking_common(system_ctx_t *ctx)
     m->tracking_start_ms   = time_now();
     m->best_pwm            = 0;       /* v0.41: per-search best point */
     m->best_ichg           = 0;
-    sp_drive_down(ctx);
+    floor_probe_drop(m);              /* v0.44: a search starts at the floor */
+    sp_track_target(ctx);
     start_dwell(ctx);
 }
 
@@ -445,6 +511,7 @@ static void enter_hold(system_ctx_t *ctx)
     ctx->mppt.hold_start_ms = time_now();
     ctx->mppt.knee_probe_ms = time_now();
     ctx->mppt.probing       = false;
+    floor_probe_drop(&ctx->mppt);     /* v0.44: unmeasured = not accepted */
     sp_follow(ctx);
 }
 
@@ -521,6 +588,49 @@ static void tracking_tick(system_ctx_t *ctx)
         if (settled || dwelt >= MPPT_SP_SETTLE_MAX_MS) {
             m->dwell_phase      = 1;
             m->measure_start_ms = now;
+            return;
+        }
+
+        /* ── v0.44: not arriving. Is the voltage floor what holds the loop? ──
+         *
+         * The loop stops asking for more once V_panel is inside the band
+         * around the floor target, so a fence below that voltage is never
+         * reached. Two cases:
+         *   - the loop has been backing off (a sag step within
+         *     MPPT_FLOOR_PROBE_QUIET_MS): the light is falling; the floor is
+         *     right and the fence is stale. Fence follows the plant up, park.
+         *   - the loop is quiet at the floor: the floor may be stale-high
+         *     (learned in brighter light). Lower it one MPPT_KNEE_VFLOOR_MV
+         *     under test and give the loop another settle; the measurement
+         *     at the fence decides whether the lowered floor stays. */
+        if (!on_fence && dwelt >= MPPT_KNEE_SETTLE_MS &&
+            ctx->pwm > m->cliff_pwm_min) {
+            uint16_t floor = sp_floor_mv(ctx);
+            int32_t  band  = (int32_t)charger_vreg_deadband_mv(ctx);
+            bool voltage_limited = (floor != 0) &&
+                ((int32_t)ctx->meas.panel_voltage <=
+                     (int32_t)m->vreg_setpoint_mv + band);
+            if (voltage_limited) {
+                /* "Quiet": no sag step lately — or the loop has already
+                 * backed off to zero delivery, where a step changes nothing
+                 * and waiting for it to stop would wait forever. */
+                bool quiet = ((now - ctx->charger.last_backoff_ms) >=
+                                  MPPT_FLOOR_PROBE_QUIET_MS) ||
+                             (ctx->charger.zero_draw_pwm != 0 &&
+                              ctx->pwm >= ctx->charger.zero_draw_pwm);
+                bool room  = (uint32_t)floor >=
+                             (uint32_t)PANEL_MIN_MV + MPPT_KNEE_VFLOOR_MV;
+                if (quiet && room) {
+                    m->floor_probe_mv += MPPT_KNEE_VFLOOR_MV;
+                    m->floor_probing   = true;
+                    sp_track_target(ctx);
+                    m->dwell_start_ms  = now;     /* fresh settle from here */
+                } else {
+                    m->cliff_pwm_min = ctx->pwm;  /* the floor is the fence */
+                    m->probing       = false;
+                    enter_hold(ctx);              /* drops the probe */
+                }
+            }
         }
         return;
     }
@@ -563,6 +673,7 @@ static void tracking_tick(system_ctx_t *ctx)
     if (avg < (int16_t)CHG_DELIVERING_MIN_MA && m->knee_pwm == 0) {
         m->prev_avg_ichg  = avg;
         m->prev_avg_valid = true;
+        floor_probe_commit(m);
         if (!knee_probe_step(ctx, MPPT_KNEE_ACQUIRE_STEP)) {
             enter_hold(ctx);
             return;
@@ -582,6 +693,7 @@ static void tracking_tick(system_ctx_t *ctx)
         m->prev_avg_ichg  = avg;
         m->prev_avg_valid = true;
         note_best(m, avg);
+        floor_probe_commit(m);           /* v0.44: measured, nothing fell */
         if (!knee_probe_step(ctx, step)) {
             enter_hold(ctx);       /* nothing left to probe: already fenced */
             return;
@@ -599,6 +711,7 @@ static void tracking_tick(system_ctx_t *ctx)
          * couple of counts of the gate. */
         m->prev_avg_ichg = avg;
         note_best(m, avg);
+        floor_probe_commit(m);           /* v0.44: it paid — the floor was high */
         uint8_t step = (delta > (int32_t)MPPT_KNEE_COARSE_MA)
                          ? (uint8_t)PANEL_VREG_STEP_MAX : 1U;
         if (!knee_probe_step(ctx, step)) {
@@ -623,6 +736,8 @@ static void tracking_tick(system_ctx_t *ctx)
         m->probe_step     = 0;
         m->probing        = false;
         m->prev_avg_valid = false;
+        floor_probe_drop(m);             /* v0.44: not paid — floor stays */
+        sp_track_target(ctx);
         start_dwell(ctx);
         return;
     }
@@ -669,7 +784,8 @@ void mppt_update(system_ctx_t *ctx)
                 m->event_knee_accepted = knee_learn_event(ctx,
                         (uint32_t)ctx->charger.input_trace_pwm_from,
                         ctx->charger.input_trace_ichg_from,
-                        ctx->charger.input_trace_vpanel_from);
+                        ctx->charger.input_trace_vpanel_from,
+                        ctx->charger.input_trace_settled);
             enter_disabled(ctx);
         }
 
@@ -713,7 +829,9 @@ void mppt_update(system_ctx_t *ctx)
         m->event_knee_accepted = knee_learn_event(ctx,
                 (uint32_t)ctx->charger.droop_pwm_from,
                 ctx->charger.droop_ichg_from,
-                ctx->charger.droop_vpanel_from);
+                ctx->charger.droop_vpanel_from,
+                ctx->charger.droop_settled);
+        floor_probe_drop(m);             /* v0.44: the panel just answered */
         if (m->state == MPPT_TRACKING) {
             m->prev_avg_valid = false;   /* samples spanning a droop are noise */
             start_dwell(ctx);
@@ -725,7 +843,9 @@ void mppt_update(system_ctx_t *ctx)
         m->event_knee_accepted = knee_learn_event(ctx,
                 (uint32_t)ctx->charger.input_trace_pwm_from,
                 ctx->charger.input_trace_ichg_from,
-                ctx->charger.input_trace_vpanel_from);
+                ctx->charger.input_trace_vpanel_from,
+                ctx->charger.input_trace_settled);
+        floor_probe_drop(m);
         if (m->state == MPPT_TRACKING) {
             m->prev_avg_valid = false;
             start_dwell(ctx);
@@ -818,7 +938,9 @@ void mppt_update(system_ctx_t *ctx)
             enter_hold(ctx);
             break;
         }
-        /* P4: run the dwell/decision machinery. */
+        /* P4: run the dwell/decision machinery (v0.44: with the setpoint
+         * re-derived from the floor and the live band first). */
+        sp_track_target(ctx);
         tracking_tick(ctx);
         break;
 
@@ -868,6 +990,15 @@ void mppt_update(system_ctx_t *ctx)
         bool kicked = (m->cliff_pwm_min != 0) &&
                       (ctx->pwm > m->cliff_pwm_min) &&
                       (ctx->charger.droop_count == 0);
+        /* v0.44: ...and only if there is voltage room to descend into. A rail
+         * held above the fence BY THE FLOOR is where it should be. */
+        {
+            uint32_t ft = sp_floor_target_mv(ctx);
+            if (ft != 0 &&
+                (uint32_t)ctx->meas.panel_voltage <=
+                    ft + charger_vreg_deadband_mv(ctx))
+                kicked = false;
+        }
 
         /* v0.43: a knee is evidence about the LIGHT it was learned in. If the
          * panel at the present count now reads well above what that count
@@ -888,12 +1019,19 @@ void mppt_update(system_ctx_t *ctx)
                             ((time_now() - m->knee_learned_ms) >=
                                  MPPT_KNEE_RETREAT_MS || headroom);
 
+        /* v0.44: a rail held ABOVE the fence by the voltage floor is worth a
+         * periodic look too — the floor may have been learned in brighter
+         * light (tracking_tick's floor probe, quiet-gated, decides). */
+        bool floor_bound = (m->cliff_pwm_min != 0) &&
+                           (ctx->pwm > m->cliff_pwm_min) &&
+                           (sp_floor_mv(ctx) != 0);
+
         if ((kicked || retreat_over ||
              (time_now() - m->knee_probe_ms) >= MPPT_KNEE_PROBE_MS) &&
             ctx->panel_limited &&
             (ctx->charger.state == CHG_PRECHARGE ||
              ctx->charger.state == CHG_CC) &&
-            (kicked || retreat_over || m->knee_pwm == 0 ||
+            (kicked || retreat_over || floor_bound || m->knee_pwm == 0 ||
              m->cliff_pwm_min > (uint16_t)(m->knee_pwm + MPPT_KNEE_MARGIN))) {
 
             /* A knee older than MPPT_KNEE_RETREAT_MS, or one the light has

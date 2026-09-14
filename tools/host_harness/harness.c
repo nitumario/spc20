@@ -292,6 +292,58 @@ static void t10_stale_knee_released_on_headroom(void)
     CHECK(c.mppt.state == MPPT_HOLD && c.mppt.knee_pwm == 104, "no headroom: still HOLD with the knee (state=%d knee=%u)", c.mppt.state, c.mppt.knee_pwm);
 }
 
+static void t11_floor_holds_under_falling_light(void)
+{
+    printf("T11 falling light with a knee voltage known: the loop backs off at the floor, no collapse\n");
+    /* steep plant near the knee: 150 mV/count; the knee is a count below which the panel collapses */
+    GAIN_MV = 150; KNEE = 95; VOC = 12930;
+    system_ctx_t c = fresh_cc(97, 97);                    /* 2 counts above the knee, 585 mA */
+    c.charger.plant_mv_per_count = 150;
+    int v97 = 12930 - (110 - 97) * 150;                   /* 10980 */
+    int v95 = 12930 - (110 - 95) * 150;                   /* 10680 */
+    c.mppt.state = MPPT_HOLD; c.mppt.knee_pwm = 95; c.mppt.knee_vpanel_mv = (uint16_t)(v95 - 300); /* floor = v95, target = v95+band(300) = v97 */
+    c.mppt.knee_learned_ms = h_now; c.mppt.panel_voc_mv = 12930; c.mppt.knee_probe_ms = h_now; c.mppt.hold_start_ms = h_now;
+    c.mppt.vreg_setpoint_mv = (uint16_t)v97;
+    c.charger.panel_op_mv = (uint16_t)v97; c.charger.panel_op_ms = h_now;
+    run_ms(&c, 1000);
+    printf("  (start: pwm %u V %u sp %u knee %u)\n", c.pwm, c.meas.panel_voltage, c.mppt.vreg_setpoint_mv, c.mppt.knee_pwm);
+    /* the light fades for 20 s: Voc -50 mV every 500 ms, the knee count climbs one every 2 s */
+    int worst_margin = 99;
+    for (int i = 0; i < 40; i++) {
+        run_ms(&c, 500);
+        VOC -= 50;
+        if (i % 4 == 3) KNEE++;
+        int margin = (int)c.pwm - KNEE;
+        if (margin < worst_margin) worst_margin = margin;
+    }
+    printf("  (end: pwm %u knee-count %d V %u dips %u drp %u)\n", c.pwm, KNEE, c.meas.panel_voltage, c.charger.input_dip_events, c.charger.droop_events);
+    CHECK(c.charger.input_dip_events == 0, "the input guard never had to rescue (dips=%u)", c.charger.input_dip_events);
+    CHECK(worst_margin >= 0, "the rail stayed at or above the moving knee count (worst margin %d)", worst_margin);
+    CHECK(c.fault.code == 0, "no fault");
+    GAIN_MV = 20; KNEE = 0; VOC = 12930;
+}
+
+static void t12_stale_high_floor_is_probed_down(void)
+{
+    printf("T12 a floor learned in brighter light is lowered under test and the harvest recovers\n");
+    GAIN_MV = 150; KNEE = 0; VOC = 12930;
+    system_ctx_t c = fresh_cc(105, 100);                  /* fence 100 (knee 99), but the floor holds the loop at 105 */
+    c.charger.plant_mv_per_count = 150;
+    int v105 = 12930 - (110 - 105) * 150;                 /* 12180 */
+    c.mppt.state = MPPT_HOLD; c.mppt.knee_pwm = 99; c.mppt.knee_vpanel_mv = (uint16_t)(v105 - 300 - 300); /* floor = v105-300, target = v105 */
+    c.mppt.knee_learned_ms = h_now; c.mppt.panel_voc_mv = 12930; c.mppt.knee_probe_ms = h_now; c.mppt.hold_start_ms = h_now;
+    c.mppt.vreg_setpoint_mv = (uint16_t)v105;
+    run_ms(&c, 2000);
+    CHECK(c.mppt.state == MPPT_HOLD && c.pwm == 105, "held above the fence by the floor, not kicked (state=%d pwm=%u)", c.mppt.state, c.pwm);
+    uint16_t floor0 = c.mppt.knee_vpanel_mv;
+    run_ms(&c, 60000);                                    /* the 30 s re-probe, then the floor probe */
+    printf("  (after 60 s: pwm %u fence %u knee_v %u -> %u state %d)\n", c.pwm, c.mppt.cliff_pwm_min, floor0, c.mppt.knee_vpanel_mv, c.mppt.state);
+    CHECK(c.mppt.knee_vpanel_mv < floor0, "knee voltage lowered by the floor probe (%u -> %u)", floor0, c.mppt.knee_vpanel_mv);
+    CHECK(c.pwm <= 101, "rail descended to the fence region (pwm=%u)", c.pwm);
+    CHECK(c.fault.code == 0 && c.charger.input_dip_events == 0, "no fault, no rescue");
+    GAIN_MV = 20;
+}
+
 int main(void)
 {
     t1_fine_reject_rolls_back();
@@ -305,6 +357,8 @@ int main(void)
     t8_rescue_restores_the_rail();
     t9_hold_kicked_returns_to_fence();
     t10_stale_knee_released_on_headroom();
+    t11_floor_holds_under_falling_light();
+    t12_stale_high_floor_is_probed_down();
     printf("\n%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

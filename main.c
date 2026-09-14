@@ -92,7 +92,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.43\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.44\r\n"
                 "==============================================\r\n");
 }
 

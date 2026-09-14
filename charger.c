@@ -185,6 +185,12 @@ static inline uint16_t guard_event_origin_vpanel(const system_ctx_t *ctx)
     return (ctx->charger.droop_count != 0) ? ctx->charger.droop_vpanel_from
                                            : ctx->meas.panel_voltage;
 }
+static inline bool guard_event_origin_settled(const system_ctx_t *ctx)
+{
+    return (ctx->charger.droop_count != 0)
+             ? ctx->charger.droop_settled
+             : (ctx->charger.settled_ticks >= CHG_PWM_SETTLED_TICKS);
+}
 
 /* Is the battery physically tied to the buck rail right now? Both foreground
  * guards are meaningless outside these states: in CHG_BUCK_SETTLE Q49 is still
@@ -260,6 +266,7 @@ static void charger_input_stand_down(system_ctx_t *ctx)
         c->input_trace_pwm_from    = guard_event_origin_pwm(ctx);
         c->input_trace_ichg_from   = guard_event_origin_ichg(ctx);
         c->input_trace_vpanel_from = guard_event_origin_vpanel(ctx);
+        c->input_trace_settled     = guard_event_origin_settled(ctx);
     }
     c->input_trace_pending = true;              /* always re-arm the log line */
     c->input_trace_result = INPUT_TRACE_STOOD_DOWN;
@@ -370,6 +377,7 @@ void charger_input_guard(system_ctx_t *ctx)
         c->input_trace_pwm_from    = guard_event_origin_pwm(ctx);
         c->input_trace_ichg_from   = guard_event_origin_ichg(ctx);
         c->input_trace_vpanel_from = guard_event_origin_vpanel(ctx);
+        c->input_trace_settled     = guard_event_origin_settled(ctx);
         c->input_trace_result   = INPUT_TRACE_PENDING;
         c->input_trace_pending  = true;
     }
@@ -588,6 +596,7 @@ void charger_panel_droop_guard(system_ctx_t *ctx)
         c->droop_pwm_from    = ctx->pwm;
         c->droop_ichg_from   = ctx->meas.chg_current;
         c->droop_vpanel_from = ctx->meas.panel_voltage;
+        c->droop_settled     = (c->settled_ticks >= CHG_PWM_SETTLED_TICKS);
 
         /* v0.41: this event may shed demand down to zero delivery and no
          * further. The panel is still volts above the cell here, the buck is
@@ -1166,6 +1175,7 @@ static void cc_regulate(system_ctx_t *ctx)
     if (err < -band) {
         /* Sagging below MPP → drawing too much → DRAW LESS (pwm UP) → V recovers. */
         pwm_step(ctx, +vloop_step_counts(ctx, err));
+        ctx->charger.last_backoff_ms = now;   /* v0.44: the light is falling */
     } else if (err > band) {
         /* Above MPP with current-headroom (clamp 1 didn't fire) → DRAW MORE (pwm DOWN) → V falls.
          * Fenced by the learned PWM ceiling: this branch is what walked the
