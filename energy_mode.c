@@ -95,6 +95,10 @@ static void deactivate_charger_region(system_ctx_t *ctx)
     ctx->charger.precharge_start_ms = 0;
     ctx->charger.active_start_ms = 0;
     ctx->charger.activation_ready_mv = 0;
+    /* The region is going down, so the regulator is no longer being refused
+     * anything. Leaving the stamp standing would hand the next activation a
+     * dwell it never served (mppt.c fast release). */
+    ctx->charger.draw_blocked_ms = 0;
     ctx->charger.cc_last_downstep_ms = 0;
     ctx->charger.vloop_measure_armed = false;
     ctx->charger.vloop_probe_steps   = 0;
@@ -191,6 +195,10 @@ static void activate_charger_region(system_ctx_t *ctx)
     }
 
     ctx->pwm = entry_pwm;
+
+    /* A warm resume enters AT cliff_pwm_min. Whatever dwell the last session
+     * accumulated against that fence is not this session's evidence. */
+    ctx->charger.draw_blocked_ms = 0;
 
     ctx->charger.state = CHG_BUCK_SETTLE;
     ctx->charger.active_start_ms = time_now();

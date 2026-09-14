@@ -84,6 +84,13 @@ static inline uint16_t pwm_clamp(int32_t p)
 static inline void pwm_step(system_ctx_t *ctx, int32_t delta)
 {
     ctx->pwm = pwm_clamp((int32_t)ctx->pwm + delta);
+
+    /* Every caller of this helper either reduces current or is an interlock
+     * the fence may not block, so reaching here proves the loop is not being
+     * refused. Clearing here covers all of them — the backoffs, the intake
+     * clamp, the reverse escape and the acquisition ramp — without each
+     * having to remember to. */
+    ctx->charger.draw_blocked_ms = 0;
 }
 
 /*
@@ -106,13 +113,77 @@ static inline void pwm_step(system_ctx_t *ctx, int32_t delta)
 static inline void pwm_draw_more(system_ctx_t *ctx, int32_t step)
 {
     uint16_t floor_pwm = ctx->mppt.cliff_pwm_min;
-    if (floor_pwm != 0 && ctx->pwm <= floor_pwm)
+    if (floor_pwm != 0 && ctx->pwm <= floor_pwm) {
+        /* Refused by the fence. Stamp the FIRST refusal and leave it
+         * standing: an unbroken CHG_CLIFF_PROBE_MS of being refused is the
+         * fast release's evidence (mppt.c) that the fence — not the panel —
+         * is what is capping the draw. Any grant, backoff or interlock step
+         * clears it, so only a continuously starved loop accumulates. */
+        if (ctx->charger.draw_blocked_ms == 0)
+            ctx->charger.draw_blocked_ms = time_now();
         return;
+    }
 
     uint16_t next = pwm_clamp((int32_t)ctx->pwm - step);
     if (floor_pwm != 0 && next < floor_pwm)
         next = floor_pwm;
     ctx->pwm = next;
+    ctx->charger.draw_blocked_ms = 0;
+}
+
+/*
+ * zero_draw_bound_pwm (v0.41) — the highest count a demand-shedding action
+ * may command from `from_pwm`, where the buck was delivering `ichg_from`
+ * into the cell and `idsg_from` into the load (I_buck = I_cell + I_load):
+ * the zero-delivery point plus CHG_ZERO_DRAW_MARGIN, but never less than
+ * `min_advance` counts of movement so the action is not a no-op.
+ *
+ * Uses the live charger.zero_draw_pwm estimate when there is one (refreshed
+ * every settled delivering tick in charger_update, so it follows V_bat) and
+ * derives it from the event's own snapshot otherwise. See
+ * CHG_BUCK_MA_PER_COUNT in hw_config.h for the physics and the bench case.
+ */
+static uint16_t zero_draw_bound_pwm(const system_ctx_t *ctx, uint16_t from_pwm,
+                                    int16_t ichg_from, uint16_t idsg_from,
+                                    uint16_t min_advance)
+{
+    uint32_t zero;
+    if (ctx->charger.zero_draw_pwm != 0) {
+        zero = ctx->charger.zero_draw_pwm;
+    } else {
+        int32_t i_buck = (int32_t)ichg_from + (int32_t)idsg_from;
+        if (i_buck < 0) i_buck = 0;
+        zero = (uint32_t)from_pwm +
+               ((uint32_t)i_buck + CHG_BUCK_MA_PER_COUNT - 1U) /
+                   CHG_BUCK_MA_PER_COUNT;
+    }
+    uint32_t bound = zero + CHG_ZERO_DRAW_MARGIN;
+    if (bound < (uint32_t)from_pwm + min_advance)
+        bound = (uint32_t)from_pwm + min_advance;
+    if (bound > PWM_MIN_DUTY)
+        bound = PWM_MIN_DUTY;
+    return (uint16_t)bound;
+}
+
+/* Which count is "the draw that fell over"? The droop guard runs first in the
+ * super loop and may already have moved the PWM on this same conversion, so a
+ * guard that sights the event second must take the droop's snapshot, not the
+ * live count — otherwise it records the rescue as the cause (v0.38's
+ * lesson, one layer up). */
+static inline uint16_t guard_event_origin_pwm(const system_ctx_t *ctx)
+{
+    return (ctx->charger.droop_count != 0) ? ctx->charger.droop_pwm_from
+                                           : ctx->pwm;
+}
+static inline int16_t guard_event_origin_ichg(const system_ctx_t *ctx)
+{
+    return (ctx->charger.droop_count != 0) ? ctx->charger.droop_ichg_from
+                                           : ctx->meas.chg_current;
+}
+static inline uint16_t guard_event_origin_vpanel(const system_ctx_t *ctx)
+{
+    return (ctx->charger.droop_count != 0) ? ctx->charger.droop_vpanel_from
+                                           : ctx->meas.panel_voltage;
 }
 
 /* Is the battery physically tied to the buck rail right now? Both foreground
@@ -185,8 +256,11 @@ static void charger_input_stand_down(system_ctx_t *ctx)
      * snapshot — always arrives with it at zero. */
     if (!c->input_trace_pending)
         adc_panel_trace_mv(c->input_trace_mv);  /* old window already printed */
-    if (c->input_lost_count == 0)
-        c->input_trace_pwm_from = ctx->pwm;     /* no guard snapshot: this is it */
+    if (c->input_lost_count == 0) {             /* no guard snapshot: this is it */
+        c->input_trace_pwm_from    = guard_event_origin_pwm(ctx);
+        c->input_trace_ichg_from   = guard_event_origin_ichg(ctx);
+        c->input_trace_vpanel_from = guard_event_origin_vpanel(ctx);
+    }
     c->input_trace_pending = true;              /* always re-arm the log line */
     c->input_trace_result = INPUT_TRACE_STOOD_DOWN;
 
@@ -243,13 +317,40 @@ void charger_input_guard(system_ctx_t *ctx)
     if (charger_input_present()) {
         if (c->input_lost_count != 0) {
             /* Came back inside the window: a live source that had been pushed
-             * over its knee. Stay connected at the backed-off point —
-             * cc_regulate walks it back down, MPPT raises its floor. */
+             * over its knee. Stay connected; MPPT raises its floor.
+             *
+             * v0.41: and put the rail back NOW. The backoff below had to
+             * command a target under the cell to break dropout (see its
+             * note), and it did — the input is back — but the buck is still
+             * carrying that target: 10-20 counts under the zero-delivery
+             * point is -450..-900 mA of reverse current, and the only thing
+             * that used to lift it was cc_regulate's reverse escape at 5
+             * counts per 400 ms. Every RECOVERED trace of the 10.09.26 v0.33
+             * session was followed by FAULT_REVERSE_PUMP for exactly that
+             * reason (six of its eight latches). Restore to the zero-delivery
+             * point plus a margin — no draw on the panel that just fell over,
+             * no reverse into it — and let the paced loop walk down from
+             * there under the fence the event is about to set. The FB target
+             * has authority again the moment the input is back over V_bat,
+             * so this takes one conversion. */
             c->input_lost_count = 0;
             if (c->input_dip_events < UINT16_MAX)
                 c->input_dip_events++;
             if (c->input_trace_result == INPUT_TRACE_PENDING)
                 c->input_trace_result = INPUT_TRACE_RECOVERED;
+
+            uint16_t restore = zero_draw_bound_pwm(ctx, c->input_trace_pwm_from,
+                                                   c->input_trace_ichg_from,
+                                                   ctx->meas.dsg_current,
+                                                   CHG_CLIFF_PWM_MARGIN);
+            if (restore < ctx->pwm) {
+                ctx->pwm = restore;
+                set_buck_pwm(ctx->pwm);
+            }
+            c->input_trace_pwm_to  = ctx->pwm;
+            c->input_rescue_ms     = time_now();  /* fast guard yields from here */
+            c->vloop_measure_armed = false;
+            c->draw_blocked_ms     = 0;
         }
         return;
     }
@@ -266,7 +367,9 @@ void charger_input_guard(system_ctx_t *ctx)
          * young end of the window instead of 50 ms of newer samples having
          * pushed it out. */
         adc_panel_trace_mv(c->input_trace_mv);
-        c->input_trace_pwm_from = ctx->pwm;
+        c->input_trace_pwm_from    = guard_event_origin_pwm(ctx);
+        c->input_trace_ichg_from   = guard_event_origin_ichg(ctx);
+        c->input_trace_vpanel_from = guard_event_origin_vpanel(ctx);
         c->input_trace_result   = INPUT_TRACE_PENDING;
         c->input_trace_pending  = true;
     }
@@ -310,6 +413,296 @@ void charger_input_guard(system_ctx_t *ctx)
     c->vloop_measure_armed = false;
 }
 
+/*
+ * panel_droop_trip_mv — the raw V_panel level below which the panel is
+ * falling rather than regulating. 0 = the guard cannot be armed here.
+ *
+ * The gap is measured in PWM COUNTS whenever the voltage loop has a gain to
+ * measure them with (CHG_DROOP_TRIP_COUNTS), because that is the only unit
+ * in which "further than the regulator could have moved it" means anything.
+ * CHG_DROOP_TRIP_PCT is the fallback for the first seconds of a session,
+ * before any gain exists — deliberately coarse, so it cannot false-trip
+ * while the plant is still unknown.
+ *
+ * Returns 0 (disarmed) when the resulting trip would sit under
+ * PANEL_SAFETY_MV. On a steep plant the count criterion puts it there by
+ * itself, which is the correct outcome: one PWM count is a quarter of the
+ * 6.5 V array, a droop there cannot be told from a regulation step, and the
+ * emergency backoff already owns everything below that line.
+ */
+static uint16_t panel_droop_trip_mv(const system_ctx_t *ctx)
+{
+    const charger_ctx_t *c = &ctx->charger;
+    if (c->panel_op_mv < PANEL_MIN_MV)
+        return 0;
+
+    uint32_t op  = (uint32_t)c->panel_op_mv;
+    uint32_t gap;
+
+    if (c->plant_mv_per_count != 0) {
+        gap = (uint32_t)c->plant_mv_per_count * CHG_DROOP_TRIP_COUNTS;
+        if (gap < CHG_DROOP_MIN_GAP_MV)
+            gap = CHG_DROOP_MIN_GAP_MV;
+    } else {
+        gap = (op * (100U - CHG_DROOP_TRIP_PCT)) / 100U;
+    }
+
+    if (gap >= op)
+        return 0;
+    uint32_t trip = op - gap;
+
+    if (trip < PANEL_SAFETY_MV)
+        return 0;                       /* panel_safety_backoff's territory */
+    return (uint16_t)trip;
+}
+
+/*
+ * panel_op_track — maintain the droop reference.
+ *
+ * Rises are taken immediately: a panel coming back up is never a collapse,
+ * and an operating point that has genuinely moved up must arm the guard at
+ * the new level straight away. Falls are rate-limited to
+ * CHG_DROOP_REF_FALL_MV per PANEL_VREG_INTERVAL_MS, which comfortably
+ * follows both the acquisition walk (13.2 V down to 11.9 V over ~6 s on the
+ * 14.09 array, ~215 mV/s) and any real irradiance ramp, while being ~25x
+ * too slow to follow a collapse (4 V in 20 ms). That asymmetry IS the
+ * guard: a reference that could chase the operating point into the knee
+ * would disarm itself exactly when it is needed.
+ *
+ * Cleared whenever the charger is not connected, so a re-activation arms
+ * from its own first settled reading rather than from the last session's.
+ */
+static void panel_op_track(system_ctx_t *ctx)
+{
+    charger_ctx_t *c = &ctx->charger;
+
+    if (!charger_connected(ctx)) {
+        c->panel_op_mv = 0;
+        c->droop_count = 0;
+        return;
+    }
+
+    uint16_t v = ctx->meas.panel_voltage;
+
+    if (v > c->panel_op_mv) {              /* attack: immediate */
+        c->panel_op_mv = v;
+        c->panel_op_ms = time_now();
+        return;
+    }
+
+    uint32_t now = time_now();
+    if ((now - c->panel_op_ms) < PANEL_VREG_INTERVAL_MS)
+        return;
+    c->panel_op_ms = now;
+
+    uint16_t fall = (uint16_t)(c->panel_op_mv - v);
+    if (fall > CHG_DROOP_REF_FALL_MV)
+        fall = CHG_DROOP_REF_FALL_MV;
+    c->panel_op_mv -= fall;
+}
+
+/*
+ * charger_panel_droop_guard — arrest the fall while a backoff still works.
+ *
+ * The layer that was missing until v0.40. charger_input_guard below judges
+ * the raw conversion against the BATTERY (V_bat + CHG_INPUT_LOST_MARGIN_MV
+ * = 3.77 V); this one judges it against where the regulator is actually
+ * parked (c->panel_op_mv), at CHG_DROOP_TRIP_PCT of it. On a 12.7 V
+ * operating point that is 11.2 V, and the raw traces (hw_config.h,
+ * CHG_DROOP_TRIP_PCT) show the panel passing through there one to four
+ * conversions before it reaches the battery.
+ *
+ * Why the earlier trip matters more than the earlier sample: at 11.2 V the
+ * buck is nowhere near dropout, so raising pwm removes demand directly.
+ * Below V_bat it is in dropout, the FB target has no authority over duty,
+ * and the only thing that breaks it is commanding a rail under the cell —
+ * the whole reason charger_input_guard's backoff is allowed to do something
+ * that looks so wrong (see its v0.34 note). Catching the fall one layer up
+ * turns a 2.5 s stand-down plus a 6-10 s re-acquisition into a ~10 ms notch
+ * in the draw, and it hands mppt.c a knee sighting that cost nothing.
+ *
+ * Ordering: runs BEFORE charger_input_guard in the super loop. If it
+ * arrests the fall, the input guard never sees a sub-margin sample and
+ * nothing else happens. If it does not — a genuine removal, or a collapse
+ * with no precursor at all (two of the seven traced) — the input guard is
+ * underneath it, unchanged, and this guard's own backoff has already moved
+ * the draw in the direction that guard wants anyway.
+ *
+ * This function NEVER stands down and never reduces pwm. It is bounded by
+ * CHG_DROOP_MAX_STEPS precisely so that a removed source ends up parked
+ * rather than walked to PWM_MIN_DUTY here: "the source is gone" is the
+ * input guard's call to make, and it needs the rail state to make it.
+ *
+ * ⚠️ Gated on adc_sample_seq(), NOT on calls — same reason as every other
+ * foreground guard: the super loop runs at kHz against a value that changes
+ * every TICK_ADC_MS, so a per-call counter would spend its whole budget on
+ * one stale conversion in microseconds.
+ */
+void charger_panel_droop_guard(system_ctx_t *ctx)
+{
+    charger_ctx_t *c = &ctx->charger;
+
+    if (!charger_connected(ctx) || c->input_lost_pending) {
+        c->droop_count = 0;
+        return;
+    }
+
+    /* No settled operating point yet (activation, or a session that has not
+     * completed one PANEL_VREG_INTERVAL_MS), or a plant on which a droop
+     * cannot be told from a regulation step: nothing to judge against. */
+    uint16_t trip = panel_droop_trip_mv(ctx);
+    if (trip == 0) {
+        c->droop_count = 0;
+        return;
+    }
+
+    uint32_t seq = adc_sample_seq();
+    if (seq == c->droop_seq)
+        return;                       /* already judged this conversion */
+    c->droop_seq = seq;
+
+    if (get_input_voltage_now() >= trip) {
+        c->droop_count = 0;           /* holding above the trip: event over */
+        return;
+    }
+
+    /* Under the trip. Is the PANEL falling, or did the buck just step on its
+     * own target? A panel fall cannot push more current into the cell than
+     * the average — the buck's output is bounded by what the input supplies
+     * — so a raw I_buck far above the average on this same conversion is the
+     * input capacitor discharging into a transient of the buck's own making
+     * (v0.42, CHG_DROOP_SPIKE_MA: 40 of 48 sightings on 14.09.26 v0.41 were
+     * this, at 1.3-1.6 A raw against 0.1-0.5 A average). Nothing to shed
+     * there, and nothing for the tracker to learn. */
+    int32_t i_raw = (int32_t)get_charge_current_now() +
+                    (int32_t)get_discharge_current_now();
+    int32_t i_avg = (int32_t)ctx->meas.chg_current +
+                    (int32_t)ctx->meas.dsg_current;
+    bool    spike = (i_raw > i_avg + (int32_t)CHG_DROOP_SPIKE_MA);
+
+    /* Snapshot the draw that could not be held BEFORE the first backoff
+     * moves it — mppt.c reads this as the knee, and reading it after the
+     * fact is exactly the bug v0.39 fixed in the input guard's own trace (it
+     * fenced 2 backoffs too high, permanently). */
+    if (c->droop_count == 0) {
+        c->droop_pwm_from    = ctx->pwm;
+        c->droop_ichg_from   = ctx->meas.chg_current;
+        c->droop_vpanel_from = ctx->meas.panel_voltage;
+
+        /* v0.41: this event may shed demand down to zero delivery and no
+         * further. The panel is still volts above the cell here, the buck is
+         * out of dropout, and past zero the FB target is not "less demand" —
+         * it is a rail under the cell and the sync FETs pumping into the
+         * panel (14.09.26: 103 -> 111 on a 110 zero-draw, 0x0100 latched
+         * 160 ms later). See CHG_ZERO_DRAW_MARGIN. */
+        c->droop_limit_pwm = zero_draw_bound_pwm(ctx, ctx->pwm,
+                                                 ctx->meas.chg_current,
+                                                 ctx->meas.dsg_current,
+                                                 0U);
+
+        /* v0.41: post-mortem for main.c — the raw window and the raw buck
+         * current at the sighting. Every sighting is traced, glitches
+         * included; they are what the log needs to see. */
+        adc_panel_trace_mv(c->droop_trace_mv);
+        c->droop_trace_ibuck   = (int16_t)i_raw;
+        c->droop_trace_trip_mv = trip;
+        c->droop_trace_pwm_to  = ctx->pwm;
+        c->droop_trace_pending = true;
+        c->droop_kind          = spike ? DROOP_KIND_GLITCH : DROOP_KIND_FALL;
+        c->droop_counted       = false;
+        if (spike && c->droop_glitch_events < UINT16_MAX)
+            c->droop_glitch_events++;
+    }
+
+    if (c->droop_count >= CHG_DROOP_MAX_STEPS)
+        return;                       /* parked: the input guard's call now */
+    c->droop_count++;
+
+    if (spike)
+        return;                       /* the buck's transient, not the panel */
+
+    /* A FALL conversion — possibly after a glitch sighting, if the transient
+     * tipped a marginal panel over; from here it is a real event. */
+    c->droop_kind = DROOP_KIND_FALL;
+
+    /* v0.43: shed to the bound in ONE conversion. A fall at the knee under
+     * fading light means the panel's available power has just dropped below
+     * the demand; no partial notch can hold it, only removing the demand can
+     * (the constant-power load line has no stable point left of the new
+     * MPP). Bench 14.09.26 13:03 (v0.42): nine FALL sightings, CHG_DROOP_STEP
+     * (4) per conversion, and seven of them still reached the input guard —
+     * the panel goes from 10.8 V to the cell in one or two conversions, and
+     * four counts is ~180 mA against a power deficit of hundreds. Shedding
+     * everything costs a re-acquisition (~3 s via HOLD's kicked re-probe);
+     * the alternative was a rescue with the rail under the cell or a
+     * stand-down. The bound is still zero delivery + CHG_ZERO_DRAW_MARGIN:
+     * never a rail under the cell from here. */
+    uint16_t next = c->droop_limit_pwm;
+    bool stepped = (next > ctx->pwm);   /* false once at zero delivery */
+
+    if (stepped) {
+        ctx->pwm = next;
+        set_buck_pwm(ctx->pwm);
+        /* v0.41: a rescue, exactly as the input guard's is. Open the window
+         * in which charger_fast_guard reads the rail's transient as this
+         * rescue's tail rather than as reverse pumping (CHG_REVERSE_BLANK_MS). */
+        c->input_rescue_ms = time_now();
+    }
+    c->droop_trace_pwm_to = ctx->pwm;
+
+    /* One event, one sighting for the tracker — counted on the first FALL
+     * conversion, not on each of them, so a four-conversion fall does not
+     * ratchet the fence four times. Counted even when there was nothing
+     * left to shed (pwm:X->X in the DROOP line): the tracker's delivering
+     * gate rejects it, and the log gets to see it. */
+    if (!c->droop_counted) {
+        c->droop_counted = true;
+        if (c->droop_events < UINT16_MAX) c->droop_events++;
+    }
+    if (!stepped)
+        return;
+
+    /* Whatever the voltage loop had armed is not a plant measurement any
+     * more: the PWM moved underneath it and V_panel is mid-fall. Same
+     * reasoning as charger_input_guard's backoff. */
+    c->vloop_measure_armed = false;
+
+    /* The draw just went DOWN, so the fence is not what is holding the loop
+     * back — clear the starvation stamp for the same reason pwm_step does. */
+    c->draw_blocked_ms = 0;
+}
+
+/*
+ * charger_fast_guard — reverse current into a live input.
+ *
+ * v0.41 rewrote the decision. The raw single-conversion charge-current sense
+ * is ~240 mA RMS (hw_config.h, CHG_REVERSE_FAST_MA), so "three raw samples
+ * under -100 mA" was a noise process that latched within a second whenever
+ * the delivery sat near zero — which is where every droop backoff, every
+ * rescue and every Q49 close puts it. All six 0x0100 latches of the v0.40
+ * bench session were that (dips:0 — the input never reached the battery).
+ *
+ * Two paths now, both blanked for CHG_REVERSE_BLANK_MS after any guard
+ * rescue and for CHG_CONNECT_BLANK_MS after Q49 closes:
+ *   FAST  — raw I_buck under -CHG_REVERSE_FAST_MA (~2σ) on CHG_REVERSE_SAMPLES
+ *           distinct conversions. Catches a May-class -1 A reversal in
+ *           ~30 ms; at zero true current it false-trips about once an hour.
+ *   AVG   — the 64-sample averaged I_buck under -CHG_REVERSE_CURRENT_MA for
+ *           CHG_REVERSE_LATCH_MS with the input live. cc_regulate's reverse
+ *           escape acts on the same signal first (-PANEL_BACKOFF_STEP per
+ *           interval); a reversal it has not cleared after 2-3 steps is
+ *           sustained and real.
+ * The dead-input branch is unchanged (v0.26): reverse current with the input
+ * already under V_bat is a disconnect charger_input_guard lost the race to,
+ * and it stands down without latching.
+ *
+ * chg_current (R440) is NET cell current: I_cell = I_buck − I_load. An
+ * activation under load connects Q49 with the buck at ~zero delivery, so
+ * I_cell legitimately reads −I_load until cc_regulate walks the delivery up
+ * — judging chg alone here latched this fault on every lamps-on activation
+ * (bench 2026-07-29). Genuine reverse pumping means the BUCK branch is
+ * negative, so judge I_buck = I_cell + I_dsg on both paths.
+ */
 void charger_fast_guard(system_ctx_t *ctx)
 {
     charger_ctx_t *c = &ctx->charger;
@@ -317,106 +710,99 @@ void charger_fast_guard(system_ctx_t *ctx)
     /* A stand-down already isolated the path this tick; nothing left to judge
      * (and chg_current reads 0 with Q49 open anyway). */
     if (!charger_connected(ctx) || c->input_lost_pending) {
-        c->reverse_count = 0;
+        c->reverse_count        = 0;
+        c->reverse_avg_since_ms = 0;
         return;
     }
 
-    /* chg_current (R440) is NET cell current: I_cell = I_buck − I_load. An
-     * activation under load connects Q49 with the buck at ~zero delivery, so
-     * I_cell legitimately reads −I_load until cc_regulate walks the delivery
-     * up — judging chg alone here latched this fault on every lamps-on
-     * activation (bench 2026-07-29, panel replug). Genuine reverse pumping
-     * means the BUCK branch is negative, so judge I_buck = I_cell + I_dsg.
-     * The dsg sensor's ~45 mA zero-offset only biases this check away from
-     * tripping, well inside the threshold. */
-    int32_t i_buck_now = (int32_t)get_charge_current_now() +
-                         (int32_t)get_discharge_current_now();
+    uint32_t now        = time_now();
+    int32_t  i_buck_now = (int32_t)get_charge_current_now() +
+                          (int32_t)get_discharge_current_now();
+    int32_t  i_buck_avg = (int32_t)ctx->meas.chg_current +
+                          (int32_t)ctx->meas.dsg_current;
 
-    if (i_buck_now >= -(int32_t)CHG_REVERSE_CURRENT_MA) {
-        c->reverse_count = 0;
-    } else {
-        /* Classify before latching. Reverse current with the input already
-         * DEAD is a disconnect whose voltage signature charger_input_guard
-         * narrowly lost the race to — the input node can fall past the
-         * crossover inside one 10 ms conversion interval. Stand down cleanly;
-         * latching there is what made every source removal look like a charge
-         * over-current (bench 2026-07-30).
-         *
-         * Reverse current with the input still LIVE is the real failure: the
-         * cell is being pushed back into a working panel, which can drive
-         * V_panel above open circuit toward the TPS564247's input ceiling
-         * (May bench trace: −1010 mA at V_panel 14.1 V on a 13 V panel). That
-         * latches. FAULT_REVERSE_PUMP's action opens Q49 before disabling the
-         * buck; energy_mode's fault-clear re-arm subsequently restarts from
-         * CHG_BUCK_SETTLE, never directly connected. */
-        if (!charger_input_present()) {
-            charger_input_stand_down(ctx);
-            return;
-        }
-
-        /* Live input, reverse current — but is this the pathology, or the
-         * tail of a collapse charger_input_guard is still rescuing?
-         *
-         * Within CHG_REVERSE_BLANK_MS of the guard's last action the two are
-         * indistinguishable by sign alone: the panel recovers to full voltage
-         * in a few milliseconds while the buck is still carrying the backed-off
-         * target, so "reverse current with a live input" is exactly what a
-         * successful rescue looks like on its way back. v0.32 read it as the
-         * pathology and latched 0x0100 on all four collapses of the 10.09.26
-         * bench session — every one of them next to its own INTRACE RECOVERED.
-         *
-         * So inside the window, correct the cause first: lift the target back
-         * to the zero-draw point (which cannot sink) and give it one
-         * conversion. Still reversing on the next one means it was not the
-         * rescue — stand down cleanly rather than latch, the same call v0.26
-         * made for a dead input. Exposure stays bounded at one 10 ms sample. */
-        bool rescuing = (c->input_rescue_ms != 0) &&
-                        ((time_now() - c->input_rescue_ms) < CHG_REVERSE_BLANK_MS);
-
-        if (rescuing) {
-            /* Yield: charger_input_guard owns this event and resolves it
-             * within CHG_INPUT_LOST_SAMPLES conversions (~30 ms) either way.
-             * Do NOT try to correct the target here — the backoff commanding
-             * below V_bat is what breaks dropout, so "helping" by lifting it
-             * back cancels the rescue (v0.34). Do not latch either: reverse
-             * current IS the expected signature while the guard works. */
-            return;
-        }
-
-        /* Same yield for the connection transient. The buck hands off from
-         * CHG_BUCK_SETTLE delivering ~nothing, so for the first conversions
-         * after Q49 closes the net cell current sits AT zero — the one place
-         * where a single raw sample straddles a -100 mA threshold on noise
-         * alone. The reverse-pump condition itself is excluded by
-         * construction here: SETL does not connect until instantaneous VCHG
-         * is above the cell. This is what made 467 of the 498 charge sessions
-         * in the 10.09.26 bench log die inside 300 ms. */
-        if ((time_now() - c->connect_ms) < CHG_CONNECT_BLANK_MS)
-            return;
-
-        /* Debounce the latch on DISTINCT conversions, exactly as
-         * charger_input_guard debounces its own teardown — this runs at
-         * super-loop rate against a value that only moves every TICK_ADC_MS,
-         * so counting calls would reach the threshold off one stale sample
-         * within microseconds.
-         *
-         * Real reverse pumping is a sustained state (-1010 mA on the May
-         * trace) and clears CHG_REVERSE_SAMPLES without difficulty; a noise
-         * sample about zero does not. Latching is expensive enough
-         * (FAULT_RECOVER_WAIT_MS, 10 s of no charging) to be worth ~30 ms of
-         * confirmation. */
-        uint32_t seq = adc_sample_seq();
-        if (seq == c->reverse_seq)
-            return;
-        c->reverse_seq = seq;
-
-        if (++c->reverse_count < CHG_REVERSE_SAMPLES)
-            return;
-
-        fault_raise(ctx, FAULT_REVERSE_PUMP);
-        ctx->pwm = PWM_MIN_DUTY;
-        c->reverse_count = 0;
+    /* Reverse current with the input already DEAD is a disconnect whose
+     * voltage signature charger_input_guard narrowly lost the race to — the
+     * input node can fall past the crossover inside one 10 ms conversion
+     * interval. Stand down cleanly; latching there is what made every source
+     * removal look like a charge over-current (bench 2026-07-30). A single
+     * raw sample is enough here because the cost of being wrong is
+     * CHG_INPUT_REARM_MS, not a 10 s fault. */
+    if (i_buck_now < -(int32_t)CHG_REVERSE_CURRENT_MA &&
+        !charger_input_present()) {
+        charger_input_stand_down(ctx);
+        return;
     }
+
+    /* Inside a rescue window the sign of the buck current says nothing: a
+     * rescued collapse ends with the panel back at full voltage while the
+     * buck still carries the backed-off target, and the droop guard's notch
+     * is the same transient one layer up (v0.32 latched 0x0100 beside every
+     * INTRACE RECOVERED of the 10.09.26 session). Same for the first
+     * conversions after Q49 closes, where the delivery is zero by
+     * construction (467 of 498 sessions on 10.09.26 died there). Yield, and
+     * start both debounces afresh afterwards. */
+    bool rescuing = (c->input_rescue_ms != 0) &&
+                    ((now - c->input_rescue_ms) < CHG_REVERSE_BLANK_MS);
+    if (rescuing || (now - c->connect_ms) < CHG_CONNECT_BLANK_MS) {
+        c->reverse_count        = 0;
+        c->reverse_avg_since_ms = 0;
+        return;
+    }
+
+    uint8_t kind = 0;
+
+    /* FAST path: a large raw reversal on distinct conversions. Gated on
+     * adc_sample_seq() — this runs at super-loop rate against a value that
+     * only moves every TICK_ADC_MS, so counting calls would reach the
+     * threshold off one stale sample within microseconds. */
+    uint32_t seq = adc_sample_seq();
+    if (seq != c->reverse_seq) {
+        c->reverse_seq = seq;
+        if (i_buck_now < -(int32_t)CHG_REVERSE_FAST_MA) {
+            if (c->reverse_count < CHG_REVERSE_SAMPLES)
+                c->reverse_trace_ibuck[c->reverse_count] = (int16_t)i_buck_now;
+            if (++c->reverse_count >= CHG_REVERSE_SAMPLES)
+                kind = 1;
+        } else {
+            c->reverse_count = 0;
+        }
+    }
+
+    /* AVG path: a moderate reversal the regulator's escape has not cleared. */
+    if (kind == 0) {
+        if (i_buck_avg < -(int32_t)CHG_REVERSE_CURRENT_MA) {
+            if (c->reverse_avg_since_ms == 0)
+                c->reverse_avg_since_ms = (now != 0) ? now : 1U;
+            else if ((now - c->reverse_avg_since_ms) >= CHG_REVERSE_LATCH_MS)
+                kind = 2;
+        } else {
+            c->reverse_avg_since_ms = 0;
+        }
+    }
+
+    if (kind == 0)
+        return;
+
+    /* Latch. FAULT_REVERSE_PUMP's action opens Q49 before disabling the buck;
+     * energy_mode's fault-clear re-arm subsequently restarts from
+     * CHG_BUCK_SETTLE, never directly connected. Keep the evidence for the
+     * log line (main.c log_reverse_trace). */
+    c->reverse_trace_kind    = kind;
+    c->reverse_trace_avg     = (int16_t)i_buck_avg;
+    c->reverse_trace_pwm     = ctx->pwm;
+    c->reverse_trace_vpanel  = get_input_voltage_now();
+    if (kind == 2) {
+        c->reverse_trace_ibuck[0] = (int16_t)i_buck_now;
+        for (uint8_t i = 1; i < CHG_REVERSE_SAMPLES; i++)
+            c->reverse_trace_ibuck[i] = 0;
+    }
+    c->reverse_trace_pending = true;
+
+    fault_raise(ctx, FAULT_REVERSE_PUMP);
+    ctx->pwm = PWM_MIN_DUTY;
+    c->reverse_count        = 0;
+    c->reverse_avg_since_ms = 0;
 }
 
 /* =========================================================================
@@ -743,6 +1129,25 @@ static void cc_regulate(system_ctx_t *ctx)
         return;   /* current-limited, not voltage-limited: no gain sample */
     }
 
+    /* Clamp 1b (v0.41): the fence is TWO-SIDED. mppt.c moves cliff_pwm_min
+     * both ways — down to probe, back up to reject a probe or to fence above
+     * a knee it just learned — and pwm_draw_more only ever refuses to go
+     * under it; nothing brought the rail back UP when the fence rose. Bench
+     * 14.09.26 v0.40: 33.8 % of all fenced CC samples had the actual pwm
+     * under the fence, one stretch for 121 s, and a "knee" was learned from
+     * two dwells measured at the same physical count (173.8-177.6 s: fence
+     * 106 -> 103 -> 106 -> 105 -> HOLD, pwm 103 throughout). Realise a raised
+     * fence here, at the loop's own pace and step bound. It is a reduction,
+     * so it is always safe; it is not the voltage loop's step, so it leaves
+     * no gain sample. */
+    uint16_t fence = ctx->mppt.cliff_pwm_min;
+    if (fence != 0 && ctx->pwm < fence) {
+        int32_t up = (int32_t)fence - (int32_t)ctx->pwm;
+        if (up > PANEL_VREG_STEP_MAX) up = PANEL_VREG_STEP_MAX;
+        pwm_step(ctx, +up);
+        return;
+    }
+
     /* Clamp 2: regulate the panel to the MPP setpoint. The target is the
      * LIVE per-panel value owned by the outer MPPT loop (seeded from
      * MPPT_SP_FRACTION_PCT·Voc on a fresh activation, then hill-climbed —
@@ -863,6 +1268,22 @@ static void cv_regulate(system_ctx_t *ctx)
 {
     uint16_t v_bat = ctx->meas.bat_voltage;
 
+    if (v_bat > (BAT_CV_VOLTAGE_MV + CV_DEADBAND_MV)) {
+        /* Above target — reduce current, voltage will drift down. */
+        pwm_step(ctx, +CV_PWM_STEP);
+        return;
+    }
+
+    /* v0.41: the fence is two-sided here too (see cc_regulate clamp 1b). A
+     * fence raised while CV was already under it — a droop in CV — would
+     * otherwise be held under indefinitely by a V_bat loop that is content
+     * where it is. Same pace as CV's own step. */
+    uint16_t fence = ctx->mppt.cliff_pwm_min;
+    if (fence != 0 && ctx->pwm < fence) {
+        pwm_step(ctx, +CV_PWM_STEP);
+        return;
+    }
+
     if (v_bat < BAT_CV_VOLTAGE_MV) {
         /* Below target — need more current to pull voltage up. Fenced by the
          * learned PWM ceiling like CC's draw-more branches: the knee does not
@@ -870,9 +1291,6 @@ static void cv_regulate(system_ctx_t *ctx)
          * than the count that already collapsed the panel, in which case the
          * unfenced alternative is another teardown, not a faster taper. */
         pwm_draw_more(ctx, CV_PWM_STEP);
-    } else if (v_bat > (BAT_CV_VOLTAGE_MV + CV_DEADBAND_MV)) {
-        /* Above target — reduce current, voltage will drift down. */
-        pwm_step(ctx, +CV_PWM_STEP);
     }
     /* Within 3650..3655: stable. */
 }
@@ -939,12 +1357,40 @@ static void tick_buck_settle(system_ctx_t *ctx)
          * under raw VCHG feedback while Q49 is still open. The small paced step
          * bounds overshoot at the eventual connection; a failed rail simply
          * saturates at PWM_MAX_DUTY without ever exposing the battery.
+         *
+         * v0.41: the walk lands ON the learned fence rather than through it,
+         * and if the rail still has not cleared the cell after sitting on the
+         * fence for CHG_PWM_SETTLED_TICKS/2 (the slew has had ~300 ms), the
+         * fence sits at or above the zero-delivery count and is provably
+         * wrong: discard it, knee and all, and finish the acquisition
+         * unfenced. That replaces v0.40's snap-to-fence at the Q49 close,
+         * which could command a rail the interlock had never validated
+         * (14.09.26: SETL cleared the cell at 108, snapped to a fence of 110
+         * — the zero-draw count — and latched 0x0100 500 ms later). The
+         * fence may not block this ramp; it may only be found wrong by it.
          */
         if (ctx->meas.panel_voltage >= PANEL_SAFETY_MV &&
-            (now - c->cc_last_downstep_ms) >=
-                CHG_BUCK_SETTLE_RAMP_MS) {
+            (now - c->cc_last_downstep_ms) >= CHG_BUCK_SETTLE_RAMP_MS) {
             c->cc_last_downstep_ms = now;
-            pwm_step(ctx, -CHG_BUCK_SETTLE_PWM_STEP);
+
+            int32_t  step  = CHG_BUCK_SETTLE_PWM_STEP;
+            uint16_t fence = ctx->mppt.cliff_pwm_min;
+            if (fence != 0) {
+                if (ctx->pwm > fence) {
+                    if (step > (int32_t)(ctx->pwm - fence))
+                        step = (int32_t)(ctx->pwm - fence);
+                } else if (c->settled_ticks >= (CHG_PWM_SETTLED_TICKS / 2U)) {
+                    ctx->mppt.cliff_pwm_min  = 0;
+                    ctx->mppt.knee_pwm       = 0;
+                    ctx->mppt.knee_learned_ms = 0;
+                    if (ctx->mppt.fence_dropped < UINT16_MAX)
+                        ctx->mppt.fence_dropped++;
+                } else {
+                    step = 0;             /* on the fence: let the rail slew */
+                }
+            }
+            if (step > 0)
+                pwm_step(ctx, -step);
         }
         return;
     }
@@ -958,23 +1404,18 @@ static void tick_buck_settle(system_ctx_t *ctx)
      * charger_fast_guard yields rather than reading noise about zero as
      * reverse pumping, and clear any debounce carried in from the last
      * session. See CHG_CONNECT_BLANK_MS. */
-    c->connect_ms     = now;
-    c->reverse_count  = 0;
+    c->connect_ms           = now;
+    c->reverse_count        = 0;
+    c->reverse_avg_since_ms = 0;
 
-    /* Re-assert the learned ceiling at the handoff. The acquisition ramp above
-     * is deliberately unfenced — fencing it is how a current limit becomes a
-     * "stranded in SETL forever" lockup — but it steps every 50 ms while the
-     * rail is merely still SLEWING, so it routinely walks 6-16 counts past
-     * wherever it started. Bench 10.09.26 (v0.33): resume entered at the
-     * ceiling (113), SETL ramped straight through it to 107, and CC then held
-     * 107 for 156 s until the panel fell over there again — pwm_draw_more
-     * cannot pull it back, since below the fence it is a no-op by design.
-     * Q49 has just closed and this only ever REDUCES current, so it is safe
-     * here in a way it is not inside the ramp. */
-    if (ctx->mppt.cliff_pwm_min != 0 && ctx->pwm < ctx->mppt.cliff_pwm_min) {
-        ctx->pwm = pwm_clamp((int32_t)ctx->mppt.cliff_pwm_min);
-        set_buck_pwm(ctx->pwm);
-    }
+    /* The ramp above lands on the fence rather than through it (v0.41), so
+     * there is nothing to re-assert here; if it does close under the fence
+     * (a fence raised while SETL was already past it), cc_regulate's
+     * two-sided fence rule walks the rail back up at the paced rate. This is
+     * the one path that lands PWM on the fence without going through
+     * pwm_draw_more, so the dwell it would otherwise inherit was served by a
+     * previous session. The loop starts fresh here. */
+    c->draw_blocked_ms = 0;
 
     if (ctx->meas.bat_voltage < BAT_PRECHARGE_MV)
         enter_precharge(ctx);
@@ -1117,6 +1558,51 @@ void charger_update(system_ctx_t *ctx)
      * armed the hardware yet; do not bypass the reverse-pump interlock. */
     if (c->state == CHG_INACTIVE) {
         return;
+    }
+
+    /* Refresh the fast droop guard's reference before anything else moves:
+     * it is the only thing standing between a knee excursion and a 2.5 s
+     * stand-down, and it must describe THIS tick's operating point. */
+    panel_op_track(ctx);
+
+    /* ── Counter-evidence for the cliff fence ──
+     *
+     * Record the highest count this session has been SEEN delivering at, so
+     * learn_cliff_pwm can never fence at or above a draw the panel actually
+     * sustained (hw_config.h, CHG_DELIVERING_MIN_MA). Gated on the count
+     * having been held CHG_PWM_SETTLED_TICKS: chg_current is a 64-sample
+     * average, so a reading taken less than 650 ms after a step still
+     * describes the previous operating point.
+     *
+     * Runs before the per-state tick so the dwell is measured against the
+     * PWM that produced this tick's measurement, not the one about to be
+     * written. */
+    if (ctx->pwm == c->settled_pwm) {
+        if (c->settled_ticks < CHG_PWM_SETTLED_TICKS)
+            c->settled_ticks++;
+    } else {
+        c->settled_pwm   = ctx->pwm;
+        c->settled_ticks = 0;
+    }
+
+    if (charger_connected(ctx) &&
+        c->settled_ticks >= CHG_PWM_SETTLED_TICKS &&
+        ctx->meas.chg_current >= (int16_t)CHG_DELIVERING_MIN_MA) {
+        if (ctx->pwm > c->delivering_pwm)
+            c->delivering_pwm = ctx->pwm;
+
+        /* v0.41: and where zero delivery is, from the same settled reading —
+         * pwm + I_buck / CHG_BUCK_MA_PER_COUNT (I_buck = I_cell + I_load).
+         * Refreshed on every delivering tick so it follows V_bat; the last
+         * value stands while the buck idles. Bounds the droop guard's
+         * backoff and places the input guard's post-rescue restore. */
+        int32_t  i_buck = (int32_t)ctx->meas.chg_current +
+                          (int32_t)ctx->meas.dsg_current;
+        uint32_t zero   = (uint32_t)ctx->pwm +
+                          ((uint32_t)i_buck + CHG_BUCK_MA_PER_COUNT - 1U) /
+                              CHG_BUCK_MA_PER_COUNT;
+        if (zero > PWM_MIN_DUTY) zero = PWM_MIN_DUTY;
+        c->zero_draw_pwm = (uint16_t)zero;
     }
 
     /* ── Per-state tick ── */

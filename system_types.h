@@ -255,6 +255,10 @@ typedef struct {
  * from the power budget as its CC target. The power budget already
  * subtracted load current — the charger just regulates to the number.
  */
+/* charger_ctx_t.droop_kind — classification of the current droop event (v0.42) */
+#define DROOP_KIND_FALL    0U   /* the panel is falling: back off, tell the tracker */
+#define DROOP_KIND_GLITCH  1U   /* the buck's own transient: leave the rail alone   */
+
 /* charger_ctx_t.input_trace_result — outcome of the last input-guard event */
 #define INPUT_TRACE_PENDING     0u   /* window still open when logged        */
 #define INPUT_TRACE_RECOVERED   1u   /* source came back after the backoff   */
@@ -338,6 +342,39 @@ typedef struct {
     uint16_t input_trace_pwm_to;   /* pwm after its last action              */
     uint8_t  input_trace_result;   /* INPUT_TRACE_*                          */
     bool     input_trace_pending;  /* a snapshot is waiting to be logged     */
+    int16_t  input_trace_ichg_from; /* v0.41: averaged chg_current at the first
+                                   * sub-margin conversion — the delivery the
+                                   * count could not hold. Gates the knee
+                                   * claim (mppt.c) and sizes the RECOVERED
+                                   * restore (charger.c)                    */
+    uint16_t input_trace_vpanel_from; /* v0.41: averaged V_panel at the same
+                                   * moment, for the Voc plausibility gate  */
+
+    /* v0.41: where the rail is parked when delivery is zero — the count at
+     * which the buck output sits exactly on the cell and no current flows in
+     * either direction. Refreshed every settled delivering tick from
+     * pwm + I_buck / CHG_BUCK_MA_PER_COUNT (charger_update), so it follows
+     * V_bat. Bounds every demand-shedding backoff that has FB authority
+     * (droop guard) and is where an input-guard rescue restores the rail to.
+     * 0 = not known yet (nothing has been delivered this boot). */
+    uint16_t zero_draw_pwm;
+
+    /* v0.41: post-mortem for a FAULT_REVERSE_PUMP latch, printed by main.c on
+     * the next tick — the raw conversions the latch was made on, the pwm and
+     * raw V_panel at the moment, and which path latched (fast raw / averaged).
+     * The v0.40 log could not tell a real reversal from noise about zero
+     * because none of this was ever recorded. */
+    int16_t  reverse_trace_ibuck[CHG_REVERSE_SAMPLES];
+    int16_t  reverse_trace_avg;      /* averaged I_buck at the latch          */
+    uint16_t reverse_trace_pwm;      /* pwm before the latch parked it        */
+    uint16_t reverse_trace_vpanel;   /* raw V_panel at the latch              */
+    uint8_t  reverse_trace_kind;     /* 1 = fast raw path, 2 = averaged path  */
+    bool     reverse_trace_pending;
+    uint32_t reverse_avg_since_ms;   /* first tick the AVERAGED I_buck read
+                                   * under -CHG_REVERSE_CURRENT_MA with a
+                                   * live input; 0 = not reversing. The
+                                   * averaged path latches once this has
+                                   * stood for CHG_REVERSE_LATCH_MS         */
 
     /* ── Online plant gain (the adaptive regulation band) ──
      * |ΔV_panel| per PWM count, mV, as measured by the voltage loop's own
@@ -377,6 +414,86 @@ typedef struct {
      * microseconds. Reset by any conversion that is not reverse. */
     uint8_t  reverse_count;       /* consecutive DISTINCT reverse samples     */
     uint32_t reverse_seq;         /* adc_sample_seq() of the last counted one */
+
+    /* Counter-evidence to mppt.cliff_pwm_min: the HIGHEST pwm (= lowest
+     * current) at which this session has actually been observed delivering
+     * CHG_DELIVERING_MIN_MA into the cell, with the count settled long
+     * enough for the 64-sample average to describe it. A fence at or above
+     * this is provably wrong — it forbids a draw the panel demonstrably
+     * sustained. Same lifetime as cliff_pwm_min (cleared on a FRESH MPPT
+     * entry): it is the same knee, seen from the other side. 0 = unknown. */
+    uint16_t delivering_pwm;
+    uint16_t settled_pwm;         /* the count settled_ticks is counting      */
+    uint8_t  settled_ticks;       /* consecutive 50 ms ticks at settled_pwm   */
+
+    /* time_now() when the regulator FIRST asked for more current and was
+     * refused by the fence, 0 while it is not being refused. A fence the
+     * loop is pinned against for CHG_CLIFF_PROBE_MS while V_panel sits above
+     * the band is a fence that is too tight, not a panel at its knee — see
+     * the fast release in mppt.c. Armed and cleared only in charger.c's
+     * regulator paths, never from a logging path (v0.38's lesson). */
+    uint32_t draw_blocked_ms;
+
+    /* ── Fast panel-droop guard (v0.40) ──
+     *
+     * panel_op_mv is where the regulator is actually parked: the settled
+     * averaged V_panel, refreshed once per PANEL_VREG_INTERVAL_MS by
+     * cc_regulate, rising instantly and falling at most CHG_DROOP_REF_FALL_MV
+     * per interval. charger_panel_droop_guard judges each raw 10 ms
+     * conversion against CHG_DROOP_TRIP_PCT of it, which is the only
+     * threshold in the firmware that sits between "regulating normally" and
+     * "already collapsed onto the cell" (charger_input_guard's trip is the
+     * latter). 0 = no credible operating point, guard disarmed. */
+    uint16_t panel_op_mv;
+    uint32_t panel_op_ms;         /* time_now() of the last reference update —
+                                   * paced to PANEL_VREG_INTERVAL_MS, the same
+                                   * interval the voltage loop steps on        */
+    uint32_t droop_seq;           /* adc_sample_seq() of the last evaluation —
+                                   * the guard runs at super-loop rate against
+                                   * a value refreshed every TICK_ADC_MS, so it
+                                   * is gated on conversions exactly as
+                                   * input_lost_count is                      */
+    uint8_t  droop_count;         /* consecutive sub-trip conversions in this
+                                   * event; capped at CHG_DROOP_MAX_STEPS so a
+                                   * removed source is left to the input guard */
+    uint16_t droop_pwm_from;      /* pwm in force when this event started, i.e.
+                                   * the draw the panel could not hold. Read by
+                                   * mppt.c exactly as input_trace_pwm_from is,
+                                   * and snapshotted before the first backoff  */
+    uint16_t droop_events;        /* droops arrested before collapse. The
+                                   * tracker learns its knee from these, and
+                                   * the count is the direct measure of what
+                                   * this guard is buying                      */
+    int16_t  droop_ichg_from;     /* v0.41: averaged chg_current when the event
+                                   * started — the delivery the count could not
+                                   * hold. Sizes the event's backoff bound and
+                                   * gates the knee claim (mppt.c)             */
+    uint16_t droop_vpanel_from;   /* v0.41: averaged V_panel at the same moment,
+                                   * for the Voc plausibility gate             */
+    uint16_t droop_limit_pwm;     /* v0.41: highest count this event may back
+                                   * off to — the zero-delivery point plus
+                                   * CHG_ZERO_DRAW_MARGIN. Past it the guard
+                                   * would be reverse-pumping, not shedding    */
+
+    /* v0.41: droop post-mortem, printed by main.c on the next tick exactly as
+     * the input guard's INTRACE is: the raw V_panel window at the first
+     * sub-trip conversion, the raw buck current then, and what the guard did.
+     * The v0.40 session had 25 droops and not one raw sample to say what they
+     * were. */
+    uint16_t droop_trace_mv[ADC_PANEL_TRACE_DEPTH];
+    int16_t  droop_trace_ibuck;   /* raw I_buck at the first sub-trip sample  */
+    uint8_t  droop_kind;          /* v0.42: DROOP_KIND_* — what this event was
+                                   * judged to be (a GLITCH is the buck's own
+                                   * switching transient: raw I_buck far above
+                                   * the average on the same conversion, which
+                                   * a panel fall can never produce)          */
+    bool     droop_counted;       /* v0.42: droop_events already bumped for
+                                   * this event (first FALL conversion)       */
+    uint16_t droop_glitch_events; /* v0.42: sightings classified GLITCH — no
+                                   * backoff, no knee, traced as such         */
+    uint16_t droop_trace_trip_mv; /* the trip level that was crossed          */
+    uint16_t droop_trace_pwm_to;  /* pwm after the event's last backoff       */
+    bool     droop_trace_pending;
 
 } charger_ctx_t;
 
@@ -463,7 +580,8 @@ typedef struct {
                                  * (mA) — the fitness baseline            */
     bool     prev_avg_valid;    /* false until a baseline dwell completes
                                  * (entry, re-probe, post-collapse)       */
-    bool     voc_pending;       /* fresh activation: capture Voc + seed at
+    bool     voc_pending;       /* VESTIGIAL since v0.40 (there is no seed).
+                                 * Was: fresh activation: capture Voc + seed at
                                  * the end of the first settled dwell —
                                  * NOT at entry, where the 640 ms panel-ADC
                                  * window is still half-full of pre-plug
@@ -478,12 +596,19 @@ typedef struct {
                                  * resumes from the converged point.
                                  * true at cold boot so the first
                                  * activation always seeds.               */
-    bool     dwell_dipped;      /* V_panel dipped below the regulation
+    bool     dwell_dipped;      /* VESTIGIAL since v0.40 — the band-hop
+                                 * whipsaw it classified cannot happen when
+                                 * the FENCE, not a millivolt setpoint, is
+                                 * the actuator. Was: V_panel dipped below
+                                 * the regulation
                                  * band during this dwell's measure window
                                  * → the setpoint cannot park (band-hop
                                  * whipsaw); classified as "too low"
                                  * regardless of the measured average     */
-    uint16_t sp_session_floor_mv; /* raised to the post-push setpoint on
+    uint16_t sp_session_floor_mv; /* VESTIGIAL since v0.40: the cliff lives
+                                 * in the PWM domain now (knee_pwm /
+                                 * cliff_pwm_min) and nothing reads this.
+                                 * Was: raised to the post-push setpoint on
                                  * every collapse/dip correction, and by
                                  * sp_learn_cliff on an input-loss
                                  * teardown: a level that failed is not
@@ -529,6 +654,66 @@ typedef struct {
     uint16_t ichg_acc_cnt;      /* samples accumulated                    */
     uint32_t dwell_start_ms;    /* current dwell start (settle+measure
                                  * phases both time from here)            */
+
+    /* ── Knee P&O on the PWM fence (v0.40) ──
+     *
+     * cliff_pwm_min above is now the tracker's ACTUATOR, not its scar: the
+     * search lowers it one count per dwell and measures delivered current,
+     * the voltage loop drives the operating point into it, and the count
+     * that stops paying is the knee. See the block comment in hw_config.h.
+     */
+    uint16_t knee_pwm;          /* lowest count PROVEN bad — measured worse,
+                                 * drooped, or collapsed. The search floor:
+                                 * probing may approach knee_pwm +
+                                 * MPPT_KNEE_MARGIN and no further. 0 = the
+                                 * panel has not been pushed that far yet  */
+    uint32_t knee_learned_ms;   /* time_now() when knee_pwm was last raised;
+                                 * gates re-probing for MPPT_KNEE_RETREAT_MS */
+    uint16_t knee_vpanel_mv;    /* v0.43: averaged V_panel when the knee was
+                                 * learned. A panel now sitting well above
+                                 * that at the same draw has more light than
+                                 * it had, and the knee is stale — HOLD
+                                 * re-probes without waiting the retreat
+                                 * (MPPT_KNEE_RELEASE_MV)                 */
+    uint16_t probe_from_pwm;    /* fence before the probe under test — the
+                                 * revert target when the probe measures
+                                 * worse                                    */
+    uint16_t seen_droop_events; /* charger.droop_events last acted on. A
+                                 * change means the fast guard arrested a
+                                 * fall at a known PWM: the cleanest knee
+                                 * sighting there is, and the only one that
+                                 * costs nothing                            */
+    uint32_t knee_probe_ms;     /* HOLD: time_now() of the last down-probe  */
+    uint8_t  probe_step;        /* counts the probe under test moved the
+                                 * fence. A failed COARSE probe brackets
+                                 * instead of teaching a knee: the knee is
+                                 * somewhere inside the jump               */
+    bool     probing;           /* a fence probe is under test this dwell —
+                                 * false during the baseline dwell that
+                                 * establishes what it is compared against  */
+
+    /* v0.41 — the dwell is timed from ARRIVAL, and the search remembers its
+     * best point. */
+    uint32_t arrived_ms;        /* time_now() when ctx->pwm first sat exactly
+                                 * on cliff_pwm_min in this dwell; 0 = not
+                                 * there yet. The settle window starts here,
+                                 * not at the request: a rejected probe's
+                                 * rollback takes the regulator an interval
+                                 * or two to realise, and the 640 ms ADC
+                                 * window must not straddle two counts     */
+    uint16_t best_pwm;          /* fence of the best-paying dwell of this
+                                 * search (highest averaged chg_current);
+                                 * where a search that ends on its runtime
+                                 * cap parks. 0 = nothing measured yet     */
+    int16_t  best_ichg;         /* ...and what it delivered                 */
+    bool     event_knee_accepted; /* v0.41: did the last droop/dip event pass
+                                 * the MPPT_KNEE_VOC_MAX_PCT plausibility
+                                 * gate and move the fence? For the log   */
+    uint16_t fence_dropped;     /* diagnostic: times a fence was found to sit
+                                 * at or above the zero-delivery count and
+                                 * was discarded (SETL could not clear the
+                                 * cell under it, or the regulator sat pinned
+                                 * on it delivering nothing)               */
 
 } mppt_ctx_t;
 
@@ -855,7 +1040,27 @@ static inline void ctx_init(system_ctx_t *ctx)
     ctx->charger.vloop_probe_steps  = 0;
     ctx->charger.vloop_measure_armed = false;
     ctx->mppt.cliff_pwm_min       = 0;                /* ...in either domain  */
-    /* Nothing learned yet: the first activation must take the FOCV path.
+    ctx->charger.delivering_pwm   = 0;
+    ctx->charger.settled_pwm      = 0;
+    ctx->charger.settled_ticks    = 0;
+    ctx->charger.draw_blocked_ms  = 0;
+
+    /* Knee P&O (v0.40): nothing measured, nothing fenced, guard disarmed
+     * until cc_regulate has a settled operating point to reference. */
+    ctx->mppt.knee_pwm            = 0;
+    ctx->mppt.knee_learned_ms     = 0;
+    ctx->mppt.probe_from_pwm      = 0;
+    ctx->mppt.seen_droop_events   = 0;
+    ctx->mppt.knee_probe_ms       = 0;
+    ctx->mppt.probe_step          = 0;
+    ctx->mppt.probing             = false;
+    ctx->charger.panel_op_mv      = 0;
+    ctx->charger.droop_seq        = 0;
+    ctx->charger.droop_count      = 0;
+    ctx->charger.droop_pwm_from   = 0;
+    ctx->charger.droop_events     = 0;
+
+    /* Nothing learned yet: the first activation must take the search path.
      * (disabled_since_ms stays 0 from the struct zeroing — it is only read
      * once seed_invalidated has been cleared by enter_disabled().) */
     ctx->mppt.seed_invalidated = true;

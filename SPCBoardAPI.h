@@ -187,6 +187,9 @@ void     set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle);
 void     set_buck_pwm(uint16_t pwm_value);
 uint16_t lookup_charging_pwm(uint16_t voltage);
 uint16_t set_charging_voltage(uint16_t voltage);
+/* v0.42: set_buck_pwm() writes the timer only when the value changes; call
+ * this after a STANDBY restore so the next write is unconditional. */
+void     buck_pwm_cache_invalidate(void);
 void     set_led_voltage(uint16_t voltage);
 void     set_led_current(uint16_t current, LED_OUTPUT led);
 
@@ -267,5 +270,18 @@ void get_time(DL_RTC_Common_Calendar* time_struct);
 
 void uart_init(void);
 void printToUART(char* string, char end_char);
+
+/* v0.41: non-blocking transmit path for the telemetry and event lines.
+ * uart_write() copies a NUL-terminated string into a software ring (whole
+ * string or nothing — a line that does not fit is dropped and counted);
+ * uart_pump() moves bytes from the ring into the hardware TX FIFO without
+ * ever waiting, and is called once per super-loop pass; uart_flush() drains
+ * ring and shifter BLOCKING, for the one place that needs the wire idle
+ * (STANDBY entry). printToUART above stays blocking for the HardFault
+ * post-mortem, which cannot rely on the loop running. */
+void     uart_write(const char *str);
+void     uart_pump(void);
+void     uart_flush(void);
+uint16_t uart_tx_dropped(void);
 
 #endif

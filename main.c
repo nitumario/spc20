@@ -57,6 +57,12 @@ static system_ctx_t ctx;
 static char uart_buf[UART_BUF_SIZE];      /* per-tick telemetry */
 static char uart_evt_buf[128];            /* state-transition events */
 
+/* v0.42: super-loop passes since the last telemetry line (`lps`). The
+ * foreground guards see a conversion only when the loop comes round, so this
+ * is the guards' effective sample rate — on this 4 MHz part it was ~370
+ * passes/s while charging before the raw getters went integer. */
+static uint32_t loop_passes = 0;
+
 /* =========================================================================
  * UART LOGGING
  * =========================================================================
@@ -70,7 +76,10 @@ static char uart_evt_buf[128];            /* state-transition events */
 
 static void send_string(const char *str)
 {
-    printToUART((char *)str, '\0');
+    /* v0.41: enqueue, never wait. The ring is drained by uart_pump() at the
+     * top of every super-loop pass, so the foreground guards are no longer
+     * parked behind ~33 ms of wire per telemetry line (UART_TX_RING_SIZE). */
+    uart_write(str);
 }
 
 /*
@@ -83,7 +92,7 @@ static void log_boot_banner(void)
 {
     send_string("\r\n"
                 "==============================================\r\n"
-                " SPC_20 Solar Charge Controller - boot v0.38\r\n"
+                " SPC_20 Solar Charge Controller - boot v0.43\r\n"
                 "==============================================\r\n");
 }
 
@@ -223,6 +232,84 @@ static void log_input_trace(uint32_t now)
 }
 
 /*
+ * Droop post-mortem (v0.41). charger_panel_droop_guard() snapshots the raw
+ * V_panel ring, the raw buck current and the trip level on the first
+ * sub-trip conversion; this prints them on the next pipeline tick with what
+ * the guard did (pwm from -> to), what the count was delivering, and what it
+ * was: GLITCH (the buck's own switching transient — raw I_buck spiked above
+ * the average, no backoff, no knee; v0.42), KNEE (the tracker accepted it as
+ * a knee sighting) or NOKNEE (a fall at a count that was not delivering).
+ * Same shape as INTRACE so the same tooling reads both.
+ */
+static void log_droop_trace(uint32_t now)
+{
+    if (!ctx.charger.droop_trace_pending) return;
+    ctx.charger.droop_trace_pending = false;
+    if (ctx.log_mode == LOG_MODE_OFF) return;
+
+    const char *kind =
+        (ctx.charger.droop_kind == DROOP_KIND_GLITCH) ? "GLITCH" :
+        ctx.mppt.event_knee_accepted                  ? "KNEE"   : "NOKNEE";
+    int len = snprintf(uart_buf, UART_BUF_SIZE,
+                       "DROOP @ %lu ms %s pwm:%u->%u Ichg:%d Ibuck_raw:%d "
+                       "Vp:%u trip:%u voc:%u drp:%u Vpanel_raw:",
+                       (unsigned long)now, kind,
+                       (unsigned)ctx.charger.droop_pwm_from,
+                       (unsigned)ctx.charger.droop_trace_pwm_to,
+                       (int)ctx.charger.droop_ichg_from,
+                       (int)ctx.charger.droop_trace_ibuck,
+                       (unsigned)ctx.charger.droop_vpanel_from,
+                       (unsigned)ctx.charger.droop_trace_trip_mv,
+                       (unsigned)ctx.mppt.panel_voc_mv,
+                       (unsigned)ctx.charger.droop_events);
+    for (unsigned i = 0; i < ADC_PANEL_TRACE_DEPTH && len > 0 &&
+                         len < UART_BUF_SIZE; i++) {
+        len += snprintf(uart_buf + len, (size_t)(UART_BUF_SIZE - len),
+                        " %u", (unsigned)ctx.charger.droop_trace_mv[i]);
+    }
+    if (len > 0 && len < UART_BUF_SIZE - 3) {
+        uart_buf[len++] = '\r';
+        uart_buf[len++] = '\n';
+        uart_buf[len]   = '\0';
+        send_string(uart_buf);
+    }
+}
+
+/*
+ * Reverse-pump latch post-mortem (v0.41). The raw conversions the latch was
+ * made on (FAST path) or the averaged buck current that stood for
+ * CHG_REVERSE_LATCH_MS (AVG path), plus pwm and raw V_panel at the moment.
+ * The v0.40 log could not separate a real reversal from noise about zero
+ * because none of this was recorded.
+ */
+static void log_reverse_trace(uint32_t now)
+{
+    if (!ctx.charger.reverse_trace_pending) return;
+    ctx.charger.reverse_trace_pending = false;
+    if (ctx.log_mode == LOG_MODE_OFF) return;
+
+    int len = snprintf(uart_buf, UART_BUF_SIZE,
+                       "REVTRACE @ %lu ms %s pwm:%u Vpanel_raw:%u Ibuck_avg:%d "
+                       "Ibuck_raw:",
+                       (unsigned long)now,
+                       (ctx.charger.reverse_trace_kind == 1) ? "FAST" : "AVG",
+                       (unsigned)ctx.charger.reverse_trace_pwm,
+                       (unsigned)ctx.charger.reverse_trace_vpanel,
+                       (int)ctx.charger.reverse_trace_avg);
+    for (unsigned i = 0; i < CHG_REVERSE_SAMPLES && len > 0 &&
+                         len < UART_BUF_SIZE; i++) {
+        len += snprintf(uart_buf + len, (size_t)(UART_BUF_SIZE - len),
+                        " %d", (int)ctx.charger.reverse_trace_ibuck[i]);
+    }
+    if (len > 0 && len < UART_BUF_SIZE - 3) {
+        uart_buf[len++] = '\r';
+        uart_buf[len++] = '\n';
+        uart_buf[len]   = '\0';
+        send_string(uart_buf);
+    }
+}
+
+/*
  * Per-tick telemetry. One line per tick, space-separated, with each
  * value prefixed by a "label:" tag so the line is self-describing
  * (e.g. "ms:34270 Vbat:3200 ..."). Fields, in order:
@@ -253,11 +340,13 @@ static void log_input_trace(uint32_t now)
  *  24  charger.state       (name: OFF/PRE/CC/CV)
  *  25  mppt.state          (name: OFF/TRK/HLD)
  *  26  pwm
- *  27  mppt.vreg_setpoint_mv (mV — live input-vreg target, owned by MPPT)
- *  28  mppt.sp_session_floor_mv (mV — learned setpoint floor: the cliff.
- *                            Rises on collapse/dip corrections and on an
- *                            input-loss teardown; sp never goes below it
- *                            until a fresh seed)
+ *  27  mppt.vreg_setpoint_mv (mV — the voltage loop's target. Since v0.40
+ *                            this only does sag protection: it follows the
+ *                            plant in HOLD and is parked low during a search
+ *                            so the FENCE meters the descent)
+ *  28  mppt.knee_pwm       (the lowest PWM count PROVEN not to hold — a probe
+ *                            that underdelivered, a droop, or a collapse.
+ *                            pwmf = this + a margin. 0 = not found yet)
  *  29  charger.input_dip_events (input collapses the guard RESCUED by
  *                            backing off — charging never stopped;
  *                            monotonic)
@@ -265,6 +354,16 @@ static void log_input_trace(uint32_t now)
  *  31  fault.history       (hex)
  *  32  temp_ok_sensor      (1 = both NTCs reading plausibly)
  *  33  thermal.derate_pct  (100 = no foldback)
+ *  34  charger.zero_draw_pwm (zd — the count at which the buck delivers
+ *                            nothing, from the last settled delivering tick;
+ *                            backoffs stop one margin past it. v0.41)
+ *  35  mppt.fence_dropped  (fdrop — fences discarded for sitting at/above the
+ *                            zero-draw count. v0.41)
+ *  36  uart_tx_dropped     (txd — log lines dropped, TX ring full. v0.41)
+ *
+ * (pwmf = mppt.cliff_pwm_min, the fence; gain/db = the measured plant gain
+ * and the regulation half-band it produces; drp = charger.droop_events —
+ * see the comments beside the format arguments below.)
  */
 static void log_measurements(void)
 {
@@ -275,9 +374,9 @@ static void log_measurements(void)
         "Tbat:%d Tboard:%d "
         "bat_low:%u has_sun:%u has_load:%u temp_ok:%u p_limited:%u bat_full:%u "
         "i_buck_max:%u allowed_chg:%u "
-        "EM:%s CHG:%s MPPT:%s pwm:%u pwmf:%u sp:%u spf:%u gain:%u db:%u "
-        "dips:%u fault:%04X flt_hist:%04X "
-        "tsens:%u derate:%u\r\n",
+        "EM:%s CHG:%s MPPT:%s pwm:%u pwmf:%u sp:%u knee:%u gain:%u db:%u "
+        "dips:%u drp:%u fault:%04X flt_hist:%04X "
+        "tsens:%u derate:%u zd:%u fdrop:%u txd:%u glt:%u lps:%lu\r\n",
         (unsigned long)time_now(),
         m->bat_voltage, m->chg_voltage, m->out_voltage,
         m->panel_voltage, m->usb1_voltage, m->usb2_voltage,
@@ -292,7 +391,7 @@ static void log_measurements(void)
         chg_state_name(ctx.charger.state),
         mppt_state_name(ctx.mppt.state),
         ctx.pwm, ctx.mppt.cliff_pwm_min,
-        ctx.mppt.vreg_setpoint_mv, ctx.mppt.sp_session_floor_mv,
+        ctx.mppt.vreg_setpoint_mv, ctx.mppt.knee_pwm,
         /* gain = measured mV of V_panel per PWM count (0 = not yet learned),
          * db = the regulation half-band it produces. Together they say
          * whether the loop can still command the setpoint it has: the
@@ -300,8 +399,30 @@ static void log_measurements(void)
         (unsigned)ctx.charger.plant_mv_per_count,
         (unsigned)charger_vreg_deadband_mv(&ctx),
         (unsigned)ctx.charger.input_dip_events,
+        /* drp = droop events the fast guard BACKED OFF for (v0.40) — counted
+         * on the first backoff of each event, so it is "the guard acted",
+         * not "a collapse was averted". dips = input collapses that
+         * RECOVERED after the input guard's backoff; a stand-down is not a
+         * dip. Neither counts the reverse-current latches (fault:0100), so
+         * drp climbing with dips flat says nothing about whether the charger
+         * stayed up — the v0.40 session had exactly that and six 0x0100
+         * teardowns. Read the DROOP/REVTRACE lines and the fault column. */
+        (unsigned)ctx.charger.droop_events,
         ctx.fault.code, ctx.fault.history,
-        (unsigned)ctx.temp_sensor_ok, (unsigned)ctx.thermal.derate_pct);
+        (unsigned)ctx.temp_sensor_ok, (unsigned)ctx.thermal.derate_pct,
+        /* zd = charger.zero_draw_pwm, the count at which the buck delivers
+         * nothing (v0.41); every demand-shedding backoff stops one margin
+         * past it. fdrop = fences discarded for sitting at/above it. txd =
+         * log lines dropped because the TX ring was full. */
+        (unsigned)ctx.charger.zero_draw_pwm,
+        (unsigned)ctx.mppt.fence_dropped,
+        (unsigned)uart_tx_dropped(),
+        /* glt = droop-guard sightings classified as the buck's own switching
+         * transient (raw I_buck spike) rather than a panel fall — no backoff,
+         * no knee (v0.42). lps = super-loop passes since the previous line. */
+        (unsigned)ctx.charger.droop_glitch_events,
+        (unsigned long)loop_passes);
+    loop_passes = 0;
     if (len > 0 && len < UART_BUF_SIZE) send_string(uart_buf);
 }
 /* =========================================================================
@@ -784,9 +905,9 @@ static void system_sleep(system_ctx_t *c)
         (unsigned long)time_now());
     if (len > 0 && len < (int)sizeof uart_evt_buf) send_string(uart_evt_buf);
 
-    /* Drain the TX shifter: printToUART blocks per byte on FIFO space, not
-     * on completion — clock-gating the UART mid-byte garbles the tail. */
-    while (DL_UART_Main_isBusy(UART_0_INST)) { }
+    /* Drain the TX ring and the shifter (blocking — the one place that is
+     * allowed to): clock-gating the UART mid-byte garbles the tail. */
+    uart_flush();
 
     /* ── Power down what sleep owns ── */
     update_led_bar(0x00, LED_BAR_1);     /* blank content so the SysTick mux */
@@ -929,6 +1050,7 @@ static void system_sleep(system_ctx_t *c)
      * below re-enable the LED boost rail, or the lamps would flash at an
      * undefined current for a tick. */
     SYSCFG_DL_restoreConfiguration();
+    buck_pwm_cache_invalidate();             /* v0.42: force the next write */
     set_buck_pwm(c->pwm);                    /* parked at PWM_MIN_DUTY here */
     set_led_voltage(LED_BOOST_TARGET_MV);
     for (uint8_t i = 0; i < 4; i++)
@@ -1109,12 +1231,23 @@ int main(void)
     while (1       ) {
         uint32_t now = time_now();
 
+        /* Re-kick the UART TX interrupt if the ring has data (v0.42: the ISR
+         * does the draining; this only guards against a lost FIFO event). */
+        uart_pump();
+        loop_passes++;
+
         /* The protection wake stimulus can hit its current limit between
          * 50 ms pipeline ticks. Poll the latest 10 ms ADC conversion in the
          * foreground and isolate Q49 immediately; bat_wake_tick records the
          * corresponding FSM transition on the next pipeline tick. */
         bat_wake_fast_guard(&ctx);
-        /* Input-loss first: it trips on the voltage collapse that PRECEDES
+        /* Droop first: it trips at a fraction of the operating voltage, which
+         * the panel crosses on its way down to the input guard's threshold —
+         * and while the buck is still out of dropout, so shedding demand
+         * there actually arrests the fall. If it works, the two guards below
+         * never see anything. */
+        charger_panel_droop_guard(&ctx);
+        /* Input-loss next: it trips on the voltage collapse that PRECEDES
          * reverse current, so on a source removal the cell is isolated before
          * charger_fast_guard has anything to trip on. */
         charger_input_guard(&ctx);
@@ -1185,6 +1318,8 @@ int main(void)
             /* ...and the raw-panel post-mortem if the input guard tripped
              * between ticks, so it prints alongside the CHG -> OFF line. */
             log_input_trace(now);
+            log_droop_trace(now);
+            log_reverse_trace(now);
 
             /* Refresh the bar-graph content from this tick's measurements
              * (battery SoC + panel power; an absent source leaves its bar

@@ -4,64 +4,20 @@
  *
  * Two implementations, selected by CHARGER_INPUT_VREG (hw_config.h):
  *
- * ── CHARGER_INPUT_VREG=1 (current): SETPOINT-P&O ───────────────────────
+ * ── CHARGER_INPUT_VREG=1 (current): KNEE P&O ON THE PWM FENCE ──────────
  *
- * Perturb & observe on the INPUT-VREG SETPOINT, not on the PWM.
+ * Perturb ctx->mppt.cliff_pwm_min — the regulator's current ceiling, in PWM
+ * counts — one count at a time, and measure averaged delivered charge
+ * current. The count that stops paying is the knee; park one margin above
+ * it. cc_regulate's voltage loop drives the operating point down into the
+ * fence and handles sag; charger_panel_droop_guard handles the 10 ms
+ * emergency. This region never writes ctx->pwm and never updates
+ * mppt_limit_ma.
  *
- * The charger's inner voltage loop (charger.c cc_regulate) holds V_panel
- * at ctx->mppt.vreg_setpoint_mv and owns ctx->pwm exclusively — pacing,
- * panel-safety backoff, reverse-current escape and the allowed_chg clamp
- * all stay active at every instant. This region is the OUTER loop: it
- * moves the setpoint one MPPT_SP_STEP_MV at a time and measures whether
- * the system delivers more or less charge current there.
- *
- * Why this survives where PWM-perturbing P&O failed on this plant:
- *   - Actuation granularity: one PWM count is ~45 mA battery-side, ~20 %
- *     of a small panel's full MPP current — a "perturbation" that big is
- *     a sledgehammer. The setpoint is continuous in mV; the inner loop
- *     realises it with its own paced 1-count steps.
- *   - Observation: each probe dwells MPPT_SP_SETTLE_MS (inner loop walk
- *     + 640 ms ADC window) before averaging chg_current over
- *     MPPT_SP_MEASURE_MS. No decisions on transient/lagged readings —
- *     the failure mode that parked the legacy tracker at garbage points.
- *   - Fitness = averaged DELIVERED charge current (chg_current is the
- *     cleanest MA-filtered signal we have, and V_bat is constant over a
- *     3 s dwell, so max current ⇔ max delivered power — converter
- *     losses included, which is what we actually want to maximise).
- *   - Safety: a probe below the panel's knee collapses V_panel; the
- *     inner backoff rescues the rail (as bench-verified 2026-06-12) and
- *     the collapse branch here steps the setpoint back up — one bounded
- *     ~1 s dip per bad probe, no teardown (has_sun clear debounce rides
- *     through it).
- *
- * Seeding (per-panel, replaces the fixed PANEL_VREG_SETPOINT_MV):
- *   On activation the panel reading still shows the unloaded IDLE value
- *   (= open circuit; the MA filter sees the pre-activation seconds), so
- *   we capture Voc for free and seed:
- *
- *     setpoint = (MPPT_SP_FRACTION_PCT/100)·Voc − PANEL_VREG_DEADBAND_MV
- *
- *   The deadband subtraction: the inner loop approaches from open
- *   circuit and parks just under the band TOP (setpoint + deadband), so
- *   the realised operating voltage ≈ setpoint + deadband ≈ k·Voc.
- *
- *   Seeding is for a FRESH start only. A resumption after an input-loss
- *   bounce keeps the converged setpoint and Voc (enter_tracking_reprobe);
- *   re-seeding on every bounce is what turned a 2 s stand-down into a
- *   ~12 s outage and fed the teardown burst. MPPT_RESEED_GAP_MS and
- *   has_sun decide which path an activation takes.
- *
- * Convergence: a probe that measures within ±MPPT_SP_MIN_DELTA_MA of
- * the baseline counts as a reversal (don't walk on noise / on a flat
- * power top / when the allowed_chg clamp, not the panel, bounds the
- * current). MPPT_SP_CONVERGE_REVERSALS reversals → HOLD for
- * MPPT_SP_HOLD_TIME_MS, then re-probe IF the panel is still the bottleneck
- * (panel_limited) — this is the upward re-probe path that recovers full
- * capability when the sun comes back after a cloudy spell.
- *
- * This region NEVER writes ctx->pwm and NEVER updates mppt_limit_ma in
- * this mode (it stays at MPPT_LIMIT_DEFAULT_MA = BUCK_MAX; the panel is
- * protected by the voltage loop, not by the current budget).
+ * There is no seed, no Voc fraction and nothing that knows the panel: the
+ * full rationale, the bench measurements behind it, and what it replaces
+ * (the FOCV setpoint tracker of v0.18-v0.39) are in the block comment
+ * immediately below the #if — read that before changing anything here.
  *
  * ── CHARGER_INPUT_VREG=0 (legacy): incremental conductance on PWM ──────
  *
@@ -91,358 +47,424 @@
 
 #if CHARGER_INPUT_VREG
 /* =========================================================================
- * SETPOINT-P&O IMPLEMENTATION
- * ========================================================================= */
-
-/*
- * sp_clamp — bound a candidate setpoint to the legal probe range.
+ * KNEE P&O ON THE PWM FENCE  (v0.40)
+ * =========================================================================
  *
- * Floor, highest of three:
- *   - MPPT_SP_MIN_MV keeps the regulation band's low edge above the
- *     PANEL_SAFETY_MV emergency floor (preserves the band ordering the
- *     backoff design assumes);
- *   - MPPT_SP_FLOOR_PCT of the learned Voc — no real MPP lives below it,
- *     so probing there only walks the panel over the knee (bench
- *     10.09.26: the tracker reached 6500 on a panel whose MPP is 11850);
- *   - the learned cliff (sp_session_floor_mv), raised by every collapse /
- *     dip correction and by an input-loss teardown.
+ * WHAT CHANGED AND WHY (read this before touching anything below).
  *
- * Ceiling: learned Voc minus MPPT_SP_VOC_GUARD_MV, so the band top
- * stays below open circuit — otherwise the inner loop could "park"
- * unloaded, drawing nothing. Applied only once a credible Voc estimate
- * exists (see the comment at the ceiling check below).
+ * v0.18-v0.39 perturbed ctx->mppt.vreg_setpoint_mv — a millivolt target —
+ * and let cc_regulate realise it in PWM counts. The 14.09.26 bench session
+ * is the case against that arrangement, and it is not a tuning case:
+ *
+ *   1. THE SEED WAS PAST THE CLIFF. MPPT_SP_FRACTION_PCT = 87 on a panel
+ *      with Voc 13208 mV seeds 11.49 V. The knee that day was at 11.9 V.
+ *      The inner loop drove faithfully toward the seed and went over the
+ *      edge at ms 463508 — the first of four collapses, caused by the
+ *      seeding constant itself. No fixed fraction of Voc can be right here:
+ *      Vmp/Voc runs 0.71-0.82 at STC and above 0.90 at the low irradiance
+ *      this system actually lives in, and it moves again with array
+ *      topology — which is the one thing the firmware is meant not to know.
+ *
+ *   2. THE SETPOINT CANNOT RESOLVE THE KNEE. The plant gain measured 26-55
+ *      mV/count, so the regulation band (2 counts, floored at
+ *      PANEL_VREG_DEADBAND_MIN_MV) was several counts wide — while the knee
+ *      is ONE count wide: pwm 79 delivered 1297 mA, pwm 78 delivered 1284,
+ *      pwm 77 collapsed the panel. Asking a millivolt setpoint to park one
+ *      count off a knee is asking for a resolution it does not have.
+ *
+ *   3. THE FENCE WAS A SCAR, AND IT ATE THE HARVEST. cliff_pwm_min was only
+ *      ever written by a collapse, CHG_CLIFF_PWM_MARGIN (6) counts above the
+ *      count that fell over, and released one count per 180 s. Four
+ *      collapses walked it 0 -> 79 -> 83 -> 91 -> 95 in ten minutes. The
+ *      session's last 280 s ran at 1.7 W on a panel that had just delivered
+ *      4.6 W, with the tracker "converged" — on the fence, not on the panel.
+ *
+ * So the fence became the actuator. This region now perturbs cliff_pwm_min
+ * one PWM count at a time and measures averaged delivered charge current;
+ * cc_regulate's voltage loop drives the operating point down into it and
+ * pwm_draw_more meters the descent. The tracker owns WHERE the ceiling is;
+ * the voltage loop owns getting there and backing off a sag; the new
+ * charger_panel_droop_guard owns the 10 ms emergency.
+ *
+ * Nothing in the search knows anything about the panel. Fitness is
+ * delivered current, the actuator is a PWM count, and the stopping rule is
+ * "the next count did not pay". Four panels in parallel, six, eight, or the
+ * same array rewired in series, all put the knee at a different count and a
+ * different current, and the search is identical. That is the property the
+ * FOCV seed could never have.
+ *
+ * WHY WE PARK OFF THE KNEE ON PURPOSE (MPPT_KNEE_MARGIN).
+ * A buck held at a fixed PWM into a stiff cell is a constant-power load,
+ * and a CPL load line is tangent to the panel I-V curve exactly at the MPP.
+ * Every operating point at or left of the MPP is therefore open-loop
+ * unstable, and this firmware's feedback — 400 ms loop, 320 ms of ADC group
+ * delay — is four orders of magnitude too slow to stabilise it. The MPP is
+ * a boundary, not a seat: two of the four collapses on 14.09 happened with
+ * the PWM frozen for seconds. One count off costs ~3 % and is the whole of
+ * the stability margin, so that is where we sit.
+ *
+ * Fitness is chg_current, NOT panel power: V_bat is constant over a dwell,
+ * so max delivered current is max delivered power, converter losses
+ * included — which is what we actually want to maximise. It is also the
+ * cleanest channel on the board (the panel-current sense disagrees with the
+ * output by 7 % of efficiency across a 3-count step, so P_panel ratios are
+ * not trustworthy at this resolution).
+ *
+ * ── CHARGER_INPUT_VREG=0 (legacy): incremental conductance on PWM ──────
+ * Unchanged, below the #else. Stiff-source bring-up only.
  */
-static uint16_t sp_clamp(const system_ctx_t *ctx, int32_t sp)
-{
-    const mppt_ctx_t *m = &ctx->mppt;
-    int32_t band = (int32_t)charger_vreg_deadband_mv(ctx);
-    int32_t lo   = (int32_t)MPPT_SP_MIN_MV;
-    if (m->panel_voc_mv >= PANEL_MIN_MV) {
-        int32_t voc_lo = ((int32_t)m->panel_voc_mv * MPPT_SP_FLOOR_PCT) / 100
-                       - band;
-        if (voc_lo > lo) lo = voc_lo;
-    }
-    if ((int32_t)m->sp_session_floor_mv > lo)
-        lo = (int32_t)m->sp_session_floor_mv;   /* don't re-test the cliff */
-    if (sp < lo) return (uint16_t)lo;
 
-    /* No ceiling until a credible Voc estimate exists (fresh activation
-     * resets it; the estimate builds as a running max — see
-     * mppt_update). An over-generous ceiling is search-safe: points
-     * near OC just measure poorly and are never accepted. A too-LOW
-     * ceiling is not safe — it can fence the search out of the only
-     * parkable region (simulation: load-biased capture + guard left
-     * every reachable band hopping the knee). */
-    if (m->panel_voc_mv >= PANEL_MIN_MV) {
-        int32_t hi = (int32_t)m->panel_voc_mv -
-                     (band + (int32_t)MPPT_SP_VOC_GUARD_MARGIN_MV);
-        if (hi < lo) hi = lo;
-        if (sp > hi) return (uint16_t)hi;
-    }
-    return (uint16_t)sp;
-}
+/* =========================================================================
+ * FENCE HELPERS
+ *
+ * PWM sign, every time: LOWER count = HIGHER duty = MORE current.
+ * cliff_pwm_min is a FLOOR on the count, i.e. a CEILING on current.
+ * "Probing down" means lowering the count to ask for more.
+ * ========================================================================= */
 
 static inline int32_t abs_diff_i32(int32_t a, int32_t b)
 {
     return (a > b) ? (a - b) : (b - a);
 }
 
-/* Begin a new dwell at the CURRENT setpoint: settle, then measure. */
+/*
+ * fence_floor — the lowest count the search may command.
+ *
+ * A proven knee fences MPPT_KNEE_MARGIN above itself; with nothing proven
+ * the only bound is the hardware limit. PWM_MAX_DUTY (1) is the smallest
+ * legal count — reaching it means the panel is stiffer than the buck, which
+ * is the bench-PSU case, and the allowed_chg clamp takes over from there.
+ */
+static uint16_t fence_floor(const mppt_ctx_t *m)
+{
+    if (m->knee_pwm == 0)
+        return PWM_MAX_DUTY;
+    uint32_t f = (uint32_t)m->knee_pwm + MPPT_KNEE_MARGIN;
+    if (f > PWM_MIN_DUTY) f = PWM_MIN_DUTY;
+    return (uint16_t)f;
+}
+
+/*
+ * knee_learn — record a count that the panel could not hold, and fence
+ * above it.
+ *
+ * Two sources, two margins:
+ *   - a MEASURED knee (a probe that delivered less) gets MPPT_KNEE_MARGIN,
+ *     because the count is exact and one count is the whole distance from
+ *     the optimum to the cliff;
+ *   - a COLLAPSED knee (droop guard, input-guard rescue, or teardown) gets
+ *     CHG_CLIFF_PWM_MARGIN, because the event moved the PWM before anyone
+ *     could read it and the snapshot is one conversion old at best.
+ * Both land on 79 for the 14.09 array (measured 78 + 1; collapsed 77 + 2),
+ * which is the count that delivered the session's best 1297 mA.
+ *
+ * Ratchets only: a knee already known to be higher (more conservative) is
+ * not lowered here. HOLD's periodic down-probe is the way back, and it is
+ * the only way back — the blind relax timers it replaces (v0.39's 2 s
+ * draw-blocked release and 180 s ratchet relax) both failed in the same
+ * session, one by marching straight back into the cliff and one by being
+ * far too slow to follow the sun.
+ *
+ * Bounded by charger.delivering_pwm exactly as v0.39's learn_cliff_pwm was:
+ * a count this session has been SEEN delivering at is proof the panel
+ * sustains it, and a fence at or above it is provably wrong.
+ */
+static void knee_learn(system_ctx_t *ctx, uint32_t bad_pwm, uint32_t margin,
+                       uint16_t vpanel_at)
+{
+    mppt_ctx_t *m = &ctx->mppt;
+
+    if (bad_pwm == 0 || bad_pwm >= PWM_MIN_DUTY)
+        return;                         /* no trace, or it fell over while off */
+
+    /* A COARSE probe that fell over says the knee is somewhere inside the
+     * jump. Fencing at bad_pwm + margin can land BELOW the count that last
+     * paid — on the 14.09 array a coarse probe 82 -> 79 -> 76 droops at 76
+     * and fences at 78, one count under the 79 that had just delivered the
+     * session's best current — and the next probe then walks back into the
+     * same fall. Give the known-good count back first; the ratchet below
+     * still applies, so the fence ends at whichever is more conservative. */
+    if (m->probing && m->probe_step > 1U &&
+        m->probe_from_pwm > m->cliff_pwm_min) {
+        m->cliff_pwm_min = m->probe_from_pwm;
+        m->probe_step    = 0;
+        m->probing       = false;
+    }
+
+    if (bad_pwm > (uint32_t)m->knee_pwm) {
+        m->knee_pwm        = (uint16_t)bad_pwm;
+        m->knee_learned_ms = time_now();
+        m->knee_vpanel_mv  = vpanel_at;     /* the light it was learned in */
+    }
+
+    uint32_t fence = bad_pwm + margin;
+    if (fence > PWM_MIN_DUTY)
+        fence = PWM_MIN_DUTY;
+
+    /* Counter-evidence (v0.39, kept): never fence at or above a count this
+     * session actually delivered at, and only while that evidence sits ABOVE
+     * the count that fell over — inside one margin the two say the same
+     * thing and the margin is the one to trust. */
+    uint16_t delivered = ctx->charger.delivering_pwm;
+    if (delivered != 0 && (uint32_t)delivered > bad_pwm &&
+        fence > (uint32_t)delivered)
+        fence = (uint32_t)delivered;
+
+    if (fence > (uint32_t)m->cliff_pwm_min)
+        m->cliff_pwm_min = (uint16_t)fence;
+}
+
+/*
+ * knee_learn_event (v0.41) — knee_learn for a sighting that came from an
+ * EVENT (a droop, an input-guard rescue, a teardown) rather than from a
+ * measured dwell: the count must have been delivering, or the event says
+ * nothing about the knee. The guard's backoff has already happened either
+ * way; only the tracker's memory is gated. Returns whether the claim was
+ * accepted, for the log.
+ *
+ * v0.42 dropped the Voc-fraction gate v0.41 added here: it rejected a real
+ * collapse at 96.6 % of Voc on the 14.09.26 afternoon session, and the
+ * open-circuit "flickers" it existed for were the buck's own switching
+ * transient, which the droop guard now recognises by its current signature
+ * (CHG_DROOP_SPIKE_MA) and never reports as an event at all.
+ */
+static bool knee_learn_event(system_ctx_t *ctx, uint32_t bad_pwm,
+                             int16_t ichg_at, uint16_t vpanel_at)
+{
+    if (ichg_at < (int16_t)CHG_DELIVERING_MIN_MA)
+        return false;                   /* nothing was being drawn there */
+
+    knee_learn(ctx, bad_pwm, CHG_CLIFF_PWM_MARGIN, vpanel_at);
+    return true;
+}
+
+/* Begin a new dwell at the CURRENT fence: settle, then measure. */
 static void start_dwell(system_ctx_t *ctx)
 {
-    mppt_ctx_t *m   = &ctx->mppt;
+    mppt_ctx_t *m       = &ctx->mppt;
     m->dwell_start_ms   = time_now();
     m->measure_start_ms = m->dwell_start_ms;
     m->dwell_phase      = 0;        /* settling */
-    m->ichg_acc       = 0;
-    m->ichg_acc_cnt   = 0;
-    m->dwell_dipped   = false;
+    m->arrived_ms       = 0;        /* v0.41: settle is timed from arrival */
+    m->ichg_acc         = 0;
+    m->ichg_acc_cnt     = 0;
+    m->dwell_dipped     = false;
 }
 
-/*
- * sp_push_up — shared "this setpoint is too low" correction, used by
- * both the collapse branch (V_panel below the emergency floor) and the
- * dip classifier (V_panel below the band: band-hop whipsaw). One step
- * toward Voc, search pointed up, fresh baseline (samples from a
- * collapsing/hopping plant are garbage).
- *
- * Deliberately does NOT count toward convergence: pushes are an escape
- * ramp out of unparkable territory, not oscillation around an optimum —
- * counting them could converge HOLD inside a whipsaw. Instead the
- * learned floor rises to the post-push level, so down-probes can never
- * re-test the cliff while this panel is trusted; they clamp against the
- * floor and the resulting boundary flips (sp_probe_step) drive
- * convergence.
- */
-static void sp_push_up(system_ctx_t *ctx)
+/* v0.41: remember the best-paying fence of this search — where a search
+ * that ends on its runtime cap parks, instead of on whatever it was trying. */
+static void note_best(mppt_ctx_t *m, int16_t avg)
 {
-    mppt_ctx_t *m = &ctx->mppt;
-    /* Push by the CURRENT step, not the coarse initial one: after the
-     * adaptive step has refined, a fine down-probe that dips must step
-     * back exactly to the known-good level — a coarse push would raise
-     * the session floor PAST the accepted optimum and fence it out. */
-    uint16_t up = sp_clamp(ctx, (int32_t)m->vreg_setpoint_mv +
-                              (int32_t)m->sp_step_mv);
-    m->vreg_setpoint_mv     = up;
-    m->prev_sp_mv           = up;
-    m->sp_session_floor_mv  = up;
-    m->sp_direction         = +1;
-    m->prev_avg_valid       = false;
-}
-
-/*
- * sp_note_reversal — bookkeeping shared by every "the other direction
- * looks better / nothing here" event: count toward convergence and
- * halve the probe step (adaptive step: coarse to find the region, fine
- * to bracket the knee below one PWM count of granularity).
- */
-static void sp_note_reversal(mppt_ctx_t *m)
-{
-    if (m->reversals < 255) m->reversals++;
-    m->sp_step_mv /= 2;
-    if (m->sp_step_mv < MPPT_SP_STEP_MIN_MV)
-        m->sp_step_mv = MPPT_SP_STEP_MIN_MV;
-}
-
-/*
- * sp_probe_step — move the setpoint one step in the probe direction,
- * remembering the current (accepted) setpoint as the revert target.
- *
- * If the step clamps against the floor/ceiling there is nothing to
- * probe that way: flip direction (counts toward convergence) and try
- * the other side. If BOTH sides clamp (degenerate range), the setpoint
- * stays put and the reversal counter walks us into HOLD.
- */
-static void sp_probe_step(system_ctx_t *ctx)
-{
-    mppt_ctx_t *m = &ctx->mppt;
-    uint16_t cur  = m->vreg_setpoint_mv;
-    uint16_t next = sp_clamp(ctx, (int32_t)cur +
-                      (int32_t)m->sp_direction * (int32_t)m->sp_step_mv);
-    if (next == cur) {
-        m->sp_direction = (int8_t)-m->sp_direction;
-        sp_note_reversal(m);
-        next = sp_clamp(ctx, (int32_t)cur +
-                  (int32_t)m->sp_direction * (int32_t)m->sp_step_mv);
+    if (m->best_pwm == 0 || avg > m->best_ichg) {
+        m->best_pwm  = m->cliff_pwm_min;
+        m->best_ichg = avg;
     }
-    m->prev_sp_mv       = cur;
-    m->vreg_setpoint_mv = next;
 }
 
 /*
- * sp_learn_cliff — the panel fell over at the operating point the tracker
- * had it at: either the guard rescued it (v0.32, input_dip_events ticked)
- * or the region was torn down (rearm_block_ms stamped). Nothing else
- * in this file can see that event — the collapse reaches V_bat in
- * 10-20 ms and charger_input_guard stands the region down ~40 ms in, so
- * the 640 ms average never crosses PANEL_SAFETY_MV and neither the
- * collapse branch nor the dip classifier fires. Until v0.30 the tracker
- * resumed with no memory of it and probed straight back down (bench
- * 10.09.26: 13 of 15 teardowns within 6 s of a downward probe).
+ * knee_probe_step — lower the fence by `step` counts and remember where we
+ * came from, so a probe that does not pay can be reverted exactly.
  *
- * Learn the cliff from the plant, not the setpoint: with a ±1200 mV band
- * the setpoint says little about where the plant actually sat, but the
- * last clean averaged V_panel does. Put the band top MPPT_SP_CLIFF_MARGIN_MV
- * above it and make that the floor — same shape as sp_push_up, sourced
- * from a measurement instead of a step. Capped at the Voc ceiling: a
- * collapse from up there (sun dimmed under a parked point) is not a
- * setpoint problem, and a floor above the ceiling would park the loop
- * at open circuit drawing nothing.
- *
- * The floor persists through the bounce and through HOLD; only a fresh
- * entry (new Voc: sun lost, or MPPT_RESEED_GAP_MS) releases it. Known
- * trade-off: after a light cloud lowers the knee, the tracker is fenced
- * a few hundred mV above the new MPP until the next fresh seed. That
- * costs a few percent under a cloud; the alternative cost 12 s of full
- * sun per teardown.
+ * Returns false when there is nothing left to probe (already at the floor):
+ * the caller parks in HOLD, where the periodic re-probe will try again once
+ * MPPT_KNEE_RETREAT_MS has passed and the knee is allowed to move.
  */
-/*
- * learn_cliff_pwm — the same cliff, recorded in the domain that can act on it.
- *
- * sp_learn_cliff below teaches the setpoint, which only produces a backoff
- * once V_panel falls more than PANEL_VREG_DEADBAND_MV under it. On a panel
- * whose MPP has walked up near Voc — every low-irradiance panel, so every
- * late afternoon — the setpoint is fenced MPPT_SP_VOC_GUARD_MV below Voc and
- * V_panel sits INSIDE the band, so no reachable setpoint commands anything.
- * Bench 10.09.26: three consecutive teardowns at pwm 106 with the setpoint
- * already pinned at its ceiling, nothing left to learn, nothing to change.
- *
- * The PWM that fell over is not ambiguous the way the setpoint is: it is the
- * exact draw the panel could not hold. Fence one margin above it. The
- * ratchet is what tracks a fading Isc — the voltage loop cannot, because at
- * a near-Voc operating point the collapse is a current event with no
- * precursor in V_panel (the trace before every teardown is flat to within
- * 50 mV, then one sample of descent).
- *
- * Called before sp_learn_cliff's early returns: those guard the setpoint
- * estimate (needs a credible V_panel, and gives up once the floor is at its
- * ceiling) and neither condition says anything about the PWM.
- */
-static void learn_cliff_pwm(system_ctx_t *ctx)
+static bool knee_probe_step(system_ctx_t *ctx, uint8_t step)
 {
-    mppt_ctx_t *m = &ctx->mppt;
+    mppt_ctx_t *m  = &ctx->mppt;
+    uint16_t  cur  = m->cliff_pwm_min;
+    uint16_t  lo   = fence_floor(m);
 
-    /* input_trace_pwm_from is the count in force when the guard first saw
-     * the input under margin — before its own backoff moved it, and before
-     * a stand-down parked it at PWM_MIN_DUTY. */
-    uint32_t fell_at = (uint32_t)ctx->charger.input_trace_pwm_from;
-    if (fell_at == 0 || fell_at >= PWM_MIN_DUTY)
-        return;                    /* no trace, or it fell over while off */
+    if (cur == 0 || cur <= lo)
+        return false;
 
-    uint32_t floor_pwm = fell_at + CHG_CLIFF_PWM_MARGIN;
-    if (floor_pwm > PWM_MIN_DUTY)
-        floor_pwm = PWM_MIN_DUTY;  /* a ceiling at "off" is still a ceiling */
+    int32_t next = (int32_t)cur - (int32_t)step;
+    if (next < (int32_t)lo)
+        next = (int32_t)lo;
 
-    if (floor_pwm <= (uint32_t)m->cliff_pwm_min)
-        return;                    /* already fenced at or above this draw */
+    m->probe_from_pwm = cur;
+    m->cliff_pwm_min  = (uint16_t)next;
+    m->probe_step     = (uint8_t)(cur - (uint16_t)next);
+    m->probing        = true;
 
-    m->cliff_pwm_min      = (uint16_t)floor_pwm;
-    m->cliff_pwm_relax_ms = time_now();
+    /* The loop is about to be granted current it was being refused; whatever
+     * starvation dwell it accumulated against the old fence is spent. */
+    ctx->charger.draw_blocked_ms = 0;
+    return true;
 }
 
-static void sp_learn_cliff(system_ctx_t *ctx)
+/*
+ * sp_follow — re-synchronise the voltage setpoint to where the plant is.
+ *
+ * The setpoint keeps exactly one job now: sag protection. Parked at the
+ * settled operating voltage, cc_regulate's err < -band branch backs the draw
+ * off when irradiance falls, as it always did — the fence is a floor on the
+ * count, not a target, so backing off above it is free. Called on entry to
+ * HOLD, once the fence has stopped moving.
+ *
+ * During TRACKING the setpoint is instead parked LOW (sp_drive_down), so the
+ * loop always wants more current and the fence alone meters the descent.
+ * Protection during the search is charger_panel_droop_guard, which is both
+ * faster and better targeted than the voltage loop ever was.
+ */
+static void sp_follow(system_ctx_t *ctx)
 {
     mppt_ctx_t *m = &ctx->mppt;
-
-    learn_cliff_pwm(ctx);
-
-    if (m->last_good_vpanel_mv < PANEL_MIN_MV)
-        return;                                  /* nothing credible learned */
-
-    int32_t band     = (int32_t)charger_vreg_deadband_mv(ctx);
-    int32_t floor_sp = (int32_t)m->last_good_vpanel_mv
-                     - band
-                     + (int32_t)MPPT_SP_CLIFF_MARGIN_MV;
-    if (m->panel_voc_mv >= PANEL_MIN_MV) {
-        int32_t hi = (int32_t)m->panel_voc_mv -
-                     (band + (int32_t)MPPT_SP_VOC_GUARD_MARGIN_MV);
-        if (floor_sp > hi) floor_sp = hi;
+    if (ctx->meas.panel_voltage >= PANEL_MIN_MV) {
+        m->vreg_setpoint_mv = ctx->meas.panel_voltage;
+        m->prev_sp_mv       = m->vreg_setpoint_mv;
     }
-    if (floor_sp <= (int32_t)m->sp_session_floor_mv)
-        return;                                  /* already know this cliff */
+}
 
-    m->sp_session_floor_mv = (uint16_t)floor_sp;
-    /* Resume above the cliff, probing away from it. */
-    uint16_t up = sp_clamp(ctx, (int32_t)m->vreg_setpoint_mv);
-    m->vreg_setpoint_mv = up;
-    m->prev_sp_mv       = up;
-    m->sp_direction     = +1;
-    /* Called mid-session for a RECOVERED collapse (v0.32): the setpoint
-     * just moved under a running dwell, so its measurement is garbage —
-     * restart it with a fresh baseline. HOLD has no dwell to restart; the
-     * lifted setpoint takes effect in cc_regulate on the same tick. */
-    if (m->state == MPPT_TRACKING) {
-        m->prev_avg_valid = false;
-        start_dwell(ctx);
-    }
+/* Park the setpoint below anything the panel will show, so cc_regulate's
+ * "above the band with headroom" branch fires every interval and the fence
+ * is the only thing metering the descent.
+ *
+ * Just above PANEL_SAFETY_MV, not at MPPT_SP_MIN_MV. MPPT_SP_MIN_MV (6500)
+ * was sized to keep a SETPOINT's band clear of the emergency floor, which
+ * mattered when the setpoint was the target. It is the wrong number for a
+ * "say more, forever" value: on the 6.5 V array the operating point IS
+ * ~6500 mV, so a setpoint there sits inside its own 1200 mV band and the
+ * loop would never command a single step — the descent would stall and the
+ * fence would never be probed.
+ *
+ * Setting it here is safe precisely because the setpoint no longer bounds
+ * anything: the FENCE bounds the descent, one measured count at a time, and
+ * panel_safety_backoff still owns everything under PANEL_SAFETY_MV (it runs
+ * before cc_regulate and returns, so the two can never fight). A plant that
+ * actually sagged to this level would have tripped the droop guard many
+ * volts earlier. */
+static void sp_drive_down(system_ctx_t *ctx)
+{
+    uint16_t sp = (uint16_t)(PANEL_SAFETY_MV + PANEL_VREG_DEADBAND_MIN_MV);
+    ctx->mppt.vreg_setpoint_mv = sp;
+    ctx->mppt.prev_sp_mv       = sp;
 }
 
 /* =========================================================================
  * STATE ENTRY ACTIONS
  * ========================================================================= */
 
-/* Shared TRACKING entry: fresh session counters + first (baseline) dwell
- * at the current setpoint. The learned floor (sp_session_floor_mv) is
- * deliberately NOT reset here — it belongs to the learned panel, not to
- * the session, and enter_tracking_fresh is the one place that clears it.
- * (Until v0.30 every entry reset it, so a teardown erased the cliff the
- * moment it was learned.) */
+/* Shared TRACKING entry: fresh session counters + a baseline dwell at the
+ * fence we are starting from. knee_pwm and cliff_pwm_min are deliberately
+ * NOT reset here — they belong to the learned panel, not to the session, and
+ * enter_tracking_fresh is the one place that clears them. */
 static void tracking_common(system_ctx_t *ctx)
 {
-    mppt_ctx_t *m = &ctx->mppt;
+    mppt_ctx_t *m          = &ctx->mppt;
     m->state               = MPPT_TRACKING;
-    m->reversals           = 0;
-    m->sp_direction        = +1;    /* first probe toward Voc — away from the knee */
-    m->sp_step_mv          = MPPT_SP_STEP_MV;
-    m->prev_avg_valid      = false; /* dwell 1 establishes the baseline */
+    m->prev_avg_valid      = false;   /* dwell 1 establishes the baseline */
+    m->probing             = false;
+    /* First probe size. Fine by default — every entry except a cold search
+     * resumes from a fence that was already measured, so the answer is a
+     * count or two away and a coarse first probe would drive straight past
+     * the knee it is meant to re-confirm. enter_tracking_fresh overrides. */
+    m->probe_step          = 1U;
+    m->probe_from_pwm      = m->cliff_pwm_min;
     m->seen_dip_events     = ctx->charger.input_dip_events;
+    m->seen_droop_events   = ctx->charger.droop_events;
     m->tracking_start_ms   = time_now();
+    m->best_pwm            = 0;       /* v0.41: per-search best point */
+    m->best_ichg           = 0;
+    sp_drive_down(ctx);
     start_dwell(ctx);
 }
 
 /*
- * Enter TRACKING from DISABLED — charger just activated.
+ * Enter TRACKING from DISABLED on a FRESH activation — cold boot, a new
+ * panel, a new day, or a gap past MPPT_RESEED_GAP_MS.
  *
- * Voc capture is DEFERRED to the end of the first settled dwell (see
- * voc_pending in tracking_tick). Capturing here looks tempting — the
- * panel idled unloaded until this tick — but the panel ADC is a 640 ms
- * moving average while has_sun debounces in only 150 ms: on a fresh
- * plug-in this tick's reading is HALF-SETTLED (a mix of pre-plug zeros
- * and the real voltage). Seeding from it poisons both the FOCV estimate
- * and the setpoint ceiling (simulation: captured 8.5 V on a 13.3 V
- * panel and trapped the tracker at a whipsaw point). Until the capture
- * lands, the inner loop regulates to the preserved/fallback setpoint.
+ * Everything learned about the previous panel goes: its Voc estimate, its
+ * knee, its fence, the counter-evidence bounding that fence, and the plant
+ * gain that sizes the regulation band. The fence starts AT the current
+ * count — the activation pre-position, which CHG_BUCK_SETTLE left at
+ * roughly the zero-draw point — so the search begins from a draw of
+ * ~nothing and walks down. That direction is the safe one by construction:
+ * approaching the knee from the high-voltage side is the stable half of the
+ * I-V curve, and every step is measured before the next is taken.
+ *
+ * There is no seed. That is the point of v0.40.
  */
 static void enter_tracking_fresh(system_ctx_t *ctx)
 {
-    ctx->mppt.voc_pending         = true;
-    ctx->mppt.panel_voc_mv        = 0;   /* maybe a different panel — relearn
-                                          * Voc from scratch via the running
-                                          * max                            */
-    ctx->mppt.sp_session_floor_mv = MPPT_SP_MIN_MV;  /* ...and its cliff  */
-    ctx->mppt.cliff_pwm_min       = 0;               /* ...in both domains */
-    ctx->mppt.last_good_vpanel_mv = 0;
-    ctx->charger.plant_mv_per_count = 0;  /* ...and its gain: the regulation
-                                           * band goes back to the static
-                                           * PANEL_VREG_DEADBAND_MV until the
-                                           * voltage loop has measured this
-                                           * panel (hw_config.h) */
+    mppt_ctx_t *m = &ctx->mppt;
+
+    m->panel_voc_mv        = 0;   /* relearn Voc from the running max      */
+    m->knee_pwm            = 0;   /* ...and its knee                       */
+    m->knee_learned_ms     = 0;
+    m->sp_session_floor_mv = MPPT_SP_MIN_MV;
+    m->last_good_vpanel_mv = 0;
+
+    ctx->charger.delivering_pwm     = 0;  /* a different panel's delivering
+                                           * count says nothing about this one */
+    ctx->charger.draw_blocked_ms    = 0;
+    ctx->charger.plant_mv_per_count = 0;  /* ...and its gain: the band goes
+                                           * back to the static fallback until
+                                           * the voltage loop measures this
+                                           * panel (hw_config.h)               */
     ctx->charger.vloop_measure_armed = false;
+
+    /* Start the fence where the plant already is. A fence of 0 means "no
+     * ceiling", which would let the voltage loop run all the way to the
+     * knee in one unmeasured descent — exactly the behaviour being removed. */
+    m->cliff_pwm_min = ctx->pwm;
+
     tracking_common(ctx);
+
+    /* A cold search starts tens of counts from any knee: open coarse. The
+     * step refines itself the moment a probe pays less than
+     * MPPT_KNEE_COARSE_MA. */
+    m->probe_step = (uint8_t)PANEL_VREG_STEP_MAX;
 }
 
 /*
- * Enter TRACKING from HOLD (periodic re-probe) or from DISABLED after an
- * input-loss bounce (v0.28). Keep the setpoint, the learned floor and
- * the Voc captured at activation (the panel is loaded now, so a
- * re-capture would read low); the baseline dwell re-measures the kept
- * point first so the comparison is against CURRENT conditions, not
- * against a minute-old number.
+ * Enter TRACKING from HOLD (periodic down-probe) or from DISABLED after an
+ * input-loss bounce. Keep the fence, the knee and the Voc estimate: the
+ * panel has not changed, and re-deriving a knee that is already measured is
+ * what made a 2 s stand-down cost 12 s of harvest (bench 10.09.26).
+ *
+ * Always fine-stepped: we resume from a converged fence, so the answer is a
+ * count or two away. The coarse step re-arms by itself the moment a probe
+ * pays more than MPPT_KNEE_COARSE_MA, which is what a genuine irradiance
+ * increase looks like.
  */
 static void enter_tracking_reprobe(system_ctx_t *ctx)
 {
     ctx->mppt.voc_pending = false;
     tracking_common(ctx);
-    /* Start FINE: we re-probe from a converged point, so the optimum is
-     * almost certainly within a step or two — a coarse first probe
-     * over-jumps the best parkable PWM count and its dip floors the
-     * session above it. If conditions really moved, the accept-doubling
-     * in the better-branch recovers coarse range within a few dwells. */
-    ctx->mppt.sp_step_mv = MPPT_SP_STEP_MIN_MV;
 }
 
 /*
- * Enter HOLD — freeze the setpoint where the climb converged. The inner
- * loop keeps regulating to it; nothing else to do. mppt_limit_ma is
- * deliberately NOT touched in this mode (see file header).
+ * Enter HOLD — the fence is where the panel says it should be. Re-point the
+ * setpoint at the plant on the way in, so the voltage loop resumes its sag
+ * duty for the length of the hold.
  */
 static void enter_hold(system_ctx_t *ctx)
 {
     ctx->mppt.state         = MPPT_HOLD;
     ctx->mppt.hold_start_ms = time_now();
+    ctx->mppt.knee_probe_ms = time_now();
+    ctx->mppt.probing       = false;
+    sp_follow(ctx);
 }
 
 /*
- * Enter DISABLED — charger region went inactive. The setpoint and the
- * captured Voc are PRESERVED (same rationale as mppt_limit_ma in the
- * legacy path): a brief EM bounce must not forget the learned MPP, and
- * cc_regulate keeps consuming the setpoint the moment charging resumes.
- *
- * Until v0.28 that preservation was pointless, because the resume path
- * went through enter_tracking_fresh() unconditionally and wiped both.
- * Now the gap is timed instead: the learned point stays trusted until
- * has_sun drops or MPPT_RESEED_GAP_MS elapses (see mppt_update), and
- * only then does the next activation re-seed from FOCV.
+ * Enter DISABLED — charger region went inactive. The fence, the knee and
+ * the Voc estimate are PRESERVED: a brief EM bounce must not forget the
+ * measured operating point, and energy_mode's warm resume enters AT
+ * cliff_pwm_min, which is why a bounce now costs the re-arm block and
+ * almost nothing else.
  */
 static void enter_disabled(system_ctx_t *ctx)
 {
     ctx->mppt.state             = MPPT_DISABLED;
     ctx->mppt.disabled_since_ms = time_now();
     ctx->mppt.seed_invalidated  = false;
+    ctx->mppt.probing           = false;
 }
 
 /* =========================================================================
- * TRACKING TICK — dwell sequencing + P&O decision
+ * TRACKING TICK — dwell sequencing + the P&O decision
  * ========================================================================= */
 
 static void tracking_tick(system_ctx_t *ctx)
@@ -451,165 +473,178 @@ static void tracking_tick(system_ctx_t *ctx)
     uint32_t now    = time_now();
     uint32_t dwelt  = now - m->dwell_start_ms;
 
-    /* ── Collapse branch ──
-     * The probe drove the panel over its I-V knee (V_panel below the
-     * emergency floor — the inner backoff is already rescuing the
-     * rail). The setpoint is too low: push it back up toward Voc
-     * (raising the session floor) and restart with a fresh baseline —
-     * any samples spanning a collapse are garbage.
-     *
-     * Blanked for MPPT_SP_COLLAPSE_BLANK_MS after each dwell start so
-     * ONE collapse event produces ONE correction: the collapsed reading
-     * persists through the MA filter + paced backoff for ~1 s after the
-     * cause is removed, and re-acting on that stale tail would ratchet
-     * the setpoint up several bogus steps (the same dead-time trap that
-     * broke the original every-tick backoff). */
+    /* ── Collapsed reading: never measure it ──
+     * panel_safety_backoff and the foreground guards own the recovery; the
+     * knee itself is learned from the event counters in mppt_update, which
+     * see it with a PWM attached. All this branch has to do is refuse to
+     * treat the wreckage as fitness. */
     if (ctx->meas.panel_voltage < PANEL_SAFETY_MV) {
-        if (dwelt >= MPPT_SP_COLLAPSE_BLANK_MS) {
-            sp_push_up(ctx);
-            start_dwell(ctx);
-        }
-        return;   /* collapsed reading: never measure, let the rail recover */
+        m->prev_avg_valid = false;
+        start_dwell(ctx);
+        return;
+    }
+
+    /* ── Battery-limited: nothing to optimise ── (v0.41)
+     * If the intake clamp, not the panel, bounds the current (precharge
+     * trickle, CV taper, a near-full cell), a fence probe cannot observe
+     * anything and a comparison made here would be a comparison of the
+     * battery limit with itself. Park; HOLD's re-probe is gated on
+     * panel_limited too and comes back when the panel is the constraint. */
+    if (!ctx->panel_limited) {
+        enter_hold(ctx);
+        return;
     }
 
     /* ── Phase 0: settle ──
      *
-     * "Settled" means the INNER loop has arrived, not that a timer expired.
-     * cc_regulate realises a setpoint change at a few PWM counts per
-     * PANEL_VREG_INTERVAL_MS, so a coarse probe takes seconds to reach the
-     * plant — bench 14.09.26, the activation walk pwm 106→84 took 9 s, and
-     * the tracker ran three whole dwells against a plant still in transit
-     * and then compared their averages as though they were fitness.
-     *
-     * So wait for both: the timer AND V_panel inside the band. Capped at
-     * MPPT_SP_SETTLE_MAX_MS for the setpoint that is never reached at all
-     * (a stiff source, or one fenced out of reach by cliff_pwm_min) — that
-     * case measures a not-quite-arrived plant, which is exactly what every
-     * dwell did before. */
+     * "Settled" means the regulator has ARRIVED at the fence — the count
+     * sitting EXACTLY on it, since v0.41 made the fence two-sided — and has
+     * stayed there for MPPT_KNEE_SETTLE_MS, the 64-sample window plus
+     * margin. The clock starts at arrival, not at the request: a rejected
+     * probe's rollback takes the regulator an interval or two to realise,
+     * and a window that straddles two counts measures neither (v0.40 timed
+     * the settle from the request and could start measuring the instant
+     * the count landed, with the old operating point still in the
+     * average). MPPT_SP_SETTLE_MAX_MS caps the wait for a fence that is
+     * never reached at all (a stiff source), which then measures a
+     * not-quite-arrived plant exactly as every dwell used to. */
     if (m->dwell_phase == 0) {
-        bool arrived =
-            (uint32_t)abs_diff_i32((int32_t)ctx->meas.panel_voltage,
-                                   (int32_t)m->vreg_setpoint_mv)
-            <= (uint32_t)charger_vreg_deadband_mv(ctx);
+        bool on_fence = (m->cliff_pwm_min != 0) &&
+                        (ctx->pwm == m->cliff_pwm_min);
+        if (!on_fence)
+            m->arrived_ms = 0;
+        else if (m->arrived_ms == 0)
+            m->arrived_ms = (now != 0) ? now : 1U;
 
-        if (dwelt >= MPPT_SP_SETTLE_MS &&
-            (arrived || dwelt >= MPPT_SP_SETTLE_MAX_MS)) {
-            /* Deferred FOCV seed (fresh activation only), now that the
-             * MA has fully settled past the plug-in transient:
-             *   sp = k·Voc − deadband
-             * (the inner loop parks just under the band TOP = sp +
-             * deadband, so the realised voltage ≈ k·Voc). Then restart
-             * the dwell: the baseline must be measured AT the seed.
-             * If no credible Voc accumulated (panel died during the
-             * settle) keep the previous seed. */
-            if (m->voc_pending) {
-                m->voc_pending = false;
-                /* panel_voc_mv is the running MAX of the filtered panel
-                 * voltage since activation (see mppt_update) — it caught
-                 * the unloaded pre-pull-down peak even though the
-                 * reading RIGHT NOW is under load. It keeps improving
-                 * after this seed (every backoff recovery samples
-                 * near-OC); the ceiling rises with it. */
-                if (m->panel_voc_mv >= PANEL_MIN_MV) {
-                    int32_t seed = ((int32_t)m->panel_voc_mv *
-                                    MPPT_SP_FRACTION_PCT) / 100
-                                 - (int32_t)charger_vreg_deadband_mv(ctx);
-                    m->vreg_setpoint_mv = sp_clamp(ctx, seed);
-                    m->prev_sp_mv       = m->vreg_setpoint_mv;
-                }
-                start_dwell(ctx);
-                return;
-            }
+        bool settled = (m->arrived_ms != 0) &&
+                       ((now - m->arrived_ms) >= MPPT_KNEE_SETTLE_MS);
+        if (settled || dwelt >= MPPT_SP_SETTLE_MAX_MS) {
             m->dwell_phase      = 1;
             m->measure_start_ms = now;
         }
         return;
     }
 
-    /* ── Phase 1: measure ── */
-    m->ichg_acc += (int32_t)ctx->meas.chg_current;
-    m->ichg_acc_cnt++;
-
-    /* Dip classifier: a parked plant never reads below the band's low
-     * edge. If V_panel does, the band contains no reachable operating
-     * point at this setpoint (one PWM count hops clear across it — the
-     * band-hop whipsaw on the panel's current-source side) and the
-     * measured average is oscillation-phase noise, not fitness. The
-     * 300 mV margin ignores parked readings grazing the edge. */
-    if ((int32_t)ctx->meas.panel_voltage <
-        (int32_t)m->vreg_setpoint_mv -
-        (int32_t)charger_vreg_deadband_mv(ctx) - 300)
-        m->dwell_dipped = true;
-
-    if ((now - m->measure_start_ms) < MPPT_SP_MEASURE_MS)
-        return;
-
-    /* ── Whipsaw dwell: the setpoint is too low to park — push up.
-     * Deterministic, average ignored: dwell-to-dwell comparisons inside
-     * a whipsaw region random-walk (simulation: converged at a hopping
-     * point delivering ~70 % of MPP and never climbed out). ── */
-    if (m->dwell_dipped) {
-        sp_push_up(ctx);
+    /* ── Phase 1: measure ──
+     * A count that moves under the measurement (a clamp, a guard, a fence
+     * change) contaminates it: the window then describes two operating
+     * points. Start the dwell over rather than judge it. Only for a dwell
+     * that had actually arrived — the capped never-arrived case measures
+     * what it can, as before. */
+    if (m->arrived_ms != 0 && ctx->pwm != m->cliff_pwm_min) {
         start_dwell(ctx);
         return;
     }
 
+    m->ichg_acc += (int32_t)ctx->meas.chg_current;
+    m->ichg_acc_cnt++;
+
+    if ((now - m->measure_start_ms) < MPPT_KNEE_MEASURE_MS)
+        return;
+
     int16_t avg = (int16_t)(m->ichg_acc / (int32_t)m->ichg_acc_cnt);
 
-    /* ── Baseline dwell: record fitness, take the first probe step ── */
-    if (!m->prev_avg_valid) {
+    /* ── Acquisition: no fitness signal exists yet ──
+     *
+     * CHG_BUCK_SETTLE hands over with the rail pre-positioned just above
+     * V_bat, which on the 14.09 array is 5-15 counts ABOVE the zero-draw
+     * count. Every count in that stretch delivers the same zero, so a P&O
+     * comparison there measures delta ~0, concludes "this count did not pay",
+     * and fences the charger off a panel it has never drawn from. (That is
+     * not hypothetical — it is what this function did when it was first
+     * written, and it is the same class of bug as v0.39's fence-above-
+     * zero-draw: a decision made where the signal does not exist.)
+     *
+     * So while the draw is under CHG_DELIVERING_MIN_MA, descend on a fixed
+     * step and judge nothing. Gated on knee_pwm == 0 so this is strictly a
+     * cold-start behaviour: once a knee is known, a low reading means the
+     * panel dipped, not that we have not started, and the ordinary path
+     * (which cannot probe past the floor) handles it. */
+    if (avg < (int16_t)CHG_DELIVERING_MIN_MA && m->knee_pwm == 0) {
         m->prev_avg_ichg  = avg;
         m->prev_avg_valid = true;
-        sp_probe_step(ctx);
-        if (m->reversals >= MPPT_SP_CONVERGE_REVERSALS) {
-            enter_hold(ctx);    /* degenerate range: both directions clamped */
+        if (!knee_probe_step(ctx, MPPT_KNEE_ACQUIRE_STEP)) {
+            enter_hold(ctx);
             return;
         }
         start_dwell(ctx);
         return;
     }
 
-    /* ── Comparison dwell: P&O decision with noise gate ── */
-    int32_t delta = (int32_t)avg - (int32_t)m->prev_avg_ichg;
-
-    if (delta > (int32_t)MPPT_SP_MIN_DELTA_MA) {
-        /* Better → accept this setpoint, keep climbing the same way,
-         * and re-grow the step (capped at the initial size): consecutive
-         * accepts mean there's real distance to cover. */
-        m->prev_avg_ichg = avg;
-        m->sp_step_mv *= 2;
-        if (m->sp_step_mv > MPPT_SP_STEP_MV)
-            m->sp_step_mv = MPPT_SP_STEP_MV;
-        sp_probe_step(ctx);
-    } else if (delta < -(int32_t)MPPT_SP_MIN_DELTA_MA) {
-        /* Worse → revert to the accepted setpoint and flip. Baseline is
-         * invalidated so the next dwell RE-MEASURES the reverted point
-         * under current conditions (irradiance may have moved between
-         * the two dwells — never compare against a stale number). */
-        m->vreg_setpoint_mv = m->prev_sp_mv;
-        m->sp_direction     = (int8_t)-m->sp_direction;
-        sp_note_reversal(m);
-        m->prev_avg_valid   = false;
-    } else {
-        /* Flat: noise floor, flat power top, or the allowed_chg clamp
-         * (not the panel) bounds the current. Don't walk — flip and
-         * count toward convergence. Baseline follows the fresh reading
-         * so slow drift doesn't accumulate into a fake delta. */
-        m->prev_avg_ichg = avg;
-        m->sp_direction  = (int8_t)-m->sp_direction;
-        sp_note_reversal(m);
-        sp_probe_step(ctx);
-    }
-
-    if (m->reversals >= MPPT_SP_CONVERGE_REVERSALS) {
-        enter_hold(ctx);
+    /* ── Baseline dwell: record fitness here, then take the first probe ──
+     * The first probe of a session is coarse: we start from the zero-draw
+     * pre-position on a fresh entry (tens of counts from any knee), and from
+     * a converged fence on a re-probe, where the first coarse probe either
+     * pays — meaning conditions really did improve — or reverts and
+     * brackets, costing one extra dwell. */
+    if (!m->prev_avg_valid) {
+        uint8_t step = (m->probe_step != 0) ? m->probe_step : 1U;
+        m->prev_avg_ichg  = avg;
+        m->prev_avg_valid = true;
+        note_best(m, avg);
+        if (!knee_probe_step(ctx, step)) {
+            enter_hold(ctx);       /* nothing left to probe: already fenced */
+            return;
+        }
+        start_dwell(ctx);
         return;
     }
-    start_dwell(ctx);
+
+    /* ── Comparison dwell: did the extra current we asked for arrive? ── */
+    int32_t delta = (int32_t)avg - (int32_t)m->prev_avg_ichg;
+
+    if (delta > (int32_t)MPPT_KNEE_MIN_DELTA_MA) {
+        /* It paid. Accept this fence and keep descending — coarse while
+         * there is clearly distance left, fine once the payoff is within a
+         * couple of counts of the gate. */
+        m->prev_avg_ichg = avg;
+        note_best(m, avg);
+        uint8_t step = (delta > (int32_t)MPPT_KNEE_COARSE_MA)
+                         ? (uint8_t)PANEL_VREG_STEP_MAX : 1U;
+        if (!knee_probe_step(ctx, step)) {
+            enter_hold(ctx);
+            return;
+        }
+        start_dwell(ctx);
+        return;
+    }
+
+    /* It did not pay. */
+    if (m->probe_step > 1U) {
+        /* A COARSE probe that failed says the knee is somewhere inside the
+         * jump, not that this count is the knee — fencing here would park us
+         * up to PANEL_VREG_STEP_MAX counts short of the optimum, which is
+         * the v0.39 failure written a different way. Revert to the last count
+         * that paid and bracket it one at a time. The baseline is dropped so
+         * the good point is RE-measured under current conditions: irradiance
+         * may have moved between the two dwells, and comparing against a
+         * stale number is how a tracker converges on weather. */
+        m->cliff_pwm_min  = m->probe_from_pwm;
+        m->probe_step     = 0;
+        m->probing        = false;
+        m->prev_avg_valid = false;
+        start_dwell(ctx);
+        return;
+    }
+
+    /* A single count that did not pay IS the knee — measured, at no cost,
+     * with the panel still up. Fence one margin above it and hold.
+     *
+     * Only when there was something to measure: two dwells that both
+     * delivered under CHG_DELIVERING_MIN_MA compare noise against noise, and
+     * a knee learned from that would fence a working panel out of reach for
+     * MPPT_KNEE_RETREAT_MS. Park without learning instead — HOLD's re-probe
+     * comes back in MPPT_KNEE_PROBE_MS and tries again against whatever the
+     * panel is doing then. */
+    if (avg >= (int16_t)CHG_DELIVERING_MIN_MA ||
+        m->prev_avg_ichg >= (int16_t)CHG_DELIVERING_MIN_MA)
+        knee_learn(ctx, (uint32_t)m->cliff_pwm_min, MPPT_KNEE_MARGIN,
+                   ctx->meas.panel_voltage);
+    enter_hold(ctx);
 }
 
 /* =========================================================================
- * PUBLIC: step 6 entry point (setpoint-P&O)
+ * PUBLIC: step 6 entry point (knee P&O)
  * ========================================================================= */
 
 void mppt_update(system_ctx_t *ctx)
@@ -621,33 +656,29 @@ void mppt_update(system_ctx_t *ctx)
                           (ctx->charger.state == CHG_CV);
 
     /* Nothing to optimise until Q49 is connected. CHG_BUCK_SETTLE runs the
-     * buck intentionally unloaded and owns PWM acquisition; starting a P&O
-     * dwell there would measure zero charge current, pollute its baseline,
-     * and report MPPT tracking before charging has actually begun. */
+     * buck intentionally unloaded and owns PWM acquisition; starting a dwell
+     * there would measure zero charge current and pollute its baseline. */
     if (!charging) {
         if (m->state != MPPT_DISABLED) {
             /* Why did the region go down? energy_mode (step 5, this same
-             * tick) stamps rearm_block_ms only for an input-loss stand-
-             * down, so a block still in the future means the panel just
-             * collapsed under us: learn the level before forgetting the
-             * session. Any other exit (CV, fault, sun lost) teaches
-             * nothing about the knee. */
+             * tick) stamps rearm_block_ms only for an input-loss stand-down,
+             * so a block still in the future means the panel fell over under
+             * us: learn the count before forgetting the session. Any other
+             * exit (CV, fault, sun lost) teaches nothing about the knee. */
             if ((int32_t)(ctx->charger.rearm_block_ms - time_now()) > 0)
-                sp_learn_cliff(ctx);
+                m->event_knee_accepted = knee_learn_event(ctx,
+                        (uint32_t)ctx->charger.input_trace_pwm_from,
+                        ctx->charger.input_trace_ichg_from,
+                        ctx->charger.input_trace_vpanel_from);
             enter_disabled(ctx);
         }
 
-        /* While the region is down, decide whether the learned Voc and
-         * setpoint survive the gap. Both signals mean "this may not be the
-         * same panel, or not the same day":
-         *   - has_sun cleared: the debounced source-present flag went away,
-         *     which is what a GENUINE disconnect trips (1.5 s) and what an
-         *     input-loss bounce never manages (it re-arms in 2 s with the
-         *     averaged panel voltage still sitting at 11 V).
-         *   - the gap ran past MPPT_RESEED_GAP_MS: a long stand-down, a
-         *     fault round-trip, or an overnight idle.
-         * Latched, never cleared here — enter_disabled() re-arms it on the
-         * next teardown and the MPPT_DISABLED entry path consumes it. */
+        /* While the region is down, decide whether what we learned survives
+         * the gap. Both signals mean "this may not be the same panel, or not
+         * the same day": has_sun cleared (what a genuine disconnect trips in
+         * 1.5 s, and what an input-loss bounce never manages), or the gap ran
+         * past MPPT_RESEED_GAP_MS. Latched; the DISABLED entry path consumes
+         * it. */
         if (!has_sun ||
             (time_now() - m->disabled_since_ms) >= MPPT_RESEED_GAP_MS)
             m->seed_invalidated = true;
@@ -656,46 +687,87 @@ void mppt_update(system_ctx_t *ctx)
     }
 
     /* Voc estimate: running max of the filtered panel voltage while the
-     * region is active. V_panel never exceeds open circuit (barring the
-     * reverse-pump pathology, where an inflated estimate only loosens
-     * the search ceiling — safe), and it touches near-OC repeatedly:
-     * the unloaded stretch right after activation, every backoff
-     * recovery, light-load moments. This self-corrects the load bias of
-     * the activation-time capture. */
+     * region is active. Diagnostic now rather than structural — nothing
+     * seeds off it any more — but it is still the credibility test that
+     * routes an activation to the fresh path, and it still costs nothing:
+     * V_panel never exceeds open circuit and touches near-OC repeatedly. */
     if (m->state != MPPT_DISABLED &&
         ctx->meas.panel_voltage > m->panel_voc_mv)
         m->panel_voc_mv = ctx->meas.panel_voltage;
 
-    /* A collapse the guard rescued (charger_input_guard backed the draw off
-     * and the panel came back) is a cliff sighting exactly like a teardown,
-     * minus the teardown. Learn it BEFORE this tick's V_panel is recorded
-     * below — the reading that matters is the one from before the dip. */
+    /* ── Knee sightings that cost nothing ──
+     *
+     * A droop the fast guard arrested (v0.40) and a collapse the input guard
+     * rescued (v0.32) are both "this count did not hold", with the count
+     * snapshotted before any backoff moved it. They are the cheapest knee
+     * measurements available — no teardown, no re-acquisition — and the
+     * droop path in particular sees the event ~10 ms in, at a PWM that is
+     * still exactly the one that failed.
+     *
+     * Both use CHG_CLIFF_PWM_MARGIN rather than MPPT_KNEE_MARGIN: a probe
+     * that merely underdelivered is a measurement, but a fall is an event
+     * whose snapshot is at best one conversion old. */
+    if (m->state != MPPT_DISABLED &&
+        ctx->charger.droop_events != m->seen_droop_events) {
+        m->seen_droop_events = ctx->charger.droop_events;
+        m->event_knee_accepted = knee_learn_event(ctx,
+                (uint32_t)ctx->charger.droop_pwm_from,
+                ctx->charger.droop_ichg_from,
+                ctx->charger.droop_vpanel_from);
+        if (m->state == MPPT_TRACKING) {
+            m->prev_avg_valid = false;   /* samples spanning a droop are noise */
+            start_dwell(ctx);
+        }
+    }
     if (m->state != MPPT_DISABLED &&
         ctx->charger.input_dip_events != m->seen_dip_events) {
         m->seen_dip_events = ctx->charger.input_dip_events;
-        sp_learn_cliff(ctx);
+        m->event_knee_accepted = knee_learn_event(ctx,
+                (uint32_t)ctx->charger.input_trace_pwm_from,
+                ctx->charger.input_trace_ichg_from,
+                ctx->charger.input_trace_vpanel_from);
+        if (m->state == MPPT_TRACKING) {
+            m->prev_avg_valid = false;
+            start_dwell(ctx);
+        }
     }
 
-    /* Relax the learned PWM ceiling while nothing is falling over. The
-     * ratchet above only ever fences MORE conservatively, so a haze that
-     * lifts without ever dropping has_sun (no fresh seed, no release) would
-     * otherwise keep the draw capped at the level the haze imposed. One
-     * count per CHG_CLIFF_PWM_RELAX_MS, and only while actually charging —
-     * an inactive region proves nothing about the knee. The stamp is shared
-     * with the ratchet, so a fresh collapse also restarts the clock. */
-    if (m->cliff_pwm_min != 0 &&
-        (time_now() - m->cliff_pwm_relax_ms) >= CHG_CLIFF_PWM_RELAX_MS) {
-        m->cliff_pwm_relax_ms = time_now();
-        m->cliff_pwm_min--;
-        if (m->cliff_pwm_min <= PWM_MAX_DUTY)
-            m->cliff_pwm_min = 0;   /* down to the hardware limit: no fence */
+    /* ── A fence the regulator sits on delivering nothing is wrong ── (v0.41)
+     *
+     * The fence is a ceiling on current. If the loop has been pinned exactly
+     * on it for a full settled window and the cell is receiving under
+     * CHG_DELIVERING_MIN_MA while the panel is the binding constraint, the
+     * fence is at or above the zero-delivery count: it is not bounding the
+     * draw, it is forbidding it (v0.39's failure, reproduced in v0.40 by the
+     * droop guard ratcheting to the zero-draw count — 14.09.26, fence 110 on
+     * a 110 zero-draw, 0x0100 on every attempt to sit there). Only a fence
+     * that a KNEE is holding up can be wrong this way; during a cold
+     * acquisition the fence is the actuator and sits at zero delivery on
+     * purpose (knee_pwm == 0). Forget the knee and re-acquire: the next
+     * baseline measures under CHG_DELIVERING_MIN_MA with no knee and takes
+     * the acquisition step. */
+    if (m->state != MPPT_DISABLED && m->knee_pwm != 0 &&
+        m->cliff_pwm_min != 0 && ctx->pwm == m->cliff_pwm_min &&
+        ctx->charger.settled_ticks >= CHG_PWM_SETTLED_TICKS &&
+        ctx->meas.chg_current < (int16_t)CHG_DELIVERING_MIN_MA &&
+        ctx->panel_limited &&
+        (ctx->charger.state == CHG_CC || ctx->charger.state == CHG_PRECHARGE)) {
+        m->knee_pwm        = 0;
+        m->knee_learned_ms = 0;
+        if (m->fence_dropped < UINT16_MAX) m->fence_dropped++;
+        if (m->state == MPPT_HOLD) {
+            m->knee_probe_ms = time_now();
+            enter_tracking_reprobe(ctx);
+        } else {
+            m->prev_avg_valid = false;
+            start_dwell(ctx);
+        }
     }
 
-    /* Cliff memory for sp_learn_cliff: the last averaged V_panel that was
-     * not already dragged down by a collapse. A collapsed 10 ms sample
-     * costs the 64-deep average ~125-190 mV; honest regulation near the
-     * knee moves it ~50 mV per tick. Reject the sharp falls, keep the
-     * rest (rises are always clean — nothing collapses upward). */
+    /* Last clean averaged V_panel — the reading a post-mortem would want,
+     * and the one sp_follow parks the setpoint on. A collapsed 10 ms sample
+     * costs the 64-deep average ~125-190 mV; honest regulation near the knee
+     * moves it ~50 mV per tick. Reject the sharp falls, keep the rest. */
     if (m->state != MPPT_DISABLED &&
         ctx->meas.panel_voltage >= PANEL_SAFETY_MV &&
         ((int32_t)ctx->meas.panel_voltage + (int32_t)MPPT_SP_VPANEL_DROP_MV
@@ -705,28 +777,14 @@ void mppt_update(system_ctx_t *ctx)
     switch (m->state) {
 
     case MPPT_DISABLED:
-        /* Charger just activated (this very tick — energy_mode runs at
-         * step 5, we run at step 6, so the panel reading is still the
-         * unloaded IDLE value). Two ways in:
+        /* Charger just activated. FRESH (cold boot, new panel, long gap):
+         * throw the learned panel away and search from the zero-draw
+         * pre-position. RE-PROBE (input-loss bounce, or any short gap): the
+         * measured fence is still good — resume at it and re-bracket.
          *
-         * FRESH (cold boot, new panel, long gap): capture Voc and seed
-         * from FOCV, then start climbing. No settle gate needed — the
-         * first dwell's 2 s settle phase absorbs the activation
-         * transient.
-         *
-         * RE-PROBE (input-loss bounce): the learned point is still good,
-         * so resume from it at the fine step instead of throwing it away.
-         * Re-seeding here was the dominant cost of a teardown — bench
-         * 10.09.26 measured a median 12.4 s to climb back to full current
-         * against the 2 s the re-arm block itself costs, and the freshly
-         * seeded setpoint sat below the knee in the meantime, walking the
-         * panel off the cliff again (the teardowns arrived in bursts).
-         * See MPPT_RESEED_GAP_MS.
-         *
-         * The panel_voc_mv guard is not optional: it stops a stale
-         * seed_invalidated from routing a boot with no credible Voc into
-         * the re-probe path, which would have neither a real setpoint nor
-         * a setpoint ceiling. */
+         * The panel_voc_mv guard stops a stale seed_invalidated from routing
+         * a boot with no credible reading into the re-probe path, where it
+         * would resume against a fence it never measured. */
         if (has_sun) {
             if (m->seed_invalidated || m->panel_voc_mv < PANEL_MIN_MV)
                 enter_tracking_fresh(ctx);
@@ -741,15 +799,22 @@ void mppt_update(system_ctx_t *ctx)
             enter_disabled(ctx);
             break;
         }
-        /* P2: charger reached CV → freeze. cv_regulate now regulates
-         * V_bat and ignores the setpoint, so probing would move the
-         * setpoint blind. HOLD keeps it for a later CC return. */
+        /* P2: charger reached CV → freeze. cv_regulate regulates V_bat and
+         * ignores both the fence and the setpoint, so a probe would measure
+         * the battery's taper, not the panel. HOLD keeps the fence for the
+         * CC return. */
         if (ctx->charger.state == CHG_CV) {
             enter_hold(ctx);
             break;
         }
-        /* P3: session runtime cap → HOLD with the best point so far. */
-        if ((time_now() - m->tracking_start_ms) >= MPPT_SP_RUNTIME_MS) {
+        /* P3: search cap → park at the best fence found so far. v0.40 said
+         * that and parked on the probe under test; v0.41 actually restores
+         * the best-paying measured fence (bounded by the knee floor), and
+         * the two-sided fence rule in cc_regulate realises it. */
+        if ((time_now() - m->tracking_start_ms) >= MPPT_KNEE_SEARCH_MS) {
+            if (m->best_pwm != 0 && m->best_pwm >= fence_floor(m))
+                m->cliff_pwm_min = m->best_pwm;
+            m->probing = false;
             enter_hold(ctx);
             break;
         }
@@ -763,44 +828,81 @@ void mppt_update(system_ctx_t *ctx)
             enter_disabled(ctx);
             break;
         }
-        /* P2: collapse escape. The held setpoint started collapsing the
-         * panel — the knee moved ABOVE the held band (sun got brighter:
-         * knee voltage rises with irradiance) or a shadow cut the
-         * available current. Either way the inner loop alone would
-         * sawtooth here until the hold expired. Step the setpoint up
-         * one notch and re-enter TRACKING: its collapse branch takes
-         * over the (paced) ratchet if one step isn't enough, and the
-         * climb re-converges on the new optimum.
+
+        /* P2: keep the setpoint on the plant. The fence is frozen, but the
+         * operating VOLTAGE drifts with irradiance and cell temperature, and
+         * a setpoint left behind by that drift either stops protecting
+         * against a sag (too low) or commands a pointless backoff (too
+         * high). Only ever follows a reading that is already inside the
+         * band, so it can never chase the plant off its own knee — a real
+         * sag leaves the band, and the loop backs off instead. */
+        if (ctx->meas.panel_voltage >= PANEL_MIN_MV &&
+            (uint32_t)abs_diff_i32((int32_t)ctx->meas.panel_voltage,
+                                   (int32_t)m->vreg_setpoint_mv)
+              <= (uint32_t)charger_vreg_deadband_mv(ctx))
+            sp_follow(ctx);
+
+        /* P3: the periodic down-probe. This is the ONLY thing that loosens
+         * the fence, and it replaces the two blind timers of v0.39 —
+         * CHG_CLIFF_PROBE_MS (released a count every 2 s while the loop was
+         * starved, which on 14.09 walked 79 -> 78 -> 77 straight back into
+         * the cliff) and CHG_CLIFF_PWM_RELAX_MS (one count per 180 s, far
+         * too slow to follow the sun, and the reason the session's last five
+         * minutes ran fenced at 95).
          *
-         * Blanked for MPPT_SP_COLLAPSE_BLANK_MS after HOLD entry: when
-         * TRACKING converges right after a collapse correction, the
-         * collapsed reading persists through the MA filter for ~1 s —
-         * reacting to that stale tail would double-correct. And only
-         * escape if the step actually moved (a setpoint pinned at the
-         * ceiling has nowhere to go — churn into TRACKING would learn
-         * nothing the hold-expiry re-probe won't). */
-        if (ctx->meas.panel_voltage < PANEL_SAFETY_MV &&
-            (time_now() - m->hold_start_ms) >= MPPT_SP_COLLAPSE_BLANK_MS) {
-            uint16_t up = sp_clamp(ctx, (int32_t)m->vreg_setpoint_mv +
-                                      (int32_t)MPPT_SP_STEP_MV);
-            if (up != m->vreg_setpoint_mv) {
-                m->vreg_setpoint_mv = up;
-                m->prev_sp_mv       = up;
-                enter_tracking_reprobe(ctx);
-            }
-            break;
+         * Gated on the panel actually being the binding constraint: if the
+         * battery bounds the current (CV taper, precharge trickle, a
+         * near-full cell) a probe cannot observe anything. Gated too on
+         * MPPT_KNEE_RETREAT_MS since the knee was last proven, unless the
+         * fence has since been pushed above it by an event — in which case
+         * there is slack to recover and no need to wait. */
+        /* v0.42: a rail sitting ABOVE the fence in HOLD was kicked there — a
+         * droop backoff, a rescue restore, a sag step — and nothing in HOLD
+         * brings it back: the setpoint follows the plant, so the voltage
+         * loop sees no error, and the 30 s probe timer (or the 120 s knee
+         * retreat) was the only way down. Bench 14.09.26 v0.41: 100 s at
+         * pwm 110 / 146 mA with the fence at 100 / 460 mA. Re-probe at once
+         * instead: TRACKING parks the setpoint low, the loop walks back to
+         * the fence and re-measures it, and HOLD resumes ~3 s later. Only
+         * once the guard's own event is over (droop_count == 0). */
+        bool kicked = (m->cliff_pwm_min != 0) &&
+                      (ctx->pwm > m->cliff_pwm_min) &&
+                      (ctx->charger.droop_count == 0);
+
+        /* v0.43: a knee is evidence about the LIGHT it was learned in. If the
+         * panel at the present count now reads well above what that count
+         * would have read then (the count difference converted through the
+         * measured gain), the light has come back and the knee is stale —
+         * release it now, not in MPPT_KNEE_RETREAT_MS. See
+         * MPPT_KNEE_RELEASE_MV for the 120 s at 1.2 W that motivated it. */
+        bool headroom = false;
+        if (m->knee_pwm != 0 && m->knee_vpanel_mv != 0 &&
+            ctx->pwm >= m->knee_pwm) {
+            uint32_t expect = (uint32_t)m->knee_vpanel_mv +
+                              (uint32_t)ctx->charger.plant_mv_per_count *
+                                  (uint32_t)(ctx->pwm - m->knee_pwm);
+            headroom = (uint32_t)ctx->meas.panel_voltage >
+                       expect + MPPT_KNEE_RELEASE_MV;
         }
-        /* P3: re-probe when the hold expires — but only while the PANEL
-         * is the binding constraint (panel_limited) and the charger is
-         * actually running a bulk state. If the battery/budget is what
-         * bounds the current (CV taper, precharge trickle, near-full)
-         * or the charger is fault-parked, probing cannot observe
-         * anything: stay held. This re-probe is the upward path that
-         * recovers capability after clouds pass. */
-        if ((time_now() - m->hold_start_ms) >= MPPT_SP_HOLD_TIME_MS &&
+        bool retreat_over = (m->knee_pwm != 0) &&
+                            ((time_now() - m->knee_learned_ms) >=
+                                 MPPT_KNEE_RETREAT_MS || headroom);
+
+        if ((kicked || retreat_over ||
+             (time_now() - m->knee_probe_ms) >= MPPT_KNEE_PROBE_MS) &&
             ctx->panel_limited &&
             (ctx->charger.state == CHG_PRECHARGE ||
-             ctx->charger.state == CHG_CC)) {
+             ctx->charger.state == CHG_CC) &&
+            (kicked || retreat_over || m->knee_pwm == 0 ||
+             m->cliff_pwm_min > (uint16_t)(m->knee_pwm + MPPT_KNEE_MARGIN))) {
+
+            /* A knee older than MPPT_KNEE_RETREAT_MS, or one the light has
+             * clearly moved past, is no longer evidence. Release it so the
+             * probe can go past it. */
+            if (retreat_over)
+                m->knee_pwm = 0;
+
+            m->knee_probe_ms = time_now();
             enter_tracking_reprobe(ctx);
         }
         break;
@@ -810,6 +912,7 @@ void mppt_update(system_ctx_t *ctx)
         break;
     }
 }
+
 
 #else  /* !CHARGER_INPUT_VREG — legacy PWM-perturbing incremental conductance */
 

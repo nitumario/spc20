@@ -660,6 +660,8 @@ void ADC1_INST_IRQHandler(void){
  * loop (see GROUP1_IRQHandler); in normal RUN the buttons are polled in
  * update_buttons().
  */
+static void uart_tx_refill(void);   /* below, with the ring */
+
 void UART_0_INST_IRQHandler(void){
     switch(DL_UART_getPendingInterrupt(UART_0_INST)){
         case DL_UART_IIDX_RX:
@@ -668,6 +670,9 @@ void UART_0_INST_IRQHandler(void){
         default:
             break;
     }
+    /* v0.42: whatever woke us (TX FIFO empty, RX byte, or the foreground
+     * pending the vector from uart_write), top the TX FIFO up from the ring. */
+    uart_tx_refill();
 }
 
 void RTC_IRQHandler(void){
@@ -823,8 +828,46 @@ int32_t get_power_into_battery(void){
  * Channel indices per the read_adc_values() mapping comment:
  *   ADC0 mem0 = I_DISCHARGE, mem2 = VBATM; ADC1 mem0 = VPANEL.
  */
+/*
+ * v0.42: the raw ("_now") getters are INTEGER arithmetic.
+ *
+ * They are called by the foreground guards on every super-loop pass, and the
+ * CPU runs at 4 MHz (CPUCLK_FREQ). The float versions ended in a division by
+ * a double constant (`/VPANEL_DIV_RATIO`, `/VBATM_DIV_RATIO`, `/CHG_CUR_GAIN/
+ * CHG_CUR_RES`) — soft-float on a Cortex-M0+, ~1000 cycles each, four to six
+ * of them per pass: the loop took ~2.7 ms per pass while charging
+ * (bench 14.09.26 v0.41, measured from the UART byte rate), which is a
+ * quarter of the ADC period the guards are supposed to be judging every
+ * sample of. The divider ratios and the 1/(gain·R_sense) = 4 mA/mV of the
+ * current sense are exact small rationals; the results agree with the float
+ * path to within 1 LSB of truncation.
+ */
+#define VPANEL_DIV_RECIP_NUM  1000U   /* 1 / 0.091 */
+#define VPANEL_DIV_RECIP_DEN  91U
+#ifdef ISSUE_VBATM
+#define VBATM_DIV_RECIP_NUM   100U    /* 1 / 0.53 */
+#define VBATM_DIV_RECIP_DEN   53U
+#else
+#define VBATM_DIV_RECIP_NUM   2U      /* 1 / 0.5 */
+#define VBATM_DIV_RECIP_DEN   1U
+#endif
+#define VCHGM_DIV_RECIP_NUM   2U      /* 1 / 0.5 */
+#define VCHGM_DIV_RECIP_DEN   1U
+#define CUR_SENSE_MA_PER_MV   4       /* 1 / (50 × 0.005 Ω)                */
+
+static inline uint32_t adc0_now_mv(uint8_t mem){
+    return (uint32_t)ADC.VREF * ADC.Adc0Result[mem] / ADC.max_adc0_value;
+}
+static inline uint32_t adc1_now_mv(uint8_t mem){
+    return (uint32_t)ADC.VREF * ADC.Adc1Result[mem] / ADC.max_adc1_value;
+}
+static inline uint16_t vpanel_mv_from_raw(uint16_t raw){
+    uint32_t mv = (uint32_t)ADC.VREF * raw / ADC.max_adc1_value;
+    return (uint16_t)(mv * VPANEL_DIV_RECIP_NUM / VPANEL_DIV_RECIP_DEN);
+}
+
 uint16_t get_input_voltage_now(void){
-    return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc1Result[0]/(ADC.max_adc1_value)/VPANEL_DIV_RATIO);
+    return vpanel_mv_from_raw(ADC.Adc1Result[0]);
 }
 
 uint32_t adc_sample_seq(void){
@@ -844,29 +887,27 @@ void adc_panel_trace_mv(uint16_t *out){
     uint8_t head = panel_trace_head;   /* oldest slot = next one to be written */
     for(uint8_t i = 0; i < ADC_PANEL_TRACE_DEPTH; i++){
         uint8_t idx = (uint8_t)((head + i) % ADC_PANEL_TRACE_DEPTH);
-        out[i] = (uint16_t)((uint32_t)ADC.VREF*panel_trace_raw[idx]
-                            /(ADC.max_adc1_value)/VPANEL_DIV_RATIO);
+        out[i] = vpanel_mv_from_raw(panel_trace_raw[idx]);
     }
 }
 
 uint16_t get_battery_voltage_now(void){
-    return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc0Result[2]/(ADC.max_adc0_value)/VBATM_DIV_RATIO);
+    return (uint16_t)(adc0_now_mv(2) * VBATM_DIV_RECIP_NUM / VBATM_DIV_RECIP_DEN);
 }
 
 uint16_t get_discharge_current_now(void){
-    float v_idischarge = (ADC.VREF*(float)ADC.Adc0Result[0]/(ADC.max_adc0_value));
-    return (uint16_t)(v_idischarge/OUT_CUR_GAIN/CHG_CUR_RES);
+    return (uint16_t)(adc0_now_mv(0) * (uint32_t)CUR_SENSE_MA_PER_MV);
 }
 
 uint16_t get_charge_voltage_now(void){
-    return (uint16_t)((uint32_t)ADC.VREF*ADC.Adc0Result[9]/(ADC.max_adc0_value)/VCHGM_DIV_RATIO);
+    return (uint16_t)(adc0_now_mv(9) * VCHGM_DIV_RECIP_NUM / VCHGM_DIV_RECIP_DEN);
 }
 
 int16_t get_charge_current_now(void){
     if(!System_Status.charger_switch) return 0;
 
-    float v_icharge = ((ADC.VREF*(float)ADC.Adc0Result[4])/(ADC.max_adc0_value)) - 1260.0;
-    return (int16_t)(v_icharge/CHG_CUR_GAIN/CHG_CUR_RES);
+    int32_t v_icharge = (int32_t)adc0_now_mv(4) - 1260;   /* zero at 1260 mV */
+    return (int16_t)(v_icharge * CUR_SENSE_MA_PER_MV);
 }
 
 uint16_t get_led_transistor_voltage(LED_OUTPUT led){
@@ -1198,13 +1239,37 @@ void set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle){
                     : LED_CURRENT_PWM_PERIOD;
     uint16_t _duty_cycle = scale_duty_cycle(duty_cycle, period);
 
-    DL_TimerG_stopCounter(pwm_channel->TIMER);
-
+    /*
+     * v0.42: write the compare register with the counter RUNNING.
+     *
+     * This used to stop the counter, write, and start it again. The timers
+     * are initialised with CVAE = LOAD (dl_timer.c, DL_Timer_initPWMMode), so
+     * every start reloaded the counter to the period and restarted the PWM
+     * phase: one truncated or stretched period per write, of random length
+     * depending on where in the period the stop landed. apply_pwm wrote the
+     * buck every 50 ms tick whether or not the value had changed, so the buck
+     * FB pin got a full-scale pulse of up to one period twenty times a
+     * second. Through the FB injection filter that is a ~100 mV step in the
+     * rail target for a millisecond — ~1.5 A through the 65 mΩ path, and a
+     * ~2 V dip on the panel input capacitor. Bench 14.09.26 (v0.41): 40 of
+     * the 48 "droop" events carried exactly that signature — raw I_buck
+     * 1.3-1.6 A against a 0.1-0.5 A average on the same conversion, and a
+     * single 1.5-2 V dip in the raw V_panel window — i.e. the droop guard
+     * catching this firmware's own switching transient about once every
+     * 30 s, and kicking the operating point 4 counts up for it every time.
+     *
+     * A compare write against a running down-counter cannot glitch: the
+     * output changes duty at the next match, nothing more. The start is
+     * kept only for a counter that is not running — the first write after
+     * boot, and after the STANDBY restore leaves the PD1 timers stopped
+     * (main.c system_sleep relies on this path to bring them back).
+     */
     DL_TimerG_setCaptureCompareValue(pwm_channel->TIMER,
                                      period - _duty_cycle,
                                      pwm_channel->CC_INDEX);
-
-    DL_TimerG_startCounter(pwm_channel->TIMER);
+    if(!DL_TimerG_isRunning(pwm_channel->TIMER)){
+        DL_TimerG_startCounter(pwm_channel->TIMER);
+    }
     return;
 }
 
@@ -1212,8 +1277,22 @@ void set_pwm_duty_cycle(const PWM_Config* pwm_channel, uint16_t duty_cycle){
  * Writes a raw PWM value [1..399] to the buck converter channel.
  * This is the only function that main's apply_pwm step should call.
  */
+static uint16_t buck_pwm_written = 0xFFFFU;   /* last value handed to the timer */
+
+/* v0.42: forget the cached value so the next set_buck_pwm() writes the
+ * timer unconditionally — after SYSCFG_DL_restoreConfiguration() the compare
+ * register no longer holds what we last wrote. */
+void buck_pwm_cache_invalidate(void){
+    buck_pwm_written = 0xFFFFU;
+}
+
 void set_buck_pwm(uint16_t pwm_value){
+    /* v0.42: apply_pwm commits ctx->pwm every 50 ms tick; only touch the
+     * timer when the value actually changed. See set_pwm_duty_cycle for what
+     * the unconditional rewrite was doing to the buck. */
+    if(pwm_value == buck_pwm_written) return;
     set_pwm_duty_cycle(&_pwm_outputs[0], pwm_value);
+    buck_pwm_written = pwm_value;
 }
 
 /*
@@ -1234,7 +1313,7 @@ uint16_t lookup_charging_pwm(uint16_t voltage){
  */
 uint16_t set_charging_voltage(uint16_t voltage){
     uint16_t pwm_value = lookup_charging_pwm(voltage);
-    set_pwm_duty_cycle(&_pwm_outputs[0], pwm_value);
+    set_buck_pwm(pwm_value);          /* through the cache, like every other writer */
     return pwm_value;
 }
 
@@ -1664,6 +1743,13 @@ __STATIC_INLINE void invokeBSLAsm(void)
 }
 
 void uart_init(void){
+    /* v0.42: SysConfig leaves the FIFOs disabled (a 1-byte transmitter).
+     * Enable them and raise the TX event when the FIFO runs EMPTY, so the
+     * ISR refills a whole FIFO at a time. TX stays masked until there is
+     * something to send (uart_write). */
+    DL_UART_enableFIFOs(UART_0_INST);
+    DL_UART_setTXFIFOThreshold(UART_0_INST, DL_UART_TX_FIFO_LEVEL_EMPTY);
+    DL_UART_disableInterrupt(UART_0_INST, DL_UART_INTERRUPT_TX);
     NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
     NVIC_EnableIRQ(UART_0_INST_INT_IRQN);
 }
@@ -1691,6 +1777,90 @@ void printToUART(char* string, char end_char){
             break;
         }
     }
+}
+
+/* ============================================================================
+ * NON-BLOCKING UART TRANSMIT RING (v0.41, interrupt-driven since v0.42)
+ * ============================================================================
+ *
+ * Producer: uart_write() in the foreground (writes uart_head).
+ * Consumer: uart_tx_refill() in UART_0_INST_IRQHandler ONLY (writes
+ * uart_tail). Each side reads the other's index once per operation and both
+ * indices are aligned halfwords, so no critical section is needed.
+ *
+ * v0.41 drained the ring from the super loop, a few bytes per pass, and on
+ * this 4 MHz part with the UART FIFO disabled that was ONE byte per pass —
+ * ~370 bytes/s while charging, a 5 Hz telemetry line every 1.2 s and 3000
+ * lines dropped in 14 minutes (bench 14.09.26). The hardware now does the
+ * pacing: the FIFO is enabled, the TX interrupt fires when it empties, and
+ * the ISR refills it from the ring. The foreground only ever enqueues and
+ * pends the IRQ; throughput is the wire rate regardless of what the loop is
+ * doing. The TX interrupt is masked while the ring is empty and unmasked by
+ * the next uart_write(), so an idle FIFO cannot storm the vector whatever
+ * its level semantics are.
+ */
+static uint8_t           uart_ring[UART_TX_RING_SIZE];
+static volatile uint16_t uart_head = 0;      /* next byte to enqueue (foreground) */
+static volatile uint16_t uart_tail = 0;      /* next byte to transmit (ISR)       */
+static volatile uint16_t uart_dropped = 0;   /* strings refused for lack of room  */
+
+static inline uint16_t uart_ring_used(void){
+    return (uint16_t)((uart_head + UART_TX_RING_SIZE - uart_tail) % UART_TX_RING_SIZE);
+}
+
+/* ISR context (or foreground with PRIMASK set — see uart_flush). */
+static void uart_tx_refill(void){
+    while(uart_tail != uart_head && !DL_UART_isTXFIFOFull(UART_0_INST)){
+        DL_UART_transmitData(UART_0_INST, uart_ring[uart_tail]);
+        uart_tail = (uint16_t)((uart_tail + 1U) % UART_TX_RING_SIZE);
+    }
+    if(uart_tail == uart_head){
+        DL_UART_disableInterrupt(UART_0_INST, DL_UART_INTERRUPT_TX);
+    }
+}
+
+void uart_write(const char *str){
+    uint16_t len = 0;
+    while(str[len] != '\0') len++;
+    /* One slot is always kept empty so head == tail means "empty", never
+     * "full". Refuse the WHOLE string rather than truncate: a torn line is
+     * worse than a missing one for the log parsers. */
+    if(len == 0 || (uint32_t)len + uart_ring_used() >= UART_TX_RING_SIZE){
+        if(uart_dropped < UINT16_MAX) uart_dropped++;
+        return;
+    }
+    for(uint16_t i = 0; i < len; i++){
+        uart_ring[uart_head] = (uint8_t)str[i];
+        uart_head = (uint16_t)((uart_head + 1U) % UART_TX_RING_SIZE);
+    }
+    /* Kick: unmask the TX event and run the ISR once now so the first bytes
+     * go out immediately; from then on the FIFO-empty event keeps it going. */
+    DL_UART_enableInterrupt(UART_0_INST, DL_UART_INTERRUPT_TX);
+    NVIC_SetPendingIRQ(UART_0_INST_INT_IRQN);
+}
+
+/* Safety net from the super loop: re-pend the IRQ if data is waiting (a
+ * lost FIFO-empty event would otherwise strand the ring). Cheap. */
+void uart_pump(void){
+    if(uart_tail != uart_head){
+        DL_UART_enableInterrupt(UART_0_INST, DL_UART_INTERRUPT_TX);
+        NVIC_SetPendingIRQ(UART_0_INST_INT_IRQN);
+    }
+}
+
+void uart_flush(void){
+    while(uart_tail != uart_head){
+        if(__get_PRIMASK() != 0U){
+            uart_tx_refill();             /* interrupts masked: drain by hand */
+        }else{
+            uart_pump();
+        }
+    }
+    while(DL_UART_Main_isBusy(UART_0_INST)){ }
+}
+
+uint16_t uart_tx_dropped(void){
+    return uart_dropped;
 }
 
 

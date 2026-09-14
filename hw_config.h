@@ -388,8 +388,16 @@
  * implausibly small (a stiff source, a stretch of flat readings) shrinking
  * the band to the point where panel noise alone drives a step every
  * interval. ~3x the tick-to-tick V_panel jitter seen on the bench (11-22
- * mV). */
-#define PANEL_VREG_DEADBAND_MIN_MV 150U
+ * mV).
+ *
+ * v0.40: was 150. On the 4x-parallel array the measured gain is 26-55
+ * mV/count, so a 150 mV floor is a band 3-6 counts wide — and the knee is
+ * ONE count wide (bench 14.09.26: pwm 79 delivered 1297 mA, pwm 78 delivered
+ * 1284, pwm 77 collapsed the panel). A regulator that cannot resolve the
+ * operating point better than +/-4 counts cannot be asked to park one count
+ * off a knee, which is why the PWM fence had to become the actuator (mppt.c)
+ * and why this floor now sits just above the jitter instead of 7x it. */
+#define PANEL_VREG_DEADBAND_MIN_MV 60U
 
 /* Sanity clamps on the online gain estimate (mV of V_panel per PWM count).
  * Anything outside this is not a plant measurement — it is an irradiance
@@ -765,6 +773,42 @@
  * and a real removal should still be isolated on the first sample. */
 #define CHG_REVERSE_SAMPLES       3U
 
+/* ── v0.41: the raw reverse test had no SNR where it was being used ─────
+ *
+ * The charge-current sense is noisy: the 64-sample AVERAGE has a standard
+ * deviation of ~30 mA at every settled operating point in
+ * serial_20260914_110639.log (37 windows, pwm 89..109, 50..585 mA — the
+ * spread does not depend on the level, so it is sensor noise, not the
+ * panel). A single conversion is therefore ~240 mA RMS. Against that,
+ * "three consecutive raw samples under -100 mA" is a noise process whose
+ * rate depends only on how little current is being delivered:
+ *
+ *      true I_buck     P(sample < -100)   expected time to 3-in-a-row
+ *          0 mA            0.34                  < 1 s
+ *       +100 mA            0.20                  ~1 s
+ *       +250 mA            0.07                  ~30 s
+ *       +400 mA            0.02                  ~25 min
+ *
+ * That is the whole 14.09.26 v0.40 session: six FAULT_REVERSE_PUMP latches,
+ * every one within seconds of the delivery being pushed under ~100 mA (a
+ * droop backoff to the zero-draw count, a SETL hand-off ON it), and not one
+ * in the 20 minutes the panel delivered 250-560 mA. dips:0 for the session —
+ * the input never once reached the battery. The 468 latches of v0.34 and
+ * the 27 of v0.36 are the same process at the connection transient.
+ *
+ * So the raw path keeps only the job it can do: catch a LARGE reversal in
+ * three conversions. CHG_REVERSE_FAST_MA is ~2σ of one raw sample, which
+ * at zero true current false-trips once per hour or so and at the May
+ * trace's -1010 mA fires on the first three samples. Anything smaller is
+ * judged on the 64-sample average instead — cc_regulate's reverse escape
+ * (CHG_REVERSE_CURRENT_MA, -5 counts per interval) acts on that first, and
+ * a reversal the escape has not cleared after CHG_REVERSE_LATCH_MS is the
+ * pathology: sustained, and 10-15 counts of demand removed without effect.
+ * The dead-input branch keeps its single raw sample: it stands down without
+ * latching, so a false trip there costs CHG_INPUT_REARM_MS, not 10 s. */
+#define CHG_REVERSE_FAST_MA       500
+#define CHG_REVERSE_LATCH_MS      1000UL
+
 /* ── Learned PWM ceiling (the current-domain cliff memory) ──────────────
  *
  * sp_session_floor_mv learns a collapse in the SETPOINT domain, and on a
@@ -787,8 +831,17 @@
  * events' worth). Backoffs,
  * the reverse-current escape and the CHG_BUCK_SETTLE ramp all ignore the
  * floor: it bounds current, and every one of those REDUCES current or is
- * an interlock that must not be blockable. */
-#define CHG_CLIFF_PWM_MARGIN      6U
+ * an interlock that must not be blockable.
+ *
+ * v0.40: 6 -> 2. Six counts was sized when the fence was a scar — something
+ * only a collapse ever wrote, so it had to be conservative. It is now the
+ * tracker's actuator (mppt.c knee P&O), re-probed downward every
+ * MPPT_KNEE_PROBE_MS, so an over-wide margin is not caution, it is the whole
+ * loss. Bench 14.09.26: four collapses walked the fence 0 -> 79 -> 83 -> 91
+ * -> 95 in ten minutes while the knee sat at 79-89, and the last 280 s ran
+ * at 1.7 W on a panel that had delivered 4.6 W — 6 counts is ~270 mA of
+ * demand, and the whole distance from the knee to a safe point is one. */
+#define CHG_CLIFF_PWM_MARGIN      2U
 
 /* The ratchet is one-way per event, so it needs a way back down as the sun
  * comes back: release one count per this interval of collapse-free charging
@@ -808,6 +861,69 @@
  * covers within-session recovery that never drops has_sun — a thin haze
  * clearing, not a sunrise. */
 #define CHG_CLIFF_PWM_RELAX_MS    180000UL
+
+/* ── Two bounds on the cliff fence, both added in v0.39 ──────────────────
+ *
+ * Bench 14.09.26 (serial_20260914_092508.log) showed the ratchet above can
+ * fence the charger clean off the panel. One genuine collapse at pwm 104
+ * (INTRACE @2410 ms) set cliff_pwm_min = 104 + 6 = 110 — and on that 13 V
+ * panel 110 is the ZERO-DRAW count. For the next six minutes cc_regulate was
+ * welded to the fence (pwm == pwmf at every sample), V_panel sat at 14.0-14.5 V
+ * (open circuit, ~3 V above its own setpoint), and the cell took 47 mA / 156 mW
+ * — against the 5.0 W the same panel gave at its MPP earlier that morning.
+ * Eleven FAULT_REVERSE_PUMP latches followed, because at zero delivery the
+ * sign of one raw conversion is a coin flip.
+ *
+ * The margin is not wrong in general — it is ~270 mA of notch on the 6.5 V
+ * array. It is wrong when it is WIDER THAN THE WHOLE USABLE BAND, which is
+ * what happens once the operating point walks up near Voc: cliff 104,
+ * zero-draw 110, six counts of room and a six-count margin.
+ *
+ * Neither bound below weakens the fence in the regime it exists for. Both
+ * only act where the fence has stopped bounding current and started
+ * forbidding it.
+ *
+ * (1) CHG_DELIVERING_MIN_MA — the fence may never be set at or above a count
+ *     this session has actually delivered at. A draw the panel sustained is
+ *     not a draw that collapses it. Sized at ~2 sigma of the averaged
+ *     chg_current reading (sd of the 64-sample average measures 25-30 mA
+ *     across every bench window), so noise alone cannot mint the evidence.
+ *     The count must also have been held CHG_PWM_SETTLED_TICKS first, or the
+ *     640 ms average is still describing a different operating point. */
+#define CHG_DELIVERING_MIN_MA     60
+#define CHG_PWM_SETTLED_TICKS     13U   /* 650 ms ≥ the 64-sample average */
+
+/* (2) CHG_CLIFF_PROBE_MS — a fast release for a fence that is provably too
+ *     tight. The slow relax above gives back one count per 180 s, which is
+ *     right for a haze that has lifted but cannot rescue a fence that never
+ *     had any business being where it is: 6 counts of recovery is 18 minutes,
+ *     and the 14.09 session never got there.
+ *
+ *     The test is not a timer, it is evidence: the regulator ASKED for more
+ *     current and the fence refused it, continuously, for this long. That
+ *     only happens with V_panel above the regulation band — i.e. the panel is
+ *     nowhere near its knee and the fence is the only thing holding the draw
+ *     down. A panel actually at its knee never produces it, because the
+ *     voltage loop is commanding backoff, not more.
+ *
+ *     2 s is 5 consecutive PANEL_VREG_INTERVAL_MS evaluations, each of which
+ *     independently found V_panel above the band, so a single blocked step
+ *     cannot trigger it. It has to be short because the failure it undoes
+ *     also shortens the sessions it has to run in: on 14.09 six of the twelve
+ *     charge sessions were under 2.5 s, and a 5 s dwell would not have fired
+ *     until t=73 s. At 2 s the first release lands in the third session
+ *     (t≈25 s) and the fence reaches the real cliff inside the first minute.
+ *
+ *     It is also self-limiting, which is why the rate is not the safety
+ *     question it looks like. A release only happens while the regulator is
+ *     being REFUSED, and it is only refused while V_panel is above the band —
+ *     i.e. while the extra draw is not reaching the knee. The moment the
+ *     added current pulls the panel into the band the loop stops asking,
+ *     the dwell clears, and the walk stops on its own. If it does overshoot,
+ *     charger_input_guard answers in ~30 ms and re-ratchets on the spot, and
+ *     CHG_DELIVERING_MIN_MA then stops the new fence landing back above a
+ *     count that had just been delivering. */
+#define CHG_CLIFF_PROBE_MS        2000UL
 
 /* Ceiling on how far a warm resume may advance the activation pre-position
  * (energy_mode.c). The staged start normally enters at the LUT count for
@@ -838,6 +954,151 @@
  * never holds V_panel down long enough to clear has_sun, costs ~2 s of charging
  * instead of the 10 s FAULT_RECOVER_WAIT_MS the old latched path imposed. */
 #define CHG_INPUT_REARM_MS        2000UL
+
+/* ── Fast panel-droop backoff (v0.40) ───────────────────────────────────
+ *
+ * THE missing layer. Until v0.40 the firmware had exactly two defences
+ * against a panel going over its knee, and both of them are too late:
+ *
+ *   - cc_regulate's voltage loop: one step per PANEL_VREG_INTERVAL_MS
+ *     (400 ms) against a 64-sample moving average (~320 ms of group delay).
+ *   - charger_input_guard: raw, 10 ms, but it only trips under
+ *     V_bat + CHG_INPUT_LOST_MARGIN_MV — i.e. 3.77 V, which the panel only
+ *     reaches once the collapse is COMPLETE and the buck is in dropout.
+ *
+ * Between "regulating at 12 V" and "collapsed onto the cell" there was
+ * nothing at all, and the raw traces say the fall is visible for one to
+ * four 10 ms conversions before it gets there (INTRACE, 14.09.26):
+ *
+ *     12769 12769 12769  8670  3538 3538 ...      one sample of warning
+ *     12087 12120 12087 11769 10032  3461 ...     two
+ *     11912 11879 11934 11868 11747 11571 11000 3505   five
+ *
+ * So: judge the raw conversion against where the loop is actually parked
+ * (charger.panel_op_mv, the settled averaged V_panel) instead of against
+ * the battery, and shed demand the moment it falls through a fraction of
+ * it. At 88 % of a 12.7 V operating point the trip sits at 11.2 V — 20x
+ * the +/-60 mV raw jitter and ~7x the largest legitimate single-interval
+ * move (PANEL_VREG_STEP_MAX counts x PANEL_GAIN_MAX_MV_PER_COUNT is not
+ * reachable at the gains this plant actually shows: 3 x 55 = 165 mV), so
+ * the loop's own steps cannot trip it.
+ *
+ * The point is not to save the sample — it is that a backoff taken at
+ * 11.2 V still has authority. Below V_bat the buck is in dropout and the
+ * FB target controls nothing (see charger_input_guard's v0.34 note), which
+ * is why the existing rescue has to command a rail under the cell to work
+ * at all. At 88 % we are nowhere near dropout: one write of pwm and the
+ * demand is gone.
+ *
+ * This guard NEVER stands down. It only ever reduces current. If it fails
+ * to arrest the fall, charger_input_guard is still underneath it,
+ * unchanged. */
+#define CHG_DROOP_TRIP_PCT        88U
+
+/* Counts shed per sub-trip conversion. One count is ~45 mA of buck output
+ * (~150 mW, ~13 mA of panel current at 12 V); four is a real notch taken
+ * inside 10 ms, and the fall we are racing removes ~4 V in the same time.
+ * Bounded by CHG_DROOP_MAX_STEPS so a guard chasing a genuinely removed
+ * source parks the draw rather than walking pwm to PWM_MIN_DUTY and
+ * pre-empting charger_input_guard's stand-down (which is the correct
+ * outcome for a removal, and belongs to that guard). */
+#define CHG_DROOP_STEP            4
+#define CHG_DROOP_MAX_STEPS       8U
+
+/* How fast charger.panel_op_mv — the droop reference — may follow V_panel
+ * DOWNWARD, per PANEL_VREG_INTERVAL_MS. Rises are taken immediately (a
+ * panel recovering is never a collapse); falls are rate-limited so the
+ * reference cannot chase the operating point into the knee and quietly
+ * disarm the guard. 250 mV per 400 ms tracks the loop's own descent
+ * (<=3 counts x ~55 mV) and the slowest real irradiance ramps, and is
+ * ~25x slower than the fall it has to not follow. */
+#define CHG_DROOP_REF_FALL_MV     250U
+
+/* Trip gap in PWM COUNTS — the primary criterion, once the voltage loop has
+ * measured the plant. CHG_DROOP_TRIP_PCT above is only the fallback for the
+ * first seconds of a session, before there is a gain.
+ *
+ * This is v0.38's lesson applied again: a threshold specified in millivolts
+ * is a threshold of unknown width. On the 13 V array (26-55 mV/count) a 12 %
+ * gap is ~1500 mV = 45 counts, which is so far below the operating point
+ * that the guard only fires on the last conversion before dropout. In counts
+ * it is 264 mV, and replaying the seven raw INTRACE collapse traces through
+ * both:
+ *
+ *              12 % gap          8-count gap
+ *   caught     5 of 7            6 of 7
+ *   warning    1 conversion      1-3 conversions
+ *
+ * The one neither catches (`11417 3505`) has no precursor at all — it goes
+ * from regulating to dropout inside one 10 ms sample, and nothing sampled at
+ * 10 ms can do better. charger_input_guard remains the backstop for it.
+ *
+ * Sized against the loop's own authority: cc_regulate may legitimately move
+ * the operating point PANEL_VREG_STEP_MAX (3) counts in one interval, so 8
+ * counts is 2.7x the largest honest step, plus room for the +/-60 mV raw
+ * jitter. Below ~6 the guard starts arguing with the regulator.
+ *
+ * On a steep plant this criterion widens the gap instead of narrowing it —
+ * 8 counts on the 6.5 V array is 4800 mV, which puts the trip under
+ * PANEL_SAFETY_MV and disarms the guard. That is the right answer there: one
+ * PWM count is a quarter of that panel, a droop cannot be told from a step,
+ * and panel_safety_backoff owns it as it always has. */
+#define CHG_DROOP_TRIP_COUNTS     8U
+
+/* Absolute floor on the gap, for a gain estimate that has gone implausibly
+ * small (PANEL_GAIN_MIN_MV_PER_COUNT is 5, which would put the trip 40 mV
+ * under the operating point — inside the raw jitter). Same role as
+ * PANEL_VREG_DEADBAND_MIN_MV plays for the regulation band. */
+#define CHG_DROOP_MIN_GAP_MV      200U
+
+/* ── v0.41: the zero-delivery count, and why a backoff stops there ───────
+ *
+ * Buck output current per PWM count: ~2.87 mV of rail per count (LUT span
+ * 3772 -> 2786 mV over 343 counts) across the ~65 mΩ charge path. A
+ * hardware constant, not a panel one — it is the same on every array. Used
+ * to place the ZERO-DELIVERY count from any settled delivering point:
+ *
+ *      zero_draw_pwm ≈ pwm + I_chg / CHG_BUCK_MA_PER_COUNT
+ *
+ * refreshed every settled tick while delivering (charger_update), so it
+ * follows V_bat. It is the line between "shedding demand" and "reverse
+ * pumping": above it the rail sits under the cell and the sync FETs push
+ * battery charge into the panel. Every count past it is ~-45 mA.
+ *
+ * charger_panel_droop_guard trips with the panel still volts above the
+ * battery, i.e. with the buck OUT of dropout, where the FB target has
+ * authority — so shedding to zero delivery is the whole of what a backoff
+ * can do for the panel, and the guard stops at zero_draw_pwm +
+ * CHG_ZERO_DRAW_MARGIN. (charger_input_guard is different: it trips AFTER
+ * the collapse, in dropout, and must command under the cell to break it —
+ * see its v0.34 note. That backoff stays unbounded; what changes in v0.41
+ * is that the RECOVERED branch restores the rail to this same point in the
+ * same conversion it sees the input come back, instead of leaving it 10-20
+ * counts into reverse for the 400 ms regulator to find.)
+ *
+ * Bench 14.09.26 v0.40, the event at 214.279 s: pwm 103 delivering 183 mA,
+ * two droop conversions, 103 -> 107 -> 111. Zero-draw on that session was
+ * ~110 (settled: 109 = 50 mA, 110 = 26 mA), so 111 is a rail under the cell
+ * at ~-45 mA nominal — and 0x0100 latched 160 ms later. Bounded, the same
+ * event stops at 110/111 with the delivery at zero and the fault has
+ * nothing to see. */
+#define CHG_BUCK_MA_PER_COUNT     45U
+#define CHG_ZERO_DRAW_MARGIN      1U
+
+/* ── v0.42: telling a panel fall from the buck's own transient ───────────
+ *
+ * A panel falling cannot push MORE current into the cell: the buck's output
+ * current is bounded by what the input can supply. A raw I_buck conversion
+ * far above the running average on the same sample the raw V_panel dipped
+ * is therefore not the panel — it is the input capacitor discharging into a
+ * momentary step in the buck's own target, i.e. a switching transient (bench
+ * 14.09.26 v0.41: 40 of 48 droop sightings read raw I_buck 1.3-1.6 A against
+ * a 0.1-0.5 A average, each with a single 1.5-2 V raw V_panel dip; the
+ * source was the PWM write path restarting the timer, fixed in
+ * set_pwm_duty_cycle). Such a sighting gets no backoff and teaches no knee —
+ * it is traced (DROOP … GLITCH) and counted (`glt`) instead. Raw noise on the
+ * current sense is ~240 mA RMS, so this is ~3σ above the average. */
+#define CHG_DROOP_SPIKE_MA        700
 
 /* How long the charger region may stay inactive before MPPT treats the
  * learned Voc and MPP setpoint as stale and re-seeds from FOCV
@@ -881,6 +1142,156 @@
  *      attribution unreliable (see CHANGELOG / git history).
  */
 
+/* ── Knee P&O on the PWM fence (CHARGER_INPUT_VREG=1, v0.40) ─────────────
+ *
+ * What replaced the FOCV seed, and why.
+ *
+ * THE MEASUREMENT (bench 14.09.26, serial_20260914_095416.log, settled
+ * plateaus of >= 1 s at one irradiance):
+ *
+ *      pwm   V_panel   I_chg        pwm   V_panel   I_chg
+ *       99    12757      485         83    12119     1161
+ *       93    12625      689         82    12068     1188
+ *       89    12475      834         79    11901     1297   <- best
+ *       86    12303     1002         78    11912     1284
+ *       85    12332      969         77       -- collapse --
+ *
+ * Delivered current climbs ~36 mA per count all the way down, turns over
+ * in ONE count, and the next count takes the panel over its knee. There is
+ * no flat top to converge onto and no gradual roll-off to slow down on:
+ * the optimum and the cliff are adjacent counts. Three consequences, and
+ * they are the whole of this design:
+ *
+ *  1. The MPP is the stability boundary, not a place to sit. A buck held
+ *     at a fixed PWM into a stiff cell is a CONSTANT-POWER load, and a CPL
+ *     load line is tangent to the panel I-V curve exactly at the MPP — so
+ *     every point at or left of the MPP is open-loop unstable, and the
+ *     firmware's feedback (400 ms loop, 320 ms of ADC group delay) is four
+ *     orders of magnitude too slow to stabilise it. Two of the four
+ *     collapses in that session happened with the PWM FROZEN for seconds.
+ *     The target must therefore be "one count off the knee", deliberately,
+ *     not "the knee".
+ *
+ *  2. The actuator has to be the PWM count. A knee one count wide cannot
+ *     be approached through a millivolt setpoint whose own regulation band
+ *     is several counts wide (see PANEL_VREG_DEADBAND_MIN_MV). The tracker
+ *     now perturbs mppt.cliff_pwm_min — already the regulator's current
+ *     ceiling, already the warm-resume entry point — and the voltage loop
+ *     drives the operating point into it. The setpoint keeps its old job:
+ *     sag protection during HOLD, and nothing else.
+ *
+ *  3. Nothing about this needs to know the panel. No Voc fraction, no
+ *     FOCV constant, no assumption about series/parallel topology or
+ *     irradiance: the fitness is delivered charge current and the actuator
+ *     is a PWM count. Four panels in parallel, six or eight, or the same
+ *     array in series, all move the knee to a different count and a
+ *     different current; the search is identical. That is what the old
+ *     MPPT_SP_FRACTION_PCT could not be — and on the 14.09 array 87 % of
+ *     Voc is 11.49 V against a knee at 11.9 V, i.e. the seed itself
+ *     commanded a point past the cliff and the inner loop dutifully drove
+ *     there. That is the first collapse of the session, by construction.
+ */
+
+/* Counts to stay off the measured knee. One count is ~45 mA of buck demand
+ * (~3 % of the best point on the 14.09 array) and one count is the entire
+ * distance between the best point and the collapse, so this is the
+ * smallest margin that exists and the largest that is affordable. Applied
+ * to a knee found by MEASUREMENT (a probe that delivered less); a knee
+ * found by COLLAPSE gets CHG_CLIFF_PWM_MARGIN instead, which is wider
+ * because the collapse itself moved the PWM before anyone could look. */
+#define MPPT_KNEE_MARGIN          1U
+
+/* Dwell either side of a fence probe. Shorter than the setpoint tracker's
+ * 2 s + 1 s because a fence step is ONE PWM count and lands immediately —
+ * there is no inner-loop traverse to wait out, only the 64-sample ADC
+ * window (640 ms, ~320 ms group delay). Settle covers the window; measure
+ * averages a further 400 ms of it. ~1.2 s per probe, so a cold search from
+ * the zero-draw point down to a knee 30 counts away takes ~35 s once, and
+ * a HOLD re-probe costs ~2.4 s. */
+#define MPPT_KNEE_SETTLE_MS       800UL
+#define MPPT_KNEE_MEASURE_MS      400UL
+
+/* Noise gate on the probe comparison (mA of averaged chg_current). Below
+ * this a probe is "no better", which ends the descent — the tracker stops
+ * at the first count that fails to pay, rather than walking until something
+ * falls over. Sized off the measured ~36 mA/count so a genuine count of
+ * improvement always clears it, and off the ~10 mA spread of a settled
+ * 400 ms average so noise never does. */
+#define MPPT_KNEE_MIN_DELTA_MA    15
+
+/* Above this much improvement, the descent is still far from the knee and
+ * probes PANEL_VREG_STEP_MAX counts at a time instead of one. Measured
+ * improvement on the 14.09 array is ~36 mA per count all the way down, so a
+ * coarse probe that pays less than ~2.5 counts' worth is near enough to
+ * bracket finely. A coarse probe that fails does NOT teach a knee — the
+ * knee is somewhere inside those three counts — it reverts to the last good
+ * count and re-brackets one at a time. Cuts a cold search from ~36 s to
+ * ~20 s; warm resumes skip it entirely (energy_mode enters at the fence). */
+#define MPPT_KNEE_COARSE_MA       90
+
+/* Acquisition step, used while the buck is still delivering less than
+ * CHG_DELIVERING_MIN_MA. Between the activation pre-position and the
+ * zero-draw count there is no fitness signal AT ALL — every count reads the
+ * same zero charge current — so a P&O comparison there would see delta ~0,
+ * call it a knee, and fence the charger off the panel before it ever drew
+ * anything. Descend on a fixed step instead and do not judge until there is
+ * something to judge. Bench 14.09: the pre-position lands 5-15 counts above
+ * zero-draw, so 8 crosses it in one or two dwells. */
+#define MPPT_KNEE_ACQUIRE_STEP    8U
+
+/* How often HOLD re-probes one count down. This is the ONLY way the fence
+ * ever loosens, and it replaces two blind timers that v0.39 needed because
+ * nothing measured: the 2 s draw-blocked fast release (which marched
+ * straight back into the cliff — bench 14.09.26, pwm 79 -> 78 -> 77
+ * -> collapse) and the 180 s blind relax (which was far too slow to follow
+ * irradiance and left the 14.09 session fenced at 95 for its last five
+ * minutes). A measured probe can be frequent precisely because it is
+ * measured: worst case it costs one dwell of slightly-off operation, or
+ * one droop that the fast guard catches in 10 ms. */
+#define MPPT_KNEE_PROBE_MS        30000UL
+
+/* A count that has just been proven bad is not re-probed for this long,
+ * whatever the probe timer says. Stops a knee that is genuinely where it
+ * is from being re-tested every MPPT_KNEE_PROBE_MS; irradiance moves the
+ * knee on a scale of minutes, not seconds. Cleared by a fresh entry. */
+#define MPPT_KNEE_RETREAT_MS      120000UL
+
+/* v0.43: the retreat is a TIMER, and irradiance does not keep time. Bench
+ * 14.09.26 13:03 (v0.42): a collapse at 167 s taught knee 114; HOLD then sat
+ * at pwm 115 / 1.2 W for the full 120 s while the averaged V_panel at that
+ * fixed draw climbed from 11.2 V to 13.1 V — the cloud had passed, the
+ * panel was barely loaded, and the tracker was forbidden to look. So the
+ * knee remembers the panel voltage it was learned at (knee_vpanel_mv), and
+ * HOLD may re-probe as soon as V_panel at the present count is this much
+ * above what that count would read under the light the knee was found in
+ * (knee_vpanel_mv + gain × (pwm − knee_pwm)). Sized above the ~330 mV a
+ * two-count margin buys by itself at the steepest gain seen (165 mV/count)
+ * and above the regulation band, so a settled HOLD at the fence never
+ * qualifies by noise. The timer stays as the fallback. */
+#define MPPT_KNEE_RELEASE_MV      500U
+
+/* ── Event-sourced knee sightings: what gates them ───────────────────────
+ *
+ * A droop, an input-guard rescue or a teardown is "this count did not
+ * hold" only if the panel was actually being loaded there: the delivery
+ * must have been at least CHG_DELIVERING_MIN_MA (knee_learn_event, mppt.c).
+ *
+ * v0.41 also gated on the averaged V_panel being under 95 % of the learned
+ * Voc, on the reasoning that no PV knee sits at 99 % of open circuit. That
+ * was wrong for this array in weak light: the 14.09.26 afternoon session
+ * collapsed for real at pwm 96 / 12.39 V with Voc 12.82 V — 96.6 % — and
+ * the gate threw the sighting away. The 98-99 % "flickers" it was written
+ * against turned out to be the buck's own switching transient
+ * (CHG_DROOP_SPIKE_MA above), which is now recognised by its current
+ * signature instead. No Voc fraction is used anywhere any more. */
+
+/* Cap on one descent. A search that has not turned over by now is not on a
+ * panel with a knee in reach (a bench PSU, a heavily clamped battery) —
+ * park and let HOLD's probe carry on from there. At ~1.2 s per count this
+ * is ~60 counts, more than the full span from zero-draw to PWM_MAX_DUTY on
+ * either known plant. */
+#define MPPT_KNEE_SEARCH_MS       75000UL
+
 /* ── Setpoint-P&O (CHARGER_INPUT_VREG=1) ────────────────────────────────── */
 
 /* FOCV seed: Vmpp ≈ this % of Voc. The seed only needs to land in the
@@ -902,7 +1313,18 @@
  * silicon is 0.71–0.82; this panel is stiffer than the textbook). It is
  * only the STARTING point — P&O still hill-climbs from here, and since
  * v0.28 the seed only runs at cold boot or after MPPT_RESEED_GAP_MS, so
- * a wrong value costs one climb rather than one per teardown. */
+ * a wrong value costs one climb rather than one per teardown.
+ *
+ * ⚠️ RETIRED in v0.40 — no longer read by anything. Kept only as the record
+ * of why a constant of this shape cannot work here. 0.87 was fitted to two
+ * bench sessions on one array, and on the 14.09.26 array (Voc 13208 mV,
+ * knee at 11.9 V = 0.90) it seeds 11.49 V, which is PAST the knee: the
+ * inner loop drives to the seed, and the seed is over the cliff. Any fixed
+ * fraction has this failure mode, because Vmp/Voc is a function of
+ * irradiance and cell temperature (0.71-0.82 at STC, >0.90 at the low
+ * irradiance this system spends most of its life in) and of the array
+ * topology the firmware is explicitly meant not to know about. The knee is
+ * now measured — see MPPT_KNEE_MARGIN above. */
 #define MPPT_SP_FRACTION_PCT      87
 
 /* INITIAL setpoint perturbation per dwell (mV). Must move the parked
@@ -1268,6 +1690,20 @@
 #define LOG_MODE_1HZ              1
 #define LOG_MODE_FAST             2
 #define LOG_MODE_DEFAULT          LOG_MODE_FAST
+
+/* v0.41: UART transmit ring. The foreground guards (charger_panel_droop_guard,
+ * charger_input_guard, charger_fast_guard) run from the super loop and are
+ * only as fast as the slowest thing in it. printToUART blocked per byte, so
+ * every 5 Hz telemetry line (~380 characters at 115200 baud) parked the loop
+ * for ~33 ms — three ADC conversions the guards never inspected — and the
+ * collapse traces show falls with one or two conversions of warning. Logging
+ * now enqueues here; since v0.42 the UART TX interrupt drains it (the v0.41
+ * loop-paced drain managed one byte per pass on this 4 MHz part and dropped
+ * most lines). A line that does not fit is dropped whole (never truncated)
+ * and counted in the `txd` telemetry field. Sized for the worst burst: a
+ * telemetry line + the four state-transition lines + an INTRACE and a DROOP
+ * trace in one tick. */
+#define UART_TX_RING_SIZE         1536U
 #define TICK_LOG_1HZ_MS           1000    /* LOG_MODE_1HZ  interval               */
 #define TICK_LOG_FAST_MS          200     /* LOG_MODE_FAST interval (5 lines/s)   */
 

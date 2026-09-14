@@ -70,6 +70,13 @@ void charger_update(system_ctx_t *ctx);
  * charger down without latching (ctx->charger.input_lost_pending). */
 void charger_input_guard(system_ctx_t *ctx);
 
+/* Foreground panel-droop guard (v0.40). Runs BEFORE charger_input_guard: it
+ * trips at CHG_DROOP_TRIP_PCT of the settled operating voltage, which the
+ * panel passes through one to four 10 ms conversions before it reaches the
+ * battery — and, crucially, while the buck is still out of dropout, so a
+ * backoff has authority. Only ever reduces current; never stands down. */
+void charger_panel_droop_guard(system_ctx_t *ctx);
+
 /* Foreground fast trip for reverse current. The normal regulator uses filtered
  * data; this guard cuts the power path from the latest 10 ms ADC conversion.
  * Backstop to charger_input_guard: reverse current on a dead input stands down
